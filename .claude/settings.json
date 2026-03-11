@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:openreview.net)",
+      "WebFetch(domain:medium.com)",
+      "WebFetch(domain:ml4eng.github.io)",
+      "WebFetch(domain:docs.nvidia.com)",
+      "WebSearch",
+      "Bash(xargs grep -l \"profile\\\\|time\\\\|memory\\\\|optimization\\\\|bottleneck\")",
+      "WebFetch(domain:packages.ubuntu.com)",
+      "WebFetch(domain:cs.stanford.edu)",
+      "WebFetch(domain:iclr-blogposts.github.io)"
+    ]
+  }
+}

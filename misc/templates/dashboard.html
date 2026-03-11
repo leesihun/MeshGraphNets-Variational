@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MeshGraphNets - Training Loss Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .header {
+            background: white;
+            border-radius: 10px;
+            padding: 25px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+
+        .header h1 {
+            color: #333;
+            font-size: 28px;
+            margin-bottom: 10px;
+        }
+
+        .header-info {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 15px;
+            margin-top: 15px;
+        }
+
+        .info-item {
+            padding: 12px;
+            background: #f5f5f5;
+            border-left: 4px solid #667eea;
+            border-radius: 4px;
+        }
+
+        .info-label {
+            color: #666;
+            font-size: 12px;
+            text-transform: uppercase;
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        .info-value {
+            color: #333;
+            font-size: 16px;
+            font-weight: 500;
+            word-break: break-all;
+        }
+
+        .chart-container {
+            background: white;
+            border-radius: 10px;
+            padding: 25px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            margin-bottom: 20px;
+        }
+
+        .chart-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 15px;
+        }
+
+        #lossChart {
+            position: relative;
+            height: 400px;
+            margin-bottom: 20px;
+        }
+
+        .stats-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-top: 20px;
+        }
+
+        .stat-card {
+            padding: 15px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-radius: 8px;
+            text-align: center;
+        }
+
+        .stat-label {
+            font-size: 12px;
+            text-transform: uppercase;
+            opacity: 0.9;
+            margin-bottom: 8px;
+        }
+
+        .stat-value {
+            font-size: 20px;
+            font-weight: bold;
+            font-family: 'Courier New', monospace;
+        }
+
+        .status-banner {
+            background: white;
+            border-radius: 10px;
+            padding: 15px 20px;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+
+        .status-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #4caf50;
+            animation: pulse 2s infinite;
+        }
+
+        .status-indicator.idle {
+            background: #ff9800;
+            animation: none;
+        }
+
+        @keyframes pulse {
+            0%, 100% {
+                opacity: 1;
+            }
+            50% {
+                opacity: 0.5;
+            }
+        }
+
+        .status-text {
+            color: #333;
+            font-size: 14px;
+        }
+
+        .refresh-info {
+            color: #999;
+            font-size: 12px;
+            margin-left: auto;
+        }
+
+        .error-message {
+            background: #ffebee;
+            color: #c62828;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            border-left: 4px solid #c62828;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+            font-size: 16px;
+        }
+
+        @media (max-width: 768px) {
+            .header h1 {
+                font-size: 22px;
+            }
+
+            .header-info {
+                grid-template-columns: 1fr;
+            }
+
+            .stats-container {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🔬 MeshGraphNets Training Dashboard</h1>
+            <div class="header-info" id="headerInfo">
+                <div class="info-item">
+                    <div class="info-label">Log Directory</div>
+                    <div class="info-value" id="logDir">Loading...</div>
+                </div>
+                <div class="info-item">
+                    <div class="info-label">GPU Configuration</div>
+                    <div class="info-value" id="gpuConfig">Loading...</div>
+                </div>
+                <div class="info-item">
+                    <div class="info-label">Epochs Completed</div>
+                    <div class="info-value" id="epochCount">-</div>
+                </div>
+                <div class="info-item">
+                    <div class="info-label">Last Update</div>
+                    <div class="info-value" id="lastUpdate">-</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="status-banner" id="statusBanner">
+            <div class="status-indicator" id="statusIndicator"></div>
+            <div class="status-text" id="statusText">Waiting for data...</div>
+            <div class="refresh-info">Auto-refresh: 2s</div>
+        </div>
+
+        <div class="chart-container">
+            <div class="chart-title">📊 Training & Validation Loss</div>
+            <div id="lossChart">
+                <div class="loading">Loading chart...</div>
+            </div>
+            <div class="stats-container">
+                <div class="stat-card">
+                    <div class="stat-label">Best Training Loss</div>
+                    <div class="stat-value" id="bestTrainLoss">-</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Best Validation Loss</div>
+                    <div class="stat-value" id="bestValidLoss">-</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Latest Training Loss</div>
+                    <div class="stat-value" id="latestTrainLoss">-</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Latest Validation Loss</div>
+                    <div class="stat-value" id="latestValidLoss">-</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let chart = null;
+        let lastDataLength = 0;
+
+        // Initialize chart
+        function initChart() {
+            const ctx = document.getElementById('lossChart').getContext('2d');
+            chart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [
+                        {
+                            label: 'Training Loss',
+                            data: [],
+                            borderColor: '#667eea',
+                            backgroundColor: 'rgba(102, 126, 234, 0.1)',
+                            borderWidth: 2.5,
+                            fill: true,
+                            pointRadius: 5,
+                            pointBackgroundColor: '#667eea',
+                            pointBorderColor: '#fff',
+                            pointBorderWidth: 2,
+                            pointHoverRadius: 7,
+                            tension: 0.4,
+                        },
+                        {
+                            label: 'Validation Loss',
+                            data: [],
+                            borderColor: '#764ba2',
+                            backgroundColor: 'rgba(118, 75, 162, 0.1)',
+                            borderWidth: 2.5,
+                            fill: true,
+                            pointRadius: 5,
+                            pointBackgroundColor: '#764ba2',
+                            pointBorderColor: '#fff',
+                            pointBorderWidth: 2,
+                            pointHoverRadius: 7,
+                            tension: 0.4,
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: {
+                        mode: 'index',
+                        intersect: false,
+                    },
+                    plugins: {
+                        legend: {
+                            display: true,
+                            position: 'top',
+                            labels: {
+                                usePointStyle: true,
+                                padding: 15,
+                                font: {
+                                    size: 13,
+                                    weight: 'bold'
+                                }
+                            }
+                        },
+                        tooltip: {
+                            backgroundColor: 'rgba(0, 0, 0, 0.8)',
+                            padding: 12,
+                            titleFont: { size: 13, weight: 'bold' },
+                            bodyFont: { size: 12, family: 'Courier New' },
+                            callbacks: {
+                                label: function(context) {
+                                    let value = context.parsed.y;
+                                    return context.dataset.label + ': ' + value.toExponential(4);
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        y: {
+                            type: 'logarithmic',
+                            title: {
+                                display: true,
+                                text: 'Loss (log scale)',
+                                font: { size: 12, weight: 'bold' }
+                            },
+                            grid: {
+                                color: 'rgba(0, 0, 0, 0.05)'
+                            }
+                        },
+                        x: {
+                            title: {
+                                display: true,
+                                text: 'Epoch',
+                                font: { size: 12, weight: 'bold' }
+                            },
+                            grid: {
+                                color: 'rgba(0, 0, 0, 0.05)'
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // Format scientific notation
+        function formatLoss(value) {
+            if (value === null || value === undefined) return '-';
+            return value.toExponential(4);
+        }
+
+        // Update chart with new data
+        function updateChart(data) {
+            if (data.epochs.length === 0) {
+                document.getElementById('lossChart').innerHTML =
+                    '<div class="loading">Waiting for training data...</div>';
+                return;
+            }
+
+            if (!chart) {
+                document.getElementById('lossChart').innerHTML = '';
+                initChart();
+            }
+
+            chart.data.labels = data.epochs;
+            chart.data.datasets[0].data = data.train_losses;
+            chart.data.datasets[1].data = data.valid_losses;
+            chart.update('none');
+
+            // Update stats
+            const trainMin = Math.min(...data.train_losses);
+            const validMin = Math.min(...data.valid_losses);
+            const trainLast = data.train_losses[data.train_losses.length - 1];
+            const validLast = data.valid_losses[data.valid_losses.length - 1];
+
+            document.getElementById('bestTrainLoss').textContent = formatLoss(trainMin);
+            document.getElementById('bestValidLoss').textContent = formatLoss(validMin);
+            document.getElementById('latestTrainLoss').textContent = formatLoss(trainLast);
+            document.getElementById('latestValidLoss').textContent = formatLoss(validLast);
+            document.getElementById('epochCount').textContent = data.num_epochs;
+
+            // Update status
+            if (data.num_epochs > lastDataLength) {
+                const now = new Date();
+                document.getElementById('lastUpdate').textContent = now.toLocaleTimeString();
+                document.getElementById('statusIndicator').classList.remove('idle');
+                lastDataLength = data.num_epochs;
+            }
+        }
+
+        // Fetch config info
+        async function fetchConfigInfo() {
+            try {
+                const response = await fetch('/api/config');
+                const config = await response.json();
+                document.getElementById('logDir').textContent = config.log_file_dir;
+                document.getElementById('gpuConfig').textContent = config.gpu_ids;
+            } catch (error) {
+                console.error('Error fetching config:', error);
+            }
+        }
+
+        // Fetch and update loss data
+        async function fetchLossData() {
+            try {
+                const response = await fetch('/api/loss-data');
+                const data = await response.json();
+                updateChart(data);
+                document.getElementById('statusIndicator').classList.add('idle');
+                document.getElementById('statusText').textContent =
+                    `Live (${data.num_epochs} epochs) • Data updated ${new Date().toLocaleTimeString()}`;
+            } catch (error) {
+                console.error('Error fetching loss data:', error);
+                document.getElementById('statusText').textContent = 'Error fetching data';
+            }
+        }
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            fetchConfigInfo();
+            fetchLossData();
+            setInterval(fetchLossData, 2000); // Update every 2 seconds
+        });
+    </script>
+</body>
+</html>

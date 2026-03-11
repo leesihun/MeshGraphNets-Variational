@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "allow": [
+      // 웹 검색 및 웹 페이지 가져오기
+      "WebSearch(**)",
+      "WebFetch(**)",
+      
+      // 파일 읽기 도구들
+      "ReadFile(**)",
+      "NotebookRead(**)",
+      "LS(**)",
+      "Glob(**)",
+      "Find(**)",
+      "Search(**)",
+      "Grep(**)",
+      "Agent",
+      
+      // Bash 명령어 - 읽기 전용
+      "Bash(grep:*)",
+      "Bash(grep -R:*)",
+      "Bash(rg:*)",
+      "Bash(ripgrep:*)",
+      "Bash(cat:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(less:*)",
+      "Bash(awk:*)",
+      "Bash(wc:*)",
+      "Bash(sort:*)",
+      "Bash(uniq:*)",
+      "Bash(find:*)",
+      "Bash(ls:*)",
+      "Bash(tree:*)",
+      
+      // Git 읽기 명령어
+      "Bash(git diff:*)",
+      "Bash(git show:*)",
+      "Bash(git log:*)"
+    ],
+    "deny": []
+  }
+}
