@@ -1,3 +1,4 @@
+import glob
 import os
 import signal
 import threading
@@ -5,15 +6,17 @@ import time
 import datetime
 import traceback
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
 from general_modules.data_loader import load_data
+from torch.utils.data import Subset
 from torch_geometric.loader import DataLoader
 from model.MeshGraphNets import MeshGraphNets
-from training_profiles.training_loop import train_epoch, validate_epoch, test_model
+from training_profiles.training_loop import train_epoch, validate_epoch, test_model, log_training_config, build_ema_model
 
 # Per-process shutdown flag, set by signal handler
 _stop_event = threading.Event()
@@ -90,22 +93,34 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
     if torch.cuda.is_available() and rank == 0:
         print(f'After dataset load: {torch.cuda.memory_allocated()/1e9:.2f}GB')
 
-    # Pass num_node_types to config for model to compute input dimension
-    if config.get('use_node_types', False) and dataset.num_node_types is not None:
-        config['num_node_types'] = dataset.num_node_types
-        if rank == 0:
-            print(f"  Node types enabled: {dataset.num_node_types} types will be added to input")
-
     # Divide the dataset into training, validation, and test sets
     if rank == 0:
         print("\nSplitting dataset...")
-    train_dataset, val_dataset, test_dataset = dataset.split(0.8, 0.1, 0.1)
+    split_seed = int(config.get('split_seed', 42))
+    train_dataset, val_dataset, test_dataset = dataset.split(0.8, 0.1, 0.1, seed=split_seed)
+    if rank == 0:
+        print("Writing train-derived normalization stats to HDF5...")
+        train_dataset.write_preprocessing_to_hdf5(split_seed)
+    dist.barrier()
+
+    # Pass dataset metadata to config for model construction
+    config['num_timesteps'] = train_dataset.num_timesteps
+    if config.get('use_node_types', False) and train_dataset.num_node_types is not None:
+        config['num_node_types'] = train_dataset.num_node_types
+        if rank == 0:
+            print(f"  Node types enabled: {train_dataset.num_node_types} types will be added to input")
+
+    # Compute noise target correction ratio (node_std / delta_std) from train split stats
+    if train_dataset.node_std is not None and train_dataset.delta_std is not None:
+        output_var = config['output_var']
+        config['noise_std_ratio'] = (
+            train_dataset.node_std[:output_var] / np.maximum(train_dataset.delta_std, 1e-8)
+        ).tolist()
 
     # Create distributed samplers
     if rank == 0:
-        print("\nCreating dataloaders with distributed samplers...")
+        print("\nCreating dataloaders (distributed train, rank-0 eval)...")
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
-    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
 
     # Create dataloaders
     num_workers = config['num_workers']
@@ -116,18 +131,21 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=num_workers > 0,
-        prefetch_factor=2 if num_workers > 0 else None,
+        prefetch_factor=8 if num_workers > 0 else None,
     )
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config['batch_size'],
-        sampler=val_sampler,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=num_workers > 0,
-        prefetch_factor=2 if num_workers > 0 else None,
-    )
+    if rank == 0:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=config['batch_size'],
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=num_workers > 0,
+            prefetch_factor=8 if num_workers > 0 else None,
+        )
+    else:
+        val_loader = None
 
     # Test loader only needed on rank 0 (no DDP forward, uses unwrapped model)
     test_loader = DataLoader(
@@ -136,6 +154,12 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
         shuffle=True,
         pin_memory=True
     )
+    if rank == 0:
+        train_eval_subset_size = min(len(train_dataset), int(config.get('train_eval_subset_size', 128)))
+        train_eval_rng = np.random.default_rng(split_seed)
+    else:
+        train_eval_subset_size = None
+        train_eval_rng = None
     if torch.cuda.is_available() and rank == 0:
         print(f'After dataloader creation: {torch.cuda.memory_allocated()/1e9:.2f}GB')
 
@@ -143,6 +167,11 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
     if rank == 0:
         print("\nInitializing model...")
     model = MeshGraphNets(config, str(device)).to(device)
+
+    # EMA shadow model (created before torch.compile/DDP so it holds the raw Module)
+    ema_model = build_ema_model(model, config)
+    if ema_model is not None:
+        ema_model = ema_model.to(device)
 
     # Optional torch.compile for kernel fusion (10-30% speedup, requires PyTorch 2.0+)
     if config.get('use_compile', False):
@@ -175,10 +204,16 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
         print("Model initialized successfully")
         if config.get('use_checkpointing', False):
             print("Gradient checkpointing: ENABLED")
-        if config.get('use_amp', False):
+        if config.get('use_amp', True):
             print("Mixed precision (AMP): ENABLED (bfloat16)")
         if config.get('use_compile', False):
             print("torch.compile: ENABLED (dynamic=True)")
+        if ema_model is not None:
+            print(f"EMA: ENABLED (decay={config.get('ema_decay', 0.999)})")
+        if config.get('use_vae', False):
+            print(f"VAE: ENABLED (z_dim={config.get('vae_latent_dim', 32)}, beta_kl={config.get('beta_kl', 0.001)})")
+        else:
+            print("VAE: disabled")
         total_params = sum(p.numel() for p in ddp_model.parameters())
         trainable_params = sum(p.numel() for p in ddp_model.parameters() if p.requires_grad)
         print(f"Total parameters: {total_params:,}")
@@ -191,40 +226,36 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
     if rank == 0:
         print("\nInitializing optimizer...")
     learning_rate = config.get('learningr')
-    weight_decay = float(config.get('weight_decay', 1e-4))
     use_fused = torch.cuda.is_available()
-    optimizer = torch.optim.AdamW(ddp_model.parameters(), lr=learning_rate, weight_decay=weight_decay, fused=use_fused)
+    optimizer = torch.optim.Adam(ddp_model.parameters(), lr=learning_rate, fused=use_fused)
     if rank == 0:
-        print(f"Optimizer: AdamW (weight_decay={weight_decay}, fused={use_fused})")
+        print(f"Optimizer: Adam (fused={use_fused})")
 
-    # Initialize learning rate scheduler (OneCycleLR: warmup + cosine decay, stepped per batch)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=learning_rate,
-        steps_per_epoch=len(train_loader),
-        epochs=config.get('training_epochs'),
-        pct_start=0.1,
+    # Initialize learning rate scheduler: linear warmup + cosine warm restarts
+    total_epochs = config.get('training_epochs')
+    warmup_epochs = 3
+    remaining_epochs = max(total_epochs - warmup_epochs, 1)
+    # T_0 sized so 2 full cosine cycles fit in remaining epochs (T_0 + 2*T_0 = 3*T_0)
+    cosine_T0 = max(remaining_epochs // 3, 1)
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.01, total_iters=warmup_epochs
+    )
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=cosine_T0, T_mult=2, eta_min=1e-8
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs]
     )
     if rank == 0:
-        print(f"Learning rate scheduler: OneCycleLR (max_lr={learning_rate:.2e}, warmup=10%)")
+        print(f"Learning rate scheduler: LinearLR warmup ({warmup_epochs} epochs, start=0.01x) -> "
+              f"CosineAnnealingWarmRestarts (T_0={cosine_T0}, T_mult=2, eta_min=1e-8)")
 
     if torch.cuda.is_available() and rank == 0:
         print(f'After optimizer creation: {torch.cuda.memory_allocated()/1e9:.2f}GB')
         print(f'Peak memory so far: {torch.cuda.max_memory_allocated()/1e9:.2f}GB')
 
     if rank == 0:
-        # Log per-feature loss weights if configured
-        loss_weights_cfg = config.get('feature_loss_weights', None)
-        if loss_weights_cfg is not None:
-            if not isinstance(loss_weights_cfg, list):
-                loss_weights_cfg = [loss_weights_cfg]
-            w = torch.tensor(loss_weights_cfg, dtype=torch.float32)
-            w_normalized = (w * len(w) / w.sum()).tolist()
-            w_proportional = (w / w.sum()).tolist()
-            print(f"Per-feature loss weights (raw):         {loss_weights_cfg}")
-            print(f"Per-feature loss weights (normalized):  {[f'{v:.3f}' for v in w_normalized]}")
-            print(f"Per-feature loss weights (proportional):{[f'{v:.4f}' for v in w_proportional]}")
-        else:
-            print("Per-feature loss weights: equal (default)")
+        log_training_config(config)
 
         print("\n" + "="*60)
         print("Starting training loop...")
@@ -263,7 +294,7 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
         # Set epoch for distributed sampler (important for shuffling)
         train_sampler.set_epoch(epoch)
 
-        train_loss = train_epoch(ddp_model, train_loader, optimizer, device, config, epoch, scheduler=scheduler)
+        train_metrics = train_epoch(ddp_model, train_loader, optimizer, device, config, epoch, ema_model=ema_model)
 
         # Synchronize stop decision across all ranks — if ANY rank wants to stop,
         # ALL ranks must stop together to avoid NCCL collective mismatches.
@@ -275,7 +306,48 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
                 print("\nTraining interrupted by user (after train_epoch).")
             break
 
-        valid_loss = validate_epoch(ddp_model, val_loader, device, config, epoch)
+        train_totals = torch.tensor(
+            [train_metrics['sum'], float(train_metrics['count'])],
+            device=device,
+            dtype=torch.float64,
+        )
+        dist.all_reduce(train_totals, op=dist.ReduceOp.SUM)
+        train_loss = (train_totals[0] / train_totals[1]).item()
+
+        if config.get('use_vae', False) and 'kl_mean' in train_metrics:
+            kl_tensor = torch.tensor([train_metrics['kl_mean']], device=device, dtype=torch.float64)
+            dist.all_reduce(kl_tensor, op=dist.ReduceOp.SUM)
+            train_metrics['kl_mean'] = (kl_tensor[0] / world_size).item()
+
+        if rank == 0:
+            # traineval uses the real model (sanity-check against trainopt);
+            # valid/test use EMA for smoother generalization estimates.
+            eval_model = ema_model.module if ema_model is not None else model
+
+            # Resample train_eval subset each epoch for an unbiased training loss estimate
+            train_eval_indices = train_eval_rng.choice(
+                len(train_dataset), size=train_eval_subset_size, replace=False
+            ).tolist()
+            train_eval_loader = DataLoader(
+                Subset(train_dataset, train_eval_indices),
+                batch_size=config['batch_size'],
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=True,
+            )
+            train_eval_metrics = validate_epoch(model, train_eval_loader, device, config, epoch)
+            valid_metrics = validate_epoch(eval_model, val_loader, device, config, epoch)
+            train_eval_loss = train_eval_metrics['mean']
+            valid_loss = valid_metrics['mean']
+        else:
+            train_eval_loss = 0.0
+            valid_loss = 0.0
+        train_eval_loss_tensor = torch.tensor([train_eval_loss], device=device)
+        valid_loss_tensor = torch.tensor([valid_loss], device=device)
+        dist.broadcast(train_eval_loss_tensor, src=0)
+        dist.broadcast(valid_loss_tensor, src=0)
+        train_eval_loss = train_eval_loss_tensor.item()
+        valid_loss = valid_loss_tensor.item()
 
         stop_flag = torch.tensor([1.0 if _stop_event.is_set() else 0.0], device=device)
         dist.all_reduce(stop_flag, op=dist.ReduceOp.MAX)
@@ -285,18 +357,21 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
                 print("\nTraining interrupted by user (after validate_epoch).")
             break
 
-        # All-reduce losses across ranks for accurate logging and checkpoint decisions
-        train_loss_tensor = torch.tensor([train_loss], device=device)
-        valid_loss_tensor = torch.tensor([valid_loss], device=device)
-        dist.all_reduce(train_loss_tensor, op=dist.ReduceOp.AVG)
-        dist.all_reduce(valid_loss_tensor, op=dist.ReduceOp.AVG)
-        train_loss = train_loss_tensor.item()
-        valid_loss = valid_loss_tensor.item()
+        # Step scheduler on all ranks (valid_loss is identical after all_reduce)
+        scheduler.step()
 
-        # Per epoch, batch-averaged train, validation losses.
+        # Per epoch, node-weighted optimization, clean-train, and validation losses.
         current_lr = optimizer.param_groups[0]['lr']
         if rank == 0:
-            print(f"Epoch {epoch}/{config['training_epochs']} Train Loss: {train_loss:.2e} Valid Loss: {valid_loss:.2e} LR: {current_lr:.2e}")
+            kl_str = f" KL: {train_metrics.get('kl_mean', 0.0):.2e}" if config.get('use_vae', False) else ""
+            print(
+                f"Epoch {epoch}/{config['training_epochs']} "
+                f"Train Opt Loss: {train_loss:.2e} "
+                f"Train Eval Loss: {train_eval_loss:.2e} "
+                f"Valid Loss: {valid_loss:.2e} "
+                f"LR: {current_lr:.2e}"
+                + kl_str
+            )
 
         # Only rank 0 saves checkpoints
         if valid_loss < best_valid_loss and rank == 0:
@@ -304,18 +379,21 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
             best_epoch = epoch
             checkpoint_path = modelname
             normalization = {
-                'node_mean': dataset.node_mean,
-                'node_std': dataset.node_std,
-                'edge_mean': dataset.edge_mean,
-                'edge_std': dataset.edge_std,
-                'delta_mean': dataset.delta_mean,
-                'delta_std': dataset.delta_std,
+                'node_mean': train_dataset.node_mean,
+                'node_std': train_dataset.node_std,
+                'edge_mean': train_dataset.edge_mean,
+                'edge_std': train_dataset.edge_std,
+                'delta_mean': train_dataset.delta_mean,
+                'delta_std': train_dataset.delta_std,
             }
-            if dataset.use_node_types and dataset.node_type_to_idx is not None:
-                normalization['node_type_to_idx'] = dataset.node_type_to_idx
-                normalization['num_node_types'] = dataset.num_node_types
-            if dataset.use_world_edges and dataset.world_edge_radius is not None:
-                normalization['world_edge_radius'] = dataset.world_edge_radius
+            if train_dataset.use_node_types and train_dataset.node_type_to_idx is not None:
+                normalization['node_type_to_idx'] = train_dataset.node_type_to_idx
+                normalization['num_node_types'] = train_dataset.num_node_types
+            if train_dataset.use_world_edges and train_dataset.world_edge_radius is not None:
+                normalization['world_edge_radius'] = train_dataset.world_edge_radius
+            if train_dataset.use_multiscale and len(train_dataset.coarse_edge_means) > 0:
+                normalization['coarse_edge_means'] = train_dataset.coarse_edge_means
+                normalization['coarse_edge_stds']  = train_dataset.coarse_edge_stds
             model_config = {
                 'input_var': config.get('input_var'),
                 'output_var': config.get('output_var'),
@@ -326,10 +404,18 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
                 'num_node_types': config.get('num_node_types', 0),
                 'use_world_edges': config.get('use_world_edges', False),
                 'use_checkpointing': config.get('use_checkpointing', False),
+                'use_multiscale': config.get('use_multiscale', False),
+                'multiscale_levels': config.get('multiscale_levels', 1),
+                'mp_per_level': config.get('mp_per_level', None),
+                'fine_mp_pre': config.get('fine_mp_pre', 5),
+                'coarse_mp_num': config.get('coarse_mp_num', 5),
+                'fine_mp_post': config.get('fine_mp_post', 5),
+                'coarsening_type': config.get('coarsening_type', 'bfs'),
+                'voronoi_clusters': config.get('voronoi_clusters', None),
                 'use_vae': config.get('use_vae', False),
                 'vae_latent_dim': config.get('vae_latent_dim', 32),
             }
-            torch.save({
+            save_dict = {
                 'epoch': epoch,
                 'model_state_dict': ddp_model.module.state_dict(),  # Save unwrapped model
                 'optimizer_state_dict': optimizer.state_dict(),
@@ -338,12 +424,22 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
                 'valid_loss': valid_loss,
                 'normalization': normalization,
                 'model_config': model_config,
-            }, checkpoint_path)
+            }
+            if ema_model is not None:
+                save_dict['ema_state_dict'] = ema_model.state_dict()
+            torch.save(save_dict, checkpoint_path)
             print(f"  -> New best model saved at epoch {epoch} with valid loss {valid_loss:.2e}")
 
         if log_file_dir and rank == 0:
+            kl_log_str = f" KL: {train_metrics.get('kl_mean', 0.0):.4e}" if config.get('use_vae', False) else ""
             with open(log_file, 'a') as f:
-                f.write(f"Elapsed time: {time.time() - start_time:.2f}s Epoch {epoch} Train Loss: {train_loss:.4e} Valid Loss: {valid_loss:.4e} LR: {current_lr:.4e}\n")
+                f.write(
+                    f"Elapsed time: {time.time() - start_time:.2f}s "
+                    f"Epoch {epoch} TrainOpt {train_loss:.4e} "
+                    f"TrainEval {train_eval_loss:.4e} "
+                    f"Valid {valid_loss:.4e} LR: {current_lr:.4e}"
+                    + kl_log_str + "\n"
+                )
 
         # Periodically test the model on the test set
         # Use unwrapped model to avoid DDP deadlock (only rank 0 runs this)
@@ -353,7 +449,23 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
         last_epoch = epoch == config.get('training_epochs') - 1
         if epoch % test_interval == 0 or last_epoch:
             if rank == 0:
-                test_loss = test_model(model, test_loader, device, config, epoch, dataset)
+                _test_start = time.time()
+                test_loss = test_model(eval_model, test_loader, device, config, epoch, train_dataset)
+                print(f"  Test completed in {time.time() - _test_start:.1f}s")
+
+                # Optionally visualize training set reconstruction (same batch indices)
+                if config.get('display_trainset', True):
+                    train_viz_indices = config.get('test_batch_idx', [0, 1, 2, 3, 4, 5, 6, 7])
+                    train_viz_indices = [i for i in train_viz_indices if i < len(train_dataset)]
+                    if train_viz_indices:
+                        train_viz_loader = DataLoader(
+                            Subset(train_dataset, train_viz_indices),
+                            batch_size=1, shuffle=False, pin_memory=True
+                        )
+                        viz_config = dict(config)
+                        viz_config['test_batch_idx'] = list(range(len(train_viz_indices)))
+                        train_viz_loss = test_model(eval_model, train_viz_loader, device, viz_config, epoch, train_dataset, output_prefix='train')
+                        print(f"  Train reconstruction loss: {train_viz_loss:.2e}")
             dist.barrier(device_ids=[gpu_id])
 
     if rank == 0:
@@ -364,8 +476,6 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
 
     # Analyze debug files if they exist
     if rank == 0 and log_dir:
-        import glob
-        import numpy as np
         debug_files = sorted(glob.glob(os.path.join(log_dir, 'debug_*.npz')))
 
         if debug_files:
@@ -409,7 +519,7 @@ def setup_distributed(rank, world_size, gpu_id, port):
         backend='nccl' if torch.cuda.is_available() else 'gloo',
         rank=rank,
         world_size=world_size,
-        timeout=datetime.timedelta(minutes=5)
+        timeout=datetime.timedelta(minutes=60)
     )
 
     if torch.cuda.is_available():

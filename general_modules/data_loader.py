@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 
-import torch
-
 from general_modules.mesh_dataset import MeshGraphDataset
 
 

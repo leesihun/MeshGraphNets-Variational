@@ -7,7 +7,15 @@ import torch
 from torch_geometric.data import Data
 from scipy.spatial import KDTree
 
+from general_modules.edge_features import EDGE_FEATURE_DIM, compute_edge_attr
 from model.MeshGraphNets import MeshGraphNets
+
+# Multiscale coarsening (only needed when use_multiscale=True)
+try:
+    from model.coarsening import bfs_bistride_coarsen, coarsen_graph, compute_coarse_edge_attr, compute_coarse_centroids, MultiscaleData
+    HAS_COARSENING = True
+except ImportError:
+    HAS_COARSENING = False
 
 # Try to import torch_cluster for GPU-accelerated world edges
 try:
@@ -83,6 +91,18 @@ def run_rollout(config, config_filename='config.txt'):
     edge_std = norm['edge_std']    # np.ndarray [4]
     delta_mean = norm['delta_mean']  # np.ndarray [output_var]
     delta_std = norm['delta_std']    # np.ndarray [output_var]
+    # Multiscale coarse edge normalization stats (per-level lists)
+    if 'coarse_edge_means' in norm:
+        # New format: list of arrays per level
+        coarse_edge_means = norm['coarse_edge_means']
+        coarse_edge_stds  = norm['coarse_edge_stds']
+    elif 'coarse_edge_mean' in norm:
+        # Legacy format: single array → wrap in list
+        coarse_edge_means = [norm['coarse_edge_mean']]
+        coarse_edge_stds  = [norm['coarse_edge_std']]
+    else:
+        coarse_edge_means = [edge_mean]
+        coarse_edge_stds  = [edge_std]
 
     print(f"  Normalization stats loaded from checkpoint")
     print(f"    node_mean:  {node_mean}")
@@ -116,10 +136,10 @@ def run_rollout(config, config_filename='config.txt'):
     # World edge info
     use_world_edges = config.get('use_world_edges')
     world_edge_radius = norm.get('world_edge_radius')
-    world_max_num_neighbors = config.get('world_max_num_neighbors')
+    world_max_num_neighbors = config.get('world_max_num_neighbors', 64)
 
     # Determine world edge backend
-    requested_backend = config.get('world_edge_backend').lower()
+    requested_backend = config.get('world_edge_backend', 'scipy_kdtree').lower()
     if requested_backend == 'torch_cluster' and HAS_TORCH_CLUSTER:
         world_edge_backend = 'torch_cluster'
     else:
@@ -133,7 +153,20 @@ def run_rollout(config, config_filename='config.txt'):
     # -------------------------------------------------------------------------
     print("\nInitializing model...")
     model = MeshGraphNets(config, str(device)).to(device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+
+    # Prefer EMA weights (better generalization), fall back to training weights
+    if 'ema_state_dict' in checkpoint:
+        from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
+        ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(decay=0.999))
+        ema_model.load_state_dict(checkpoint['ema_state_dict'])
+        # Copy averaged weights into the base model for inference
+        model.load_state_dict(
+            {k: v for k, v in ema_model.module.state_dict().items()}
+        )
+        print("  Loaded EMA weights from checkpoint")
+    else:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print("  Loaded training weights from checkpoint (no EMA available)")
     model.eval()
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -203,6 +236,54 @@ def run_rollout(config, config_filename='config.txt'):
         # Make edges bidirectional
         edge_index = np.concatenate([mesh_edge, mesh_edge[[1, 0], :]], axis=1)  # [2, 2M]
 
+        # Pre-compute per-level coarsening topology (static — same for all rollout steps)
+        use_multiscale = config.get('use_multiscale', False)
+        multiscale_levels = int(config.get('multiscale_levels', 1))
+        # Per-level coarsening config (from checkpoint model_config or config file)
+        raw_ct = config.get('coarsening_type', 'bfs')
+        if isinstance(raw_ct, list):
+            coarsening_types = [str(t).strip().lower() for t in raw_ct]
+        else:
+            coarsening_types = [str(raw_ct).strip().lower()] * multiscale_levels
+        if len(coarsening_types) == 1 and multiscale_levels > 1:
+            coarsening_types = coarsening_types * multiscale_levels
+        raw_vc = config.get('voronoi_clusters', None)
+        if raw_vc is None:
+            voronoi_clusters = [0] * multiscale_levels
+        elif isinstance(raw_vc, list):
+            voronoi_clusters = [int(v) for v in raw_vc]
+        else:
+            voronoi_clusters = [int(raw_vc)] * multiscale_levels
+        if len(voronoi_clusters) == 1 and multiscale_levels > 1:
+            voronoi_clusters = voronoi_clusters * multiscale_levels
+
+        bipartite_unpool = config.get('bipartite_unpool', False)
+
+        coarse_cache = None  # dict of {level: {'ftc':..., 'c_ei':..., 'n_c':...}}
+        if use_multiscale:
+            if not HAS_COARSENING:
+                raise ImportError("use_multiscale=True but model/coarsening.py could not be imported")
+            coarse_cache = {}
+            current_ei, current_n = edge_index, num_nodes
+            level_ref_pos = ref_pos.astype(np.float32)
+            for level in range(multiscale_levels):
+                method = coarsening_types[level] if level < len(coarsening_types) else 'bfs'
+                n_clusters = voronoi_clusters[level] if level < len(voronoi_clusters) else 0
+                ftc, c_ei, n_c = coarsen_graph(
+                    current_ei, current_n, method=method,
+                    num_clusters=n_clusters, ref_pos=level_ref_pos,
+                )
+                cache_entry = {'ftc': ftc, 'c_ei': c_ei, 'n_c': n_c}
+                if bipartite_unpool:
+                    from model.coarsening import build_unpool_edges
+                    cache_entry['up_ei'] = build_unpool_edges(ftc, c_ei, n_c)
+                coarse_cache[level] = cache_entry
+                print(f"  Coarsening level {level} ({method}): {current_n} → {n_c} nodes ({n_c/current_n*100:.1f}%)")
+                if n_c <= 1 or c_ei.shape[1] == 0:
+                    break
+                level_ref_pos = compute_coarse_centroids(level_ref_pos, ftc, n_c).astype(np.float32)
+                current_ei, current_n = c_ei, n_c
+
         print(f"  Reference positions: {ref_pos.shape}")
         print(f"  Initial state: {initial_state.shape}")
         print(f"  Bidirectional edges: {edge_index.shape[1]}")
@@ -242,18 +323,15 @@ def run_rollout(config, config_filename='config.txt'):
                 displacement = current_state[:, :3]  # [N, 3]
                 deformed_pos = ref_pos + displacement  # [N, 3]
 
-                # --- e. Compute edge features ---
-                src_idx = edge_index[0]
-                dst_idx = edge_index[1]
-                relative_pos = deformed_pos[dst_idx] - deformed_pos[src_idx]  # [2M, 3]
-                distance = np.linalg.norm(relative_pos, axis=1, keepdims=True)  # [2M, 1]
-                edge_attr_raw = np.concatenate([relative_pos, distance], axis=1)  # [2M, 4]
+                # --- e. Compute 8-D edge features from current and reference geometry ---
+                edge_attr_raw = compute_edge_attr(ref_pos, deformed_pos, edge_index)
 
                 # --- f. Normalize edge features ---
                 edge_attr_norm = (edge_attr_raw - edge_mean) / edge_std
 
                 # --- g. Build graph Data object ---
-                graph = Data(
+                DataClass = MultiscaleData if use_multiscale else Data
+                graph = DataClass(
                     x=torch.from_numpy(x_norm.astype(np.float32)).to(device),
                     edge_index=torch.from_numpy(edge_index).long().to(device),
                     edge_attr=torch.from_numpy(edge_attr_norm.astype(np.float32)).to(device),
@@ -263,7 +341,7 @@ def run_rollout(config, config_filename='config.txt'):
                 # --- h. Compute world edges if enabled ---
                 if use_world_edges and world_edge_radius is not None:
                     world_ei, world_ea = _compute_world_edges(
-                        deformed_pos, edge_index, world_edge_radius,
+                        ref_pos, deformed_pos, edge_index, world_edge_radius,
                         world_max_num_neighbors, world_edge_backend,
                         edge_mean, edge_std
                     )
@@ -271,7 +349,41 @@ def run_rollout(config, config_filename='config.txt'):
                     graph.world_edge_attr = torch.from_numpy(world_ea.astype(np.float32)).to(device)
                 else:
                     graph.world_edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
-                    graph.world_edge_attr = torch.zeros((0, 4), dtype=torch.float32, device=device)
+                    graph.world_edge_attr = torch.zeros((0, EDGE_FEATURE_DIM), dtype=torch.float32, device=device)
+
+                # --- h2. Attach per-level coarse graph data if multiscale ---
+                if use_multiscale and coarse_cache is not None:
+                    cur_ref = ref_pos.astype(np.float32)
+                    cur_def = deformed_pos.astype(np.float32)
+                    for level in range(len(coarse_cache)):
+                        cc = coarse_cache[level]
+                        coarse_ref = compute_coarse_centroids(cur_ref, cc['ftc'], cc['n_c'])
+                        coarse_def = compute_coarse_centroids(cur_def, cc['ftc'], cc['n_c'])
+                        if cc['c_ei'].shape[1] > 0:
+                            c_ea_raw = compute_edge_attr(
+                                coarse_ref.astype(np.float32),
+                                coarse_def.astype(np.float32),
+                                cc['c_ei']
+                            )
+                        else:
+                            c_ea_raw = np.zeros((0, EDGE_FEATURE_DIM), dtype=np.float32)
+                        if c_ea_raw.shape[0] > 0 and level < len(coarse_edge_means):
+                            c_ea_norm = (c_ea_raw - coarse_edge_means[level]) / coarse_edge_stds[level]
+                        else:
+                            c_ea_norm = c_ea_raw
+                        graph[f'fine_to_coarse_{level}']    = torch.from_numpy(cc['ftc'].astype(np.int64)).to(device)
+                        graph[f'coarse_edge_index_{level}'] = torch.from_numpy(cc['c_ei']).to(device)
+                        graph[f'coarse_edge_attr_{level}']  = torch.from_numpy(c_ea_norm.astype(np.float32)).to(device)
+                        graph[f'num_coarse_{level}']        = torch.tensor([cc['n_c']], dtype=torch.long, device=device)
+
+                        # Store coarse centroids for rel_pos computation
+                        graph[f'coarse_centroid_{level}'] = torch.from_numpy(coarse_ref.astype(np.float32)).to(device)
+
+                        # Store bipartite unpool edges
+                        if bipartite_unpool and 'up_ei' in cc:
+                            graph[f'unpool_edge_index_{level}'] = torch.from_numpy(cc['up_ei']).to(device)
+
+                        cur_ref, cur_def = coarse_ref, coarse_def
 
                 # --- i. Forward pass ---
                 predicted_delta_norm, _, _ = model(graph)  # [N, output_var]
@@ -411,40 +523,41 @@ def run_rollout(config, config_filename='config.txt'):
     print(f"\nRollout inference complete. Processed {len(sample_ids)} samples.")
 
 
-def _compute_world_edges(deformed_pos, mesh_edge_index, radius,
+def _compute_world_edges(reference_pos, deformed_pos, mesh_edge_index, radius,
                          max_num_neighbors, backend, edge_mean, edge_std):
     """
     Compute world edges (radius-based collision detection) for a single timestep.
 
     Args:
+        reference_pos: [N, 3] reference node positions
         deformed_pos: [N, 3] deformed node positions
         mesh_edge_index: [2, 2M] bidirectional mesh edges
         radius: World edge radius
         max_num_neighbors: Maximum neighbors per node
         backend: 'torch_cluster' or 'scipy_kdtree'
-        edge_mean: [4] edge normalization mean
-        edge_std: [4] edge normalization std
+        edge_mean: [8] edge normalization mean
+        edge_std: [8] edge normalization std
 
     Returns:
         world_edge_index: [2, E_world] world edge indices
-        world_edge_attr_norm: [E_world, 4] normalized world edge features
+        world_edge_attr_norm: [E_world, 8] normalized world edge features
     """
     if backend == 'torch_cluster' and HAS_TORCH_CLUSTER:
         return _world_edges_torch_cluster(
-            deformed_pos, mesh_edge_index, radius,
+            reference_pos, deformed_pos, mesh_edge_index, radius,
             max_num_neighbors, edge_mean, edge_std
         )
     else:
         return _world_edges_scipy(
-            deformed_pos, mesh_edge_index, radius,
+            reference_pos, deformed_pos, mesh_edge_index, radius,
             edge_mean, edge_std
         )
 
 
-def _world_edges_torch_cluster(pos, mesh_edges, radius,
+def _world_edges_torch_cluster(reference_pos, deformed_pos, mesh_edges, radius,
                                 max_num_neighbors, edge_mean, edge_std):
     """GPU-accelerated world edge computation using torch_cluster."""
-    pos_tensor = torch.from_numpy(pos).float().cuda()
+    pos_tensor = torch.from_numpy(deformed_pos).float().cuda()
 
     world_edges = radius_graph(
         x=pos_tensor, r=radius, batch=None,
@@ -453,7 +566,7 @@ def _world_edges_torch_cluster(pos, mesh_edges, radius,
     world_edges_np = world_edges.cpu().numpy()
 
     if world_edges_np.shape[1] == 0:
-        return np.zeros((2, 0), dtype=np.int64), np.zeros((0, 4), dtype=np.float32)
+        return np.zeros((2, 0), dtype=np.int64), np.zeros((0, EDGE_FEATURE_DIM), dtype=np.float32)
 
     # Filter out existing mesh edges
     mesh_set = {(int(mesh_edges[0, i]), int(mesh_edges[1, i]))
@@ -465,23 +578,21 @@ def _world_edges_torch_cluster(pos, mesh_edges, radius,
     we = world_edges_np[:, valid_mask]
 
     if we.shape[1] == 0:
-        return np.zeros((2, 0), dtype=np.int64), np.zeros((0, 4), dtype=np.float32)
+        return np.zeros((2, 0), dtype=np.int64), np.zeros((0, EDGE_FEATURE_DIM), dtype=np.float32)
 
-    rel = pos[we[1]] - pos[we[0]]
-    dist = np.linalg.norm(rel, axis=1, keepdims=True)
-    world_attr_raw = np.concatenate([rel, dist], axis=1).astype(np.float32)
+    world_attr_raw = compute_edge_attr(reference_pos, deformed_pos, we)
     world_attr_norm = (world_attr_raw - edge_mean) / edge_std
 
     return we, world_attr_norm
 
 
-def _world_edges_scipy(pos, mesh_edges, radius, edge_mean, edge_std):
+def _world_edges_scipy(reference_pos, deformed_pos, mesh_edges, radius, edge_mean, edge_std):
     """CPU world edge computation using scipy KDTree."""
-    tree = KDTree(pos)
+    tree = KDTree(deformed_pos)
     pairs = tree.query_pairs(r=radius, output_type='ndarray')
 
     if len(pairs) == 0:
-        return np.zeros((2, 0), dtype=np.int64), np.zeros((0, 4), dtype=np.float32)
+        return np.zeros((2, 0), dtype=np.int64), np.zeros((0, EDGE_FEATURE_DIM), dtype=np.float32)
 
     mesh_set = {(int(mesh_edges[0, i]), int(mesh_edges[1, i]))
                 for i in range(mesh_edges.shape[1])}
@@ -494,12 +605,10 @@ def _world_edges_scipy(pos, mesh_edges, radius, edge_mean, edge_std):
             we.append([r, s])
 
     if not we:
-        return np.zeros((2, 0), dtype=np.int64), np.zeros((0, 4), dtype=np.float32)
+        return np.zeros((2, 0), dtype=np.int64), np.zeros((0, EDGE_FEATURE_DIM), dtype=np.float32)
 
     wei = np.array(we, dtype=np.int64).T
-    rel = pos[wei[1]] - pos[wei[0]]
-    dist = np.linalg.norm(rel, axis=1, keepdims=True)
-    world_attr_raw = np.concatenate([rel, dist], axis=1).astype(np.float32)
+    world_attr_raw = compute_edge_attr(reference_pos, deformed_pos, wei)
     world_attr_norm = (world_attr_raw - edge_mean) / edge_std
 
     return wei, world_attr_norm

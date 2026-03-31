@@ -47,7 +47,7 @@ class NodeBlock(nn.Module):
         # Decompose graph
         edge_attr = graph.edge_attr # [E, 4] (3D)
         nodes_to_collect = []
-        
+
         _, receivers_idx = graph.edge_index # [E, 2] (sender, receiver)
         num_nodes = graph.num_nodes
         # Use sum aggregation (matches NVIDIA PhysicsNeMo deforming_plate implementation)
@@ -57,7 +57,7 @@ class NodeBlock(nn.Module):
         nodes_to_collect.append(graph.x)
         nodes_to_collect.append(agg_received_edges)
         collected_nodes = torch.cat(nodes_to_collect, dim=-1)
-        
+
         x = self.net(collected_nodes)
         return Data(x=x, edge_attr=edge_attr, edge_index=graph.edge_index)
 
@@ -97,3 +97,39 @@ class HybridNodeBlock(nn.Module):
             world_edge_attr=graph.world_edge_attr if hasattr(graph, 'world_edge_attr') else None,
             world_edge_index=graph.world_edge_index if hasattr(graph, 'world_edge_index') else None
         )
+
+
+class UnpoolBlock(nn.Module):
+    """Bipartite message passing from coarse to fine nodes (learned unpool)."""
+
+    def __init__(self, latent_dim: int, build_mlp_fn):
+        super().__init__()
+        # EdgeMLP: (h_coarse, h_fine_skip, rel_pos) → message
+        self.edge_mlp = build_mlp_fn(2 * latent_dim + 3, latent_dim, latent_dim)
+        # NodeMLP: (h_fine_skip, aggregated_messages) → h_up
+        self.node_mlp = build_mlp_fn(2 * latent_dim, latent_dim, latent_dim)
+
+    def forward(self, h_coarse, h_fine_skip, unpool_edge_index, rel_pos):
+        """
+        Args:
+            h_coarse:          [M, D] coarse node features
+            h_fine_skip:       [N, D] fine node skip features (from descending arm)
+            unpool_edge_index: [2, E_up] row0=coarse src, row1=fine dst
+            rel_pos:           [E_up, 3] relative position per edge
+        Returns:
+            h_up: [N, D] unpooled fine node features
+        """
+        src_coarse, dst_fine = unpool_edge_index
+
+        edge_input = torch.cat([
+            h_coarse[src_coarse],
+            h_fine_skip[dst_fine],
+            rel_pos,
+        ], dim=-1)
+        messages = self.edge_mlp(edge_input)
+
+        agg = scatter(messages, dst_fine, dim=0,
+                      dim_size=h_fine_skip.shape[0], reduce='sum')
+
+        h_up = self.node_mlp(torch.cat([h_fine_skip, agg], dim=-1))
+        return h_up

@@ -81,17 +81,3 @@ def parse_value(value_str):
         # Return string value as lowercase
         return value_str.lower()
 
-def display_config(config):
-    """Display loaded configuration parameters"""
-    print("\n" + "="*60)
-    print("CONFIGURATION PARAMETERS")
-    print("="*60)
-
-    # Display all parameters in alphabetical order
-    for key, value in sorted(config.items()):
-        print(f"  {key:<20}: {value} ({type(value).__name__})")
-
-    print("="*60)
-    print(f"Total parameters loaded: {len(config)}")
-    print("="*60 + "\n")
-

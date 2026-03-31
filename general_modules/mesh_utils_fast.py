@@ -368,14 +368,6 @@ def save_inference_results_fast(output_path, graph,
             print(f"Warning: No features in face values for sample_id={sample_id}, time_idx={time_idx}. Skipping visualization.")
             return None
 
-        # Debug: Print shape info for timestep==1
-        if time_idx == 1:
-            print(f"DEBUG timestep==1: sample_id={sample_id}")
-            print(f"  faces: {faces.shape}")
-            print(f"  pred_face_values_norm: {pred_face_values_norm.shape}")
-            print(f"  target_face_values_norm: {target_face_values_norm.shape}")
-            print(f"  feature_idx: {feature_idx}")
-
         # Return plot data for parallel processing with full metadata
         # Include both normalized and denormalized values for visualization
         return {
@@ -462,9 +454,9 @@ def plot_mesh_comparison(pos, faces, pred_values_norm, target_values_norm,
     if clim_denorm[1] - clim_denorm[0] < eps:
         clim_denorm[1] = clim_denorm[0] + eps
 
-    # MAE for each row
-    mae_norm = float(np.abs(pred_colors_norm - target_colors_norm).mean())
-    mae_denorm = float(np.abs(pred_colors_denorm - target_colors_denorm).mean())
+    # MSE for each row
+    mse_norm = float(((pred_colors_norm - target_colors_norm) ** 2).mean())
+    mse_denorm = float(((pred_colors_denorm - target_colors_denorm) ** 2).mean())
 
     # Build VTK-format faces: [3, v0, v1, v2, 3, v0, v1, v2, ...]
     n_faces = faces.shape[0]
@@ -485,9 +477,9 @@ def plot_mesh_comparison(pos, faces, pred_values_norm, target_values_norm,
         if n_parts > 1:
             header_parts.append(f'{n_parts} Parts')
 
-    mae_str_norm = f'MAE: {mae_norm:.4f}'
-    mae_str_denorm = (f'MAE: {mae_denorm:.4f} {feature_unit}'.strip()
-                      if feature_unit else f'MAE: {mae_denorm:.4f}')
+    mse_str_norm = f'MSE: {mse_norm:.4f}'
+    mse_str_denorm = (f'MSE: {mse_denorm:.4f} {feature_unit}'.strip()
+                      if feature_unit else f'MSE: {mse_denorm:.4f}')
 
     # Colorbar labels
     cbar_label_norm = f'{feature_name} (Normalized)'
@@ -497,9 +489,9 @@ def plot_mesh_comparison(pos, faces, pred_values_norm, target_values_norm,
     # Subplot definitions: (row, col, scalars, title, clim, show_cbar, cbar_title)
     subplot_configs = [
         (0, 0, pred_colors_norm,    'Normalized - Predicted',                         clim_norm,   False, ''),
-        (0, 1, target_colors_norm,  f'Normalized - Ground Truth | {mae_str_norm}',    clim_norm,   True,  cbar_label_norm),
+        (0, 1, target_colors_norm,  f'Normalized - Ground Truth | {mse_str_norm}',    clim_norm,   True,  cbar_label_norm),
         (1, 0, pred_colors_denorm,  'Denormalized - Predicted',                       clim_denorm, False, ''),
-        (1, 1, target_colors_denorm, f'Denormalized - Ground Truth | {mae_str_denorm}', clim_denorm, True,  cbar_label_denorm),
+        (1, 1, target_colors_denorm, f'Denormalized - Ground Truth | {mse_str_denorm}', clim_denorm, True,  cbar_label_denorm),
     ]
 
     # Create 2x2 off-screen plotter
