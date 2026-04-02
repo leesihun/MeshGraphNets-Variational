@@ -130,6 +130,7 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
     model.train()
     total_loss_sum = 0.0
     total_loss_count = 0
+    total_opt_loss_sum = 0.0  # actual optimization loss (recon + beta*kl when VAE)
     total_grad_norm = 0.0
     total_kl_sum = 0.0
     kl_count = 0
@@ -206,6 +207,7 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
         loss_val = batch_loss_sum / batch_loss_count
         total_loss_sum += batch_loss_sum
         total_loss_count += batch_loss_count
+        total_opt_loss_sum += loss.item() * batch_loss_count
         num_batches += 1
         if use_vae:
             kl_scalar = kl_loss_val.item() if hasattr(kl_loss_val, 'item') else float(kl_loss_val)
@@ -246,12 +248,11 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
         # Update progress bar every 10 batches to reduce memory query overhead
         if batch_idx % 10 == 0:
             mem_gb = torch.cuda.memory_allocated() / 1e9
-            postfix = {'loss': f'{loss_val:.2e}', 'mem': f'{mem_gb:.1f}GB'}
+            postfix = {'rec': f'{loss_val:.2e}', 'mem': f'{mem_gb:.1f}GB'}
             if use_vae:
-                recon_val = batch_loss_sum / batch_loss_count
                 kl_val = kl_loss_val.item() if hasattr(kl_loss_val, 'item') else float(kl_loss_val)
-                postfix['rec'] = f'{recon_val:.2e}'
                 postfix['kl'] = f'{kl_val:.2e}'
+                postfix['total'] = f'{loss.item():.2e}'
             if monitor_gradients:
                 postfix['grad'] = f'{grad_norm.item():.2e}'
             pbar.set_postfix(postfix)
@@ -268,6 +269,7 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
 
     result = {
         'mean': total_loss_sum / total_loss_count,
+        'total_mean': total_opt_loss_sum / total_loss_count,
         'sum': total_loss_sum,
         'count': total_loss_count,
     }
@@ -280,13 +282,19 @@ def validate_epoch(model, dataloader, device, config, epoch=0):
 
     verbose = config.get('verbose', False)
     loss_weights = _build_loss_weights(config, device)
-
     use_amp = config.get('use_amp', True)
     amp_dtype = torch.bfloat16
+
+    use_vae = config.get('use_vae', False)
+    alpha_recon = float(config.get('alpha_recon', 1.0))
+    beta_kl = float(config.get('beta_kl', 0.001))
 
     with torch.no_grad():
         total_loss_sum = 0.0
         total_loss_count = 0
+        total_opt_loss_sum = 0.0
+        total_kl_sum = 0.0
+        kl_count = 0
         num_batches = 0
 
         # Accumulate per-feature losses across all batches
@@ -303,9 +311,13 @@ def validate_epoch(model, dataloader, device, config, epoch=0):
 
             graph = graph.to(device)
             with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
-                predicted, target, _ = model(graph)
+                predicted, target, kl_loss_val = model(graph)
                 errors = torch.nn.functional.huber_loss(predicted, target, reduction='none', delta=1.0000)
-                loss, batch_loss_sum, batch_loss_count = _loss_from_errors(errors, loss_weights)
+                recon_loss, batch_loss_sum, batch_loss_count = _loss_from_errors(errors, loss_weights)
+                if use_vae:
+                    opt_loss = alpha_recon * recon_loss + beta_kl * kl_loss_val
+                else:
+                    opt_loss = recon_loss
 
             # Accumulate per-feature losses
             per_feature_loss = torch.sum(errors, dim=0)
@@ -322,12 +334,22 @@ def validate_epoch(model, dataloader, device, config, epoch=0):
 
             # Update progress bar
             mem_gb = torch.cuda.memory_allocated() / 1e9
-            pbar.set_postfix({'loss': f'{loss.item():.2e}', 'mem': f'{mem_gb:.1f}GB'})
+            postfix = {'rec': f'{recon_loss.item():.2e}', 'mem': f'{mem_gb:.1f}GB'}
+            if use_vae:
+                kl_scalar = kl_loss_val.item() if hasattr(kl_loss_val, 'item') else float(kl_loss_val)
+                postfix['kl'] = f'{kl_scalar:.2e}'
+                postfix['total'] = f'{opt_loss.item():.2e}'
+            pbar.set_postfix(postfix)
 
             total_loss_sum += batch_loss_sum
             total_loss_count += batch_loss_count
+            total_opt_loss_sum += opt_loss.item() * batch_loss_count
+            if use_vae:
+                kl_scalar = kl_loss_val.item() if hasattr(kl_loss_val, 'item') else float(kl_loss_val)
+                total_kl_sum += kl_scalar
+                kl_count += 1
             num_batches += 1
-        
+
         # Print per-feature validation loss breakdown
         if verbose and accumulated_per_feature_loss is not None and accumulated_per_feature_count > 0:
             avg_per_feature_loss = accumulated_per_feature_loss / accumulated_per_feature_count
@@ -337,11 +359,15 @@ def validate_epoch(model, dataloader, device, config, epoch=0):
                 tqdm.tqdm.write(f"  {feat_name}: {avg_per_feature_loss[feat_idx].item():.2e}")
             tqdm.tqdm.write("")
 
-    return {
+    result = {
         'mean': total_loss_sum / total_loss_count,
+        'total_mean': total_opt_loss_sum / total_loss_count,
         'sum': total_loss_sum,
         'count': total_loss_count,
     }
+    if use_vae and kl_count > 0:
+        result['kl_mean'] = total_kl_sum / kl_count
+    return result
 
 
 def test_model(model, dataloader, device, config, epoch, dataset=None, output_prefix='test'):

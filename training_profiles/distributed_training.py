@@ -314,10 +314,18 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
         dist.all_reduce(train_totals, op=dist.ReduceOp.SUM)
         train_loss = (train_totals[0] / train_totals[1]).item()
 
-        if config.get('use_vae', False) and 'kl_mean' in train_metrics:
+        use_vae = config.get('use_vae', False)
+        if use_vae and 'kl_mean' in train_metrics:
             kl_tensor = torch.tensor([train_metrics['kl_mean']], device=device, dtype=torch.float64)
             dist.all_reduce(kl_tensor, op=dist.ReduceOp.SUM)
             train_metrics['kl_mean'] = (kl_tensor[0] / world_size).item()
+        if use_vae and 'total_mean' in train_metrics:
+            total_tensor = torch.tensor(
+                [train_metrics['total_mean'] * train_metrics['count']],
+                device=device, dtype=torch.float64,
+            )
+            dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+            train_metrics['total_mean'] = (total_tensor[0] / train_totals[1]).item()
 
         if rank == 0:
             # traineval uses the real model (sanity-check against trainopt);
@@ -363,15 +371,21 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
         # Per epoch, node-weighted optimization, clean-train, and validation losses.
         current_lr = optimizer.param_groups[0]['lr']
         if rank == 0:
-            kl_str = f" KL: {train_metrics.get('kl_mean', 0.0):.2e}" if config.get('use_vae', False) else ""
-            print(
-                f"Epoch {epoch}/{config['training_epochs']} "
-                f"Train Opt Loss: {train_loss:.2e} "
-                f"Train Eval Loss: {train_eval_loss:.2e} "
-                f"Valid Loss: {valid_loss:.2e} "
-                f"LR: {current_lr:.2e}"
-                + kl_str
-            )
+            if use_vae:
+                print(
+                    f"Epoch {epoch}/{config['training_epochs']} LR: {current_lr:.2e} | "
+                    f"TrainOpt  recon={train_loss:.2e} kl={train_metrics.get('kl_mean', 0.0):.2e} total={train_metrics.get('total_mean', train_loss):.2e} | "
+                    f"TrainEval recon={train_eval_loss:.2e} kl={train_eval_metrics.get('kl_mean', 0.0):.2e} total={train_eval_metrics.get('total_mean', train_eval_loss):.2e} | "
+                    f"Valid     recon={valid_loss:.2e} kl={valid_metrics.get('kl_mean', 0.0):.2e} total={valid_metrics.get('total_mean', valid_loss):.2e}"
+                )
+            else:
+                print(
+                    f"Epoch {epoch}/{config['training_epochs']} "
+                    f"TrainOpt: {train_loss:.2e} "
+                    f"TrainEval: {train_eval_loss:.2e} "
+                    f"Valid: {valid_loss:.2e} "
+                    f"LR: {current_lr:.2e}"
+                )
 
         # Only rank 0 saves checkpoints
         if valid_loss < best_valid_loss and rank == 0:
@@ -431,15 +445,22 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
             print(f"  -> New best model saved at epoch {epoch} with valid loss {valid_loss:.2e}")
 
         if log_file_dir and rank == 0:
-            kl_log_str = f" KL: {train_metrics.get('kl_mean', 0.0):.4e}" if config.get('use_vae', False) else ""
             with open(log_file, 'a') as f:
-                f.write(
-                    f"Elapsed time: {time.time() - start_time:.2f}s "
-                    f"Epoch {epoch} TrainOpt {train_loss:.4e} "
-                    f"TrainEval {train_eval_loss:.4e} "
-                    f"Valid {valid_loss:.4e} LR: {current_lr:.4e}"
-                    + kl_log_str + "\n"
-                )
+                if use_vae:
+                    f.write(
+                        f"Elapsed: {time.time() - start_time:.2f}s "
+                        f"Epoch {epoch} LR: {current_lr:.4e} | "
+                        f"TrainOpt recon={train_loss:.4e} kl={train_metrics.get('kl_mean', 0.0):.4e} total={train_metrics.get('total_mean', train_loss):.4e} | "
+                        f"TrainEval recon={train_eval_loss:.4e} kl={train_eval_metrics.get('kl_mean', 0.0):.4e} total={train_eval_metrics.get('total_mean', train_eval_loss):.4e} | "
+                        f"Valid recon={valid_loss:.4e} kl={valid_metrics.get('kl_mean', 0.0):.4e} total={valid_metrics.get('total_mean', valid_loss):.4e}\n"
+                    )
+                else:
+                    f.write(
+                        f"Elapsed: {time.time() - start_time:.2f}s "
+                        f"Epoch {epoch} TrainOpt {train_loss:.4e} "
+                        f"TrainEval {train_eval_loss:.4e} "
+                        f"Valid {valid_loss:.4e} LR: {current_lr:.4e}\n"
+                    )
 
         # Periodically test the model on the test set
         # Use unwrapped model to avoid DDP deadlock (only rank 0 runs this)

@@ -204,15 +204,26 @@ def single_worker(config, config_filename='config.txt'):
 
             # Per epoch, node-weighted optimization, clean-train, and validation losses.
             current_lr = optimizer.param_groups[0]['lr']
-            kl_str = f" KL: {train_metrics.get('kl_mean', 0.0):.2e}" if config.get('use_vae', False) else ""
-            print(
-                f"Epoch {epoch}/{config['training_epochs']} "
-                f"Train Opt Loss: {train_loss:.2e} "
-                f"Train Eval Loss: {train_eval_loss:.2e} "
-                f"Valid Loss: {valid_loss:.2e} "
-                f"LR: {current_lr:.2e}"
-                + kl_str
-            )
+            use_vae = config.get('use_vae', False)
+            if use_vae:
+                train_kl   = train_metrics.get('kl_mean', 0.0)
+                train_total = train_metrics.get('total_mean', train_loss)
+                valid_kl   = valid_metrics.get('kl_mean', 0.0)
+                valid_total = valid_metrics.get('total_mean', valid_loss)
+                print(
+                    f"Epoch {epoch}/{config['training_epochs']} LR: {current_lr:.2e} | "
+                    f"TrainOpt  recon={train_loss:.2e} kl={train_kl:.2e} total={train_total:.2e} | "
+                    f"TrainEval recon={train_eval_loss:.2e} kl={train_eval_metrics.get('kl_mean', 0.0):.2e} total={train_eval_metrics.get('total_mean', train_eval_loss):.2e} | "
+                    f"Valid     recon={valid_loss:.2e} kl={valid_kl:.2e} total={valid_total:.2e}"
+                )
+            else:
+                print(
+                    f"Epoch {epoch}/{config['training_epochs']} "
+                    f"TrainOpt: {train_loss:.2e} "
+                    f"TrainEval: {train_eval_loss:.2e} "
+                    f"Valid: {valid_loss:.2e} "
+                    f"LR: {current_lr:.2e}"
+                )
 
             if valid_loss < best_valid_loss:
                 best_valid_loss = valid_loss
@@ -271,15 +282,22 @@ def single_worker(config, config_filename='config.txt'):
                 print(f"  -> New best model saved at epoch {epoch} with valid loss {valid_loss:.2e}")
 
             if log_file_dir:
-                kl_log_str = f" KL: {train_metrics.get('kl_mean', 0.0):.4e}" if config.get('use_vae', False) else ""
                 with open(log_file, 'a') as f:
-                    f.write(
-                        f"Elapsed time: {time.time() - start_time:.2f}s "
-                        f"Epoch {epoch} TrainOpt {train_loss:.4e} "
-                        f"TrainEval {train_eval_loss:.4e} "
-                        f"Valid {valid_loss:.4e} LR: {current_lr:.4e}"
-                        + kl_log_str + "\n"
-                    )
+                    if use_vae:
+                        f.write(
+                            f"Elapsed: {time.time() - start_time:.2f}s "
+                            f"Epoch {epoch} LR: {current_lr:.4e} | "
+                            f"TrainOpt recon={train_loss:.4e} kl={train_metrics.get('kl_mean', 0.0):.4e} total={train_metrics.get('total_mean', train_loss):.4e} | "
+                            f"TrainEval recon={train_eval_loss:.4e} kl={train_eval_metrics.get('kl_mean', 0.0):.4e} total={train_eval_metrics.get('total_mean', train_eval_loss):.4e} | "
+                            f"Valid recon={valid_loss:.4e} kl={valid_metrics.get('kl_mean', 0.0):.4e} total={valid_metrics.get('total_mean', valid_loss):.4e}\n"
+                        )
+                    else:
+                        f.write(
+                            f"Elapsed: {time.time() - start_time:.2f}s "
+                            f"Epoch {epoch} TrainOpt {train_loss:.4e} "
+                            f"TrainEval {train_eval_loss:.4e} "
+                            f"Valid {valid_loss:.4e} LR: {current_lr:.4e}\n"
+                        )
 
             # Periodically test the model on the test set and save results with ground truth
             test_interval = int(config.get('test_interval', 10))
