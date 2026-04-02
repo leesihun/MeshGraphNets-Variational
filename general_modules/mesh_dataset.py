@@ -354,7 +354,9 @@ class MeshGraphDataset(Dataset):
         self.multiscale_levels = int(config.get('multiscale_levels', 1))
         self.coarse_edge_means: List = []   # per-level: [mean_level_0, mean_level_1, ...]
         self.coarse_edge_stds: List = []    # per-level: [std_level_0, std_level_1, ...]
+        self._coarse_cache_max = int(config.get('coarse_cache_per_worker', 2000))
         self._coarse_cache: Dict = {}  # {sample_id: {'levels': L, 'fine_to_coarse_0':..., 'coarse_edge_index_0':..., 'num_coarse_0':..., ...}}
+        self._pos_feat_cache_max = int(config.get('pos_feat_cache_per_worker', 500))
         self._pos_feat_cache: Dict = {}  # {sample_id: np.ndarray [N, num_pos_features]} — cached per worker, topology-invariant
 
         # Per-level coarsening method ('bfs' or 'voronoi')
@@ -649,6 +651,8 @@ class MeshGraphDataset(Dataset):
         subset.coarse_edge_means = []
         subset.coarse_edge_stds = []
         subset._coarse_cache = {}
+        subset._coarse_cache_max = self._coarse_cache_max
+        subset._pos_feat_cache_max = self._pos_feat_cache_max
         subset._pos_feat_cache = {}
         subset._h5_handle = None
         subset.is_training = is_training
@@ -865,7 +869,7 @@ class MeshGraphDataset(Dataset):
                 first_pos_data = data_h5[:3, 0, :]  # [3, nodes] — ref xyz
                 level_ref_pos = first_pos_data.T     # [N, 3]
 
-                cache_entry = {}
+                local_entry = {}
                 current_ei, current_n = edge_idx, num_nodes
                 actual_levels = 0
                 for level in range(L):
@@ -875,20 +879,19 @@ class MeshGraphDataset(Dataset):
                         current_ei, current_n, method=method,
                         num_clusters=n_clusters, ref_pos=level_ref_pos,
                     )
-                    cache_entry[f'fine_to_coarse_{level}'] = ftc
-                    cache_entry[f'coarse_edge_index_{level}'] = c_ei
-                    cache_entry[f'num_coarse_{level}'] = n_c
+                    local_entry[f'fine_to_coarse_{level}'] = ftc
+                    local_entry[f'coarse_edge_index_{level}'] = c_ei
+                    local_entry[f'num_coarse_{level}'] = n_c
                     if self.bipartite_unpool:
                         from model.coarsening import build_unpool_edges
-                        cache_entry[f'unpool_edge_index_{level}'] = build_unpool_edges(ftc, c_ei, n_c)
+                        local_entry[f'unpool_edge_index_{level}'] = build_unpool_edges(ftc, c_ei, n_c)
                     actual_levels += 1
                     if n_c <= 1 or c_ei.shape[1] == 0:
                         break
                     # Chain centroids for next level
                     level_ref_pos = compute_coarse_centroids(level_ref_pos, ftc, n_c).astype(np.float32)
                     current_ei, current_n = c_ei, n_c
-                cache_entry['levels'] = actual_levels
-                self._coarse_cache[sid] = cache_entry
+                local_entry['levels'] = actual_levels
 
                 # Collect coarse edge stats per level — 10 timesteps is sufficient
                 max_t = min(10, self.num_timesteps)
@@ -905,9 +908,9 @@ class MeshGraphDataset(Dataset):
                     # Chain centroid computation through levels
                     cur_ref, cur_def = ref_pos, deformed_pos
                     for level in range(actual_levels):
-                        ftc_l = cache_entry[f'fine_to_coarse_{level}']
-                        c_ei_l = cache_entry[f'coarse_edge_index_{level}']
-                        n_c_l = cache_entry[f'num_coarse_{level}']
+                        ftc_l = local_entry[f'fine_to_coarse_{level}']
+                        c_ei_l = local_entry[f'coarse_edge_index_{level}']
+                        n_c_l = local_entry[f'num_coarse_{level}']
 
                         # Compute centroids at this level
                         coarse_ref = compute_coarse_centroids(cur_ref, ftc_l, n_c_l)
@@ -1094,6 +1097,8 @@ class MeshGraphDataset(Dataset):
         """Exclude unpicklable HDF5 handle when pickling (for DataLoader workers)."""
         state = self.__dict__.copy()
         state['_h5_handle'] = None
+        state['_coarse_cache'] = {}    # workers start with empty cache; they build lazily
+        state['_pos_feat_cache'] = {}
         return state
 
     def __setstate__(self, state):
@@ -1325,6 +1330,9 @@ class MeshGraphDataset(Dataset):
                     level_ref_pos = compute_coarse_centroids(level_ref_pos, ftc, n_c).astype(np.float32)
                     current_ei, current_n = c_ei, n_c
                 cache_entry['levels'] = actual_levels
+                # LRU-style eviction: evict oldest entry if over capacity
+                if len(self._coarse_cache) >= self._coarse_cache_max:
+                    self._coarse_cache.pop(next(iter(self._coarse_cache)))
                 self._coarse_cache[sample_id] = cache_entry
 
             cache = self._coarse_cache[sample_id]
