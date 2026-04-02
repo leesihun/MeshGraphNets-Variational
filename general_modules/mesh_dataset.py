@@ -1204,6 +1204,8 @@ class MeshGraphDataset(Dataset):
         # so we cache per sample_id to avoid recomputing eigenvectors every __getitem__ call.
         if self.num_pos_features > 0:
             if sample_id not in self._pos_feat_cache:
+                if len(self._pos_feat_cache) >= self._pos_feat_cache_max:
+                    self._pos_feat_cache.pop(next(iter(self._pos_feat_cache)))
                 self._pos_feat_cache[sample_id] = _compute_positional_features(
                     pos, edge_index, self.num_pos_features, self.positional_encoding
                 )
