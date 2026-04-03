@@ -3,7 +3,8 @@ import torch.nn.init as init
 import torch.nn as nn
 import torch
 from torch_geometric.data import Data
-from torch_geometric.nn import global_mean_pool
+from torch_geometric.nn import global_mean_pool, GlobalAttention
+from torch_geometric.utils import scatter
 from general_modules.edge_features import EDGE_FEATURE_DIM
 from model.blocks import EdgeBlock, NodeBlock, HybridNodeBlock
 from model.checkpointing import process_with_checkpointing
@@ -41,7 +42,7 @@ class MeshGraphNets(nn.Module):
         """Enable or disable gradient checkpointing."""
         self.model.set_checkpointing(enabled)
 
-    def forward(self, graph, debug=False):
+    def forward(self, graph, debug=False, add_noise=None, use_posterior=None):
         """
         Forward pass of the simulator.
 
@@ -54,8 +55,11 @@ class MeshGraphNets(nn.Module):
             predicted: predicted normalized delta [N, output_var]
             target: normalized target delta [N, output_var]
         """
+        if add_noise is None:
+            add_noise = self.training
+
         # Noise injection during training (node + edge noise for regularization)
-        if self.training:
+        if add_noise:
             noise_std = self.config.get('std_noise', 0.0)
             if noise_std > 0:
                 output_var = self.config['output_var']
@@ -76,9 +80,13 @@ class MeshGraphNets(nn.Module):
                 edge_noise = torch.randn_like(graph.edge_attr) * noise_std
                 graph.edge_attr = graph.edge_attr + edge_noise
         # Forward through encoder-processor-decoder
-        predicted, kl = self.model(graph, debug=debug)
+        predicted, kl, aux_loss = self.model(
+            graph,
+            debug=debug,
+            use_posterior=use_posterior,
+        )
 
-        return predicted, graph.y, kl
+        return predicted, graph.y, kl, aux_loss
 
 class EncoderProcessorDecoder(nn.Module):
     def __init__(self, config):
@@ -128,6 +136,7 @@ class EncoderProcessorDecoder(nn.Module):
             # ── Hierarchical N-level V-cycle processor ───────────────────────
             L = int(config.get('multiscale_levels', 1))
             self.multiscale_levels = L
+            self.mp_per_level = None  # set after parsing below
 
             # Parse mp_per_level or construct from legacy keys
             mp_per_level = config.get('mp_per_level', None)
@@ -140,6 +149,8 @@ class EncoderProcessorDecoder(nn.Module):
                 mp_per_level = [int(mp_per_level)]
             else:
                 mp_per_level = [int(x) for x in mp_per_level]
+
+            self.mp_per_level = mp_per_level  # save for VAE z_projs construction
 
             expected_len = 2 * L + 1
             if len(mp_per_level) != expected_len:
@@ -213,78 +224,138 @@ class EncoderProcessorDecoder(nn.Module):
         self.use_vae = config.get('use_vae', False)
         if self.use_vae:
             self.vae_latent_dim = int(config.get('vae_latent_dim', 32))
-            self.vae_encoder = VariationalEncoder(
-                self.node_output_size, self.latent_dim, self.vae_latent_dim
+            vae_mp_layers = int(config.get('vae_mp_layers', 2))
+            self.vae_encoder = GNNVariationalEncoder(
+                self.node_output_size, self.edge_input_size,
+                self.latent_dim, self.vae_latent_dim, num_mp_layers=vae_mp_layers
             )
-            self.condition_proj = nn.Linear(self.latent_dim + self.vae_latent_dim, self.latent_dim)
-            print(f"  VAE: ENABLED (z_dim={self.vae_latent_dim})")
+            # Per-layer z injection: concat z to node features before each GnBlock
+            # so the processor sees z continuously (not just once at the input)
+            if not self.use_multiscale:
+                self.z_projs = nn.ModuleList([
+                    nn.Linear(self.latent_dim + self.vae_latent_dim, self.latent_dim)
+                    for _ in range(self.message_passing_num)
+                ])
+            else:
+                # Inject z only at finest level (level 0) pre and post blocks
+                L = self.multiscale_levels
+                pre_count_0  = self.mp_per_level[0]
+                post_count_0 = self.mp_per_level[2 * L]
+                self.ms_z_projs_pre_0 = nn.ModuleList([
+                    nn.Linear(self.latent_dim + self.vae_latent_dim, self.latent_dim)
+                    for _ in range(pre_count_0)
+                ])
+                self.ms_z_projs_post_0 = nn.ModuleList([
+                    nn.Linear(self.latent_dim + self.vae_latent_dim, self.latent_dim)
+                    for _ in range(post_count_0)
+                ])
+            # Auxiliary decoder: z → global stats of target delta per graph.
+            # Forces z to encode useful summary info (mean + std per output feature).
+            # Provides direct gradient signal to the VAE encoder independent of the processor.
+            self.aux_decoder = build_mlp(
+                self.vae_latent_dim, self.latent_dim,
+                2 * self.node_output_size,
+                layer_norm=False, decoder=True
+            )
+            print(f"  VAE: ENABLED (z_dim={self.vae_latent_dim}, vae_mp_layers={vae_mp_layers})")
 
-    def _vae_condition(self, encoder_x, original_y, original_batch):
+    def _encode_vae(self, original_y, original_edge_index, original_edge_attr,
+                    original_batch, N, device, dtype, use_posterior):
         """
-        Apply VAE conditioning.
-          Training + y available: encode y → (z, mu, logvar), reparameterize, return (x_cond, kl).
-          Eval or y=None:         sample z ~ N(0, I), return (x_cond, 0.0).
-        z is broadcast per-node then concatenated with encoder_x and projected back to latent_dim.
+        Encode target delta into VAE latent z.
+          use_posterior=True  + y available: GNN-encode y → (z, mu, logvar), compute KL.
+          use_posterior=False or y missing:  sample z ~ N(0, I), KL=0.
+        Returns:
+            z:   [B, vae_latent_dim]
+            kl:  scalar
         """
-        N = encoder_x.shape[0]
-        device = encoder_x.device
-        dtype = encoder_x.dtype
-
-        if self.training and original_y is not None:
+        if use_posterior and original_y is not None:
             batch = (original_batch if original_batch is not None
                      else torch.zeros(N, dtype=torch.long, device=device))
-            z, mu, logvar = self.vae_encoder(original_y, batch)
-            kl = VariationalEncoder.kl_loss(mu, logvar)
+            z, mu, logvar = self.vae_encoder(original_y, original_edge_index, original_edge_attr, batch)
+            kl = GNNVariationalEncoder.kl_loss(mu, logvar)
         else:
             B = int(original_batch.max().item()) + 1 if original_batch is not None else 1
             z = torch.randn(B, self.vae_latent_dim, device=device, dtype=dtype)
             kl = 0.0
+        return z, kl
 
-        batch_bc = (original_batch if original_batch is not None
-                    else torch.zeros(N, dtype=torch.long, device=device))
-        z_per_node = z[batch_bc]  # [N, vae_latent_dim]
-        x_conditioned = self.condition_proj(torch.cat([encoder_x, z_per_node], dim=-1))
-        return x_conditioned, kl
+    def _aux_loss(self, z, original_y, original_batch, N, device):
+        """Auxiliary loss: z should predict global stats (mean+std) of target delta per graph."""
+        batch = (original_batch if original_batch is not None
+                 else torch.zeros(N, dtype=torch.long, device=device))
+        B = z.shape[0]
+        y_mean = scatter(original_y, batch, dim=0, dim_size=B, reduce='mean')   # [B, output_var]
+        y_centered = original_y - y_mean[batch]                                  # [N, output_var]
+        y_std = scatter(y_centered.pow(2), batch, dim=0, dim_size=B, reduce='mean').sqrt()  # [B, output_var]
+        aux_target = torch.cat([y_mean, y_std], dim=-1)                          # [B, 2*output_var]
+        aux_pred = self.aux_decoder(z)                                            # [B, 2*output_var]
+        return torch.nn.functional.mse_loss(aux_pred, aux_target)
 
-    def forward(self, graph, debug=False):
+    def forward(self, graph, debug=False, use_posterior=None):
+        if use_posterior is None:
+            use_posterior = self.training and self.use_vae
+
         if not self.use_multiscale:
             # ── Original flat path ────────────────────────────────────────────
-            # Save y and batch BEFORE encoder (encoder drops them)
-            original_y = getattr(graph, 'y', None)
-            original_batch = getattr(graph, 'batch', None)
+            # Save y, batch, and raw edge features BEFORE encoder (encoder drops them)
+            original_y         = getattr(graph, 'y', None)
+            original_batch     = getattr(graph, 'batch', None)
+            original_edge_attr = graph.edge_attr
+            original_edge_index = graph.edge_index
 
             graph = self.encoder(graph)
-            encoder_x = graph.x  # save pre-VAE encoder output for skip connection
+            encoder_x = graph.x  # save encoder output for gated skip connection
             if debug:
                 print(f"  After Encoder: x std={graph.x.std().item():.4f}, mean={graph.x.mean().item():.4f}")
 
-            # VAE conditioning (after encoder, before processor)
+            # VAE: encode target delta → z, then inject z at every processor layer
             kl = 0.0
+            aux_loss = 0.0
+            z_per_node = None
             if self.use_vae:
-                x_conditioned, kl = self._vae_condition(graph.x, original_y, original_batch)
-                graph.x = x_conditioned
+                N = graph.x.shape[0]
+                device = graph.x.device
+                dtype = graph.x.dtype
+                batch_bc = (original_batch if original_batch is not None
+                            else torch.zeros(N, dtype=torch.long, device=device))
+                z, kl = self._encode_vae(
+                    original_y, original_edge_index, original_edge_attr,
+                    original_batch, N, device, dtype, use_posterior
+                )
+                z_per_node = z[batch_bc]  # [N, vae_latent_dim]
+                if self.training and original_y is not None:
+                    aux_loss = self._aux_loss(z, original_y, original_batch, N, device)
 
             if self.use_checkpointing and self.training:
-                graph = process_with_checkpointing(self.processer_list, graph)
+                graph = process_with_checkpointing(self.processer_list, graph,
+                                                   z_projs=self.z_projs if self.use_vae else None,
+                                                   z_per_node=z_per_node)
             else:
                 for i, model in enumerate(self.processer_list):
+                    if self.use_vae and z_per_node is not None:
+                        # Inject z: concat current node features with z, project back to latent_dim
+                        graph.x = self.z_projs[i](torch.cat([graph.x, z_per_node], dim=-1))
                     graph = model(graph)
                     if debug and i == len(self.processer_list) - 1:
                         print(f"  After MP block {i}: x std={graph.x.std().item():.4f}, mean={graph.x.mean().item():.4f}")
+
             # Gated skip: blend encoder features back into processed output
             gate = self.skip_gate(torch.cat([graph.x, encoder_x], dim=-1))
             graph = Data(x=graph.x + gate * encoder_x, edge_attr=graph.edge_attr, edge_index=graph.edge_index)
             output = self.decoder(graph)
             if debug:
                 print(f"  After Decoder: out std={output.std().item():.4f}, mean={output.mean().item():.4f}")
-            return output, kl
+            return output, kl, aux_loss
 
         # ── Hierarchical N-level V-cycle path ─────────────────────────────────
         L = self.multiscale_levels
 
-        # Save y and batch BEFORE encoder (encoder drops them)
-        original_y = getattr(graph, 'y', None)
-        original_batch = getattr(graph, 'batch', None)
+        # Save y, batch, and raw edge features BEFORE encoder (encoder drops them)
+        original_y          = getattr(graph, 'y', None)
+        original_batch      = getattr(graph, 'batch', None)
+        original_edge_attr  = graph.edge_attr
+        original_edge_index = graph.edge_index
 
         # Extract per-level topology BEFORE encoder (encoder drops custom attrs)
         level_data = {}
@@ -308,26 +379,43 @@ class EncoderProcessorDecoder(nn.Module):
 
         # Encode fine graph
         graph = self.encoder(graph)
-        encoder_x = graph.x  # save pre-VAE encoder output for skip connection
+        encoder_x = graph.x  # save encoder output for gated skip connection
         if debug:
             print(f"  [MS] After Encoder: x std={graph.x.std().item():.4f}")
 
-        # VAE conditioning at fine level (after encoder, before V-cycle)
+        # VAE: encode target delta → z
         kl = 0.0
+        aux_loss = 0.0
+        z_per_node = None
         if self.use_vae:
-            x_conditioned, kl = self._vae_condition(graph.x, original_y, original_batch)
-            graph.x = x_conditioned
+            N = graph.x.shape[0]
+            device = graph.x.device
+            dtype = graph.x.dtype
+            batch_bc = (original_batch if original_batch is not None
+                        else torch.zeros(N, dtype=torch.long, device=device))
+            z, kl = self._encode_vae(
+                original_y, original_edge_index, original_edge_attr,
+                original_batch, N, device, dtype, use_posterior
+            )
+            z_per_node = z[batch_bc]  # [N, vae_latent_dim]
+            if self.training and original_y is not None:
+                aux_loss = self._aux_loss(z, original_y, original_batch, N, device)
 
         # ── DESCENDING ARM (fine → coarse) ───────────────────────────────────
         skip_states = []
         current_graph = graph
 
         for i in range(actual_levels):
-            # Run pre-blocks at level i
+            # Run pre-blocks at level i (inject z at finest level only)
+            z_projs_pre = self.ms_z_projs_pre_0 if (self.use_vae and i == 0) else None
             if self.use_checkpointing and self.training:
-                current_graph = process_with_checkpointing(self.pre_blocks[i], current_graph)
+                current_graph = process_with_checkpointing(self.pre_blocks[i], current_graph,
+                                                           z_projs=z_projs_pre,
+                                                           z_per_node=z_per_node)
             else:
-                for block in self.pre_blocks[i]:
+                for j, block in enumerate(self.pre_blocks[i]):
+                    if z_projs_pre is not None and z_per_node is not None:
+                        current_graph.x = z_projs_pre[j](torch.cat([current_graph.x, z_per_node], dim=-1))
                     current_graph = block(current_graph)
 
             if debug:
@@ -387,11 +475,16 @@ class EncoderProcessorDecoder(nn.Module):
                 current_graph.world_edge_attr = skip['w_attr']
                 current_graph.world_edge_index = skip['w_idx']
 
-            # Run post-blocks at level i
+            # Run post-blocks at level i (inject z at finest level only)
+            z_projs_post = self.ms_z_projs_post_0 if (self.use_vae and i == 0) else None
             if self.use_checkpointing and self.training:
-                current_graph = process_with_checkpointing(self.post_blocks[i], current_graph)
+                current_graph = process_with_checkpointing(self.post_blocks[i], current_graph,
+                                                           z_projs=z_projs_post,
+                                                           z_per_node=z_per_node)
             else:
-                for block in self.post_blocks[i]:
+                for j, block in enumerate(self.post_blocks[i]):
+                    if z_projs_post is not None and z_per_node is not None:
+                        current_graph.x = z_projs_post[j](torch.cat([current_graph.x, z_per_node], dim=-1))
                     current_graph = block(current_graph)
 
             if debug:
@@ -404,7 +497,7 @@ class EncoderProcessorDecoder(nn.Module):
         output = self.decoder(current_graph)
         if debug:
             print(f"  [MS] After Decoder: out std={output.std().item():.4f}")
-        return output, kl
+        return output, kl, aux_loss
 
     def set_checkpointing(self, enabled: bool):
         """Enable or disable gradient checkpointing."""
@@ -457,29 +550,55 @@ def build_mlp(in_size, hidden_size, out_size, layer_norm=True, activation='silu'
 
     return module
 
-class VariationalEncoder(nn.Module):
-    """Encodes ground-truth target delta into a global stochastic latent z (cVAE encoder)."""
+class GNNVariationalEncoder(nn.Module):
+    """GNN-based cVAE encoder: encodes target delta into a global stochastic latent z.
 
-    def __init__(self, node_output_size, latent_dim, vae_latent_dim):
+    Runs message passing on the mesh graph before pooling, so z captures spatially
+    correlated patterns in the deformation field (e.g. manufacturing variation that
+    affects a whole region) rather than just per-node averages.
+
+    Architecture:
+        y [N, output_var]  → node_encoder MLP  → [N, latent_dim]
+        edge_attr [E, 8]   → edge_encoder MLP  → [E, latent_dim]
+        → num_mp_layers GnBlocks (message passing on mesh topology)
+        → GlobalAttention pool → [B, latent_dim]
+        → mu_head, logvar_head → z [B, vae_latent_dim]
+    """
+
+    def __init__(self, node_output_size, edge_input_size, latent_dim, vae_latent_dim, num_mp_layers=2):
         super().__init__()
-        self.encoder_mlp = build_mlp(node_output_size, latent_dim, latent_dim)
+        self.node_encoder = build_mlp(node_output_size, latent_dim, latent_dim)
+        self.edge_encoder = build_mlp(edge_input_size, latent_dim, latent_dim)
+        minimal_config = {'residual_scale': 1.0, 'use_pairnorm': False}
+        self.mp_layers = nn.ModuleList([
+            GnBlock(minimal_config, latent_dim, use_world_edges=False)
+            for _ in range(num_mp_layers)
+        ])
+        # Attention pooling: focus on high-variation nodes (e.g. stress concentrations)
+        self.attention_pool = GlobalAttention(nn.Linear(latent_dim, 1))
         self.mu_head = nn.Linear(latent_dim, vae_latent_dim)
         self.logvar_head = nn.Linear(latent_dim, vae_latent_dim)
 
-    def forward(self, y, batch):
+    def forward(self, y, edge_index, edge_attr, batch):
         """
         Args:
-            y:     [N, node_output_size] per-node target delta
-            batch: [N] PyG batch assignment index
+            y:          [N, node_output_size] per-node target delta
+            edge_index: [2, E] mesh edge connectivity
+            edge_attr:  [E, 8] raw edge features
+            batch:      [N] PyG batch assignment index
         Returns:
             z:      [B, vae_latent_dim] reparameterized latent
             mu:     [B, vae_latent_dim]
             logvar: [B, vae_latent_dim]
         """
-        h = self.encoder_mlp(y)                # [N, latent_dim]
-        h_pooled = global_mean_pool(h, batch)  # [B, latent_dim]
-        mu = self.mu_head(h_pooled)            # [B, vae_latent_dim]
-        logvar = self.logvar_head(h_pooled)    # [B, vae_latent_dim]
+        h = self.node_encoder(y)              # [N, latent_dim]
+        e = self.edge_encoder(edge_attr)      # [E, latent_dim]
+        g = Data(x=h, edge_attr=e, edge_index=edge_index)
+        for mp in self.mp_layers:
+            g = mp(g)                         # message passing on target delta field
+        h_graph = self.attention_pool(g.x, batch)  # [B, latent_dim]
+        mu = self.mu_head(h_graph)
+        logvar = self.logvar_head(h_graph)
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         z = mu + std * eps

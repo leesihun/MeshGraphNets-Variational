@@ -60,7 +60,19 @@
       "Bash(curl -s \"https://api.search.brave.com/res/v1/web/search?q=PointNet%2B%2B+feature+propagation+inverse+distance+interpolation+upsampling&count=10\" -H \"Accept: application/json\" -H \"X-Subscription-Token: $BRAVE_SEARCH_API_KEY\")",
       "Bash(curl -s \"https://api.search.brave.com/res/v1/web/search?q=Graph+U-Net+Gao+Ji+2019+gUnpool+unpooling+mechanism&count=10\" -H \"Accept: application/json\" -H \"X-Subscription-Token: $BRAVE_SEARCH_API_KEY\")",
       "Bash(curl -s \"https://api.search.brave.com/res/v1/web/search?q=DiffPool+Ying+2018+soft+assignment+matrix+unpooling+reverse&count=10\" -H \"Accept: application/json\" -H \"X-Subscription-Token: $BRAVE_SEARCH_API_KEY\")",
-      "WebFetch(domain:www.semanticscholar.org)"
+      "WebFetch(domain:www.semanticscholar.org)",
+      "Bash(curl -s \"https://api.search.brave.com/res/v1/web/search?q=graph+VAE+pooling+problem+preserve+spatial+structure+VGAE+GraphVAE&count=10\" -H 'Accept: application/json' -H 'Accept-Encoding: gzip' -H 'X-Subscription-Token: $BRAVE_SEARCH_API_KEY')",
+      "Bash(curl -s \"https://api.search.brave.com/res/v1/web/search?q=Set2Set+attention+pooling+DiffPool+graph+level+readout+preserve+structure&count=10\" -H 'Accept: application/json' -H 'Accept-Encoding: gzip' -H 'X-Subscription-Token: $BRAVE_SEARCH_API_KEY')",
+      "Bash(curl -s \"https://api.search.brave.com/res/v1/web/search?q=per+node+latent+variable+graph+VAE+spatially+coherent+sampling+inference&count=10\" -H 'Accept: application/json' -H 'Accept-Encoding: gzip' -H 'X-Subscription-Token: $BRAVE_SEARCH_API_KEY')",
+      "Bash(curl -s \"https://api.search.brave.com/res/v1/web/search?q=hierarchical+graph+pooling+mesh+data+FEA+simulation+VAE&count=10\" -H 'Accept: application/json' -H 'Accept-Encoding: gzip' -H 'X-Subscription-Token: $BRAVE_SEARCH_API_KEY')",
+      "Bash(curl -s \"https://api.search.brave.com/res/v1/web/search?q=physics+informed+VAE+mesh+graph+neural+network+simulation+uncertainty&count=10\" -H 'Accept: application/json' -H 'Accept-Encoding: gzip' -H 'X-Subscription-Token: $BRAVE_SEARCH_API_KEY')",
+      "Bash(curl -s \"https://api.search.brave.com/res/v1/web/search?q=message+passing+GNN+inside+VAE+encoder+before+pooling+graph+generation&count=10\" -H 'Accept: application/json' -H 'Accept-Encoding: gzip' -H 'X-Subscription-Token: $BRAVE_SEARCH_API_KEY')",
+      "WebFetch(domain:openaccess.thecvf.com)",
+      "Bash(curl -s \"https://api.search.brave.com/res/v1/web/search?q=conditional+VAE+graph+neural+network+latent+injection+message+passing+FiLM+modulation&count=10\" -H 'Accept: application/json' -H 'Accept-Encoding: gzip' -H 'X-Subscription-Token: $BRAVE_SEARCH_API_KEY')",
+      "Bash(curl -s \"https://api.search.brave.com/res/v1/web/search?q=information+preference+conditional+VAE+decoder+ignores+latent+posterior+collapse+solutions&count=10\" -H 'Accept: application/json' -H 'Accept-Encoding: gzip' -H 'X-Subscription-Token: $BRAVE_SEARCH_API_KEY')",
+      "Bash(curl -s \"https://api.search.brave.com/res/v1/web/search?q=auxiliary+decoder+VAE+prevent+posterior+collapse+latent+variable&count=10\" -H 'Accept: application/json' -H 'Accept-Encoding: gzip' -H 'X-Subscription-Token: $BRAVE_SEARCH_API_KEY')",
+      "Bash(curl -s \"https://api.search.brave.com/res/v1/web/search?q=IWAE+importance+weighted+autoencoder+multi+sample+ELBO+posterior+collapse&count=10\" -H 'Accept: application/json' -H 'Accept-Encoding: gzip' -H 'X-Subscription-Token: $BRAVE_SEARCH_API_KEY')",
+      "Bash(curl -s \"https://api.search.brave.com/res/v1/web/search?q=normalizing+flow+posterior+VAE+scientific+simulation+physics&count=10\" -H 'Accept: application/json' -H 'Accept-Encoding: gzip' -H 'X-Subscription-Token: $BRAVE_SEARCH_API_KEY')"
     ]
   }
 }

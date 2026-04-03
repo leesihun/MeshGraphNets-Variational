@@ -16,7 +16,15 @@ from general_modules.data_loader import load_data
 from torch.utils.data import Subset
 from torch_geometric.loader import DataLoader
 from model.MeshGraphNets import MeshGraphNets
-from training_profiles.training_loop import train_epoch, validate_epoch, test_model, log_training_config, build_ema_model
+from training_profiles.training_loop import (
+    build_ema_model,
+    evaluate_vae_posterior_epoch,
+    evaluate_vae_prior_epoch,
+    log_training_config,
+    test_model,
+    train_epoch,
+    validate_epoch,
+)
 
 # Per-process shutdown flag, set by signal handler
 _stop_event = threading.Event()
@@ -288,6 +296,10 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
     dist.barrier(device_ids=[gpu_id])
 
     modelname = config.get('modelpath')
+    use_vae = config.get('use_vae', False)
+    vae_valid_prior_samples = int(config.get('vae_valid_prior_samples', 8)) if use_vae else 1
+    if vae_valid_prior_samples < 1:
+        raise ValueError("vae_valid_prior_samples must be >= 1")
 
     interrupted = False
     for epoch in range(config.get('training_epochs')):
@@ -314,7 +326,6 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
         dist.all_reduce(train_totals, op=dist.ReduceOp.SUM)
         train_loss = (train_totals[0] / train_totals[1]).item()
 
-        use_vae = config.get('use_vae', False)
         if use_vae and 'kl_mean' in train_metrics:
             kl_tensor = torch.tensor([train_metrics['kl_mean']], device=device, dtype=torch.float64)
             dist.all_reduce(kl_tensor, op=dist.ReduceOp.SUM)
@@ -328,8 +339,6 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
             train_metrics['total_mean'] = (total_tensor[0] / train_totals[1]).item()
 
         if rank == 0:
-            # traineval uses the real model (sanity-check against trainopt);
-            # valid/test use EMA for smoother generalization estimates.
             eval_model = ema_model.module if ema_model is not None else model
 
             # Resample train_eval subset each epoch for an unbiased training loss estimate
@@ -343,8 +352,24 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
                 num_workers=num_workers,
                 pin_memory=True,
             )
-            train_eval_metrics = validate_epoch(model, train_eval_loader, device, config, epoch)
-            valid_metrics = validate_epoch(eval_model, val_loader, device, config, epoch)
+            if use_vae:
+                train_eval_metrics = evaluate_vae_posterior_epoch(
+                    eval_model, train_eval_loader, device, config, epoch,
+                    progress_name='TrainEvalQ'
+                )
+                valid_metrics = evaluate_vae_posterior_epoch(
+                    eval_model, val_loader, device, config, epoch,
+                    progress_name='ValidQ'
+                )
+                valid_prior_metrics = evaluate_vae_prior_epoch(
+                    eval_model, val_loader, device, config, epoch,
+                    num_prior_samples=vae_valid_prior_samples,
+                    progress_name=f'ValidPrior@{vae_valid_prior_samples}'
+                )
+            else:
+                train_eval_metrics = validate_epoch(model, train_eval_loader, device, config, epoch)
+                valid_metrics = validate_epoch(eval_model, val_loader, device, config, epoch)
+                valid_prior_metrics = None
             train_eval_loss = train_eval_metrics['mean']
             valid_loss = valid_metrics['mean']
         else:
@@ -368,15 +393,20 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
         # Step scheduler on all ranks (valid_loss is identical after all_reduce)
         scheduler.step()
 
-        # Per epoch, node-weighted optimization, clean-train, and validation losses.
+        # Per epoch, node-weighted optimization and evaluation losses.
         current_lr = optimizer.param_groups[0]['lr']
         if rank == 0:
             if use_vae:
+                train_eval_kl = train_eval_metrics.get('kl_mean', 0.0)
+                train_eval_total = train_eval_metrics.get('total_mean', train_eval_loss)
+                valid_prior_loss = valid_prior_metrics['mean']
+                prior_gap = valid_prior_loss - valid_loss
                 print(
                     f"Epoch {epoch}/{config['training_epochs']} LR: {current_lr:.2e} | "
                     f"TrainOpt  recon={train_loss:.2e} kl={train_metrics.get('kl_mean', 0.0):.2e} total={train_metrics.get('total_mean', train_loss):.2e} | "
-                    f"TrainEval recon={train_eval_loss:.2e} kl={train_eval_metrics.get('kl_mean', 0.0):.2e} total={train_eval_metrics.get('total_mean', train_eval_loss):.2e} | "
-                    f"Valid     recon={valid_loss:.2e} kl={valid_metrics.get('kl_mean', 0.0):.2e} total={valid_metrics.get('total_mean', valid_loss):.2e}"
+                    f"TrainEvalQ recon={train_eval_loss:.2e} kl={train_eval_kl:.2e} total={train_eval_total:.2e} | "
+                    f"ValidQ    recon={valid_loss:.2e} kl={valid_metrics.get('kl_mean', 0.0):.2e} total={valid_metrics.get('total_mean', valid_loss):.2e} | "
+                    f"ValidPrior@{vae_valid_prior_samples} recon={valid_prior_loss:.2e} gap={prior_gap:.2e}"
                 )
             else:
                 print(
@@ -439,6 +469,9 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
                 'normalization': normalization,
                 'model_config': model_config,
             }
+            if use_vae:
+                save_dict['valid_prior_loss'] = valid_prior_loss
+                save_dict['valid_prior_samples'] = vae_valid_prior_samples
             if ema_model is not None:
                 save_dict['ema_state_dict'] = ema_model.state_dict()
             torch.save(save_dict, checkpoint_path)
@@ -451,8 +484,9 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
                         f"Elapsed: {time.time() - start_time:.2f}s "
                         f"Epoch {epoch} LR: {current_lr:.4e} | "
                         f"TrainOpt recon={train_loss:.4e} kl={train_metrics.get('kl_mean', 0.0):.4e} total={train_metrics.get('total_mean', train_loss):.4e} | "
-                        f"TrainEval recon={train_eval_loss:.4e} kl={train_eval_metrics.get('kl_mean', 0.0):.4e} total={train_eval_metrics.get('total_mean', train_eval_loss):.4e} | "
-                        f"Valid recon={valid_loss:.4e} kl={valid_metrics.get('kl_mean', 0.0):.4e} total={valid_metrics.get('total_mean', valid_loss):.4e}\n"
+                        f"TrainEvalQ recon={train_eval_loss:.4e} kl={train_eval_metrics.get('kl_mean', 0.0):.4e} total={train_eval_metrics.get('total_mean', train_eval_loss):.4e} | "
+                        f"ValidQ recon={valid_loss:.4e} kl={valid_metrics.get('kl_mean', 0.0):.4e} total={valid_metrics.get('total_mean', valid_loss):.4e} | "
+                        f"ValidPrior@{vae_valid_prior_samples} recon={valid_prior_loss:.4e} gap={prior_gap:.4e}\n"
                     )
                 else:
                     f.write(

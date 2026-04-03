@@ -356,8 +356,6 @@ class MeshGraphDataset(Dataset):
         self.coarse_edge_stds: List = []    # per-level: [std_level_0, std_level_1, ...]
         self._coarse_cache_max = int(config.get('coarse_cache_per_worker', 2000))
         self._coarse_cache: Dict = {}  # {sample_id: {'levels': L, 'fine_to_coarse_0':..., 'coarse_edge_index_0':..., 'num_coarse_0':..., ...}}
-        self._pos_feat_cache_max = int(config.get('pos_feat_cache_per_worker', 500))
-        self._pos_feat_cache: Dict = {}  # {sample_id: np.ndarray [N, num_pos_features]} — cached per worker, topology-invariant
 
         # Per-level coarsening method ('bfs' or 'voronoi')
         raw_ct = config.get('coarsening_type', 'bfs')
@@ -652,8 +650,6 @@ class MeshGraphDataset(Dataset):
         subset.coarse_edge_stds = []
         subset._coarse_cache = {}
         subset._coarse_cache_max = self._coarse_cache_max
-        subset._pos_feat_cache_max = self._pos_feat_cache_max
-        subset._pos_feat_cache = {}
         subset._h5_handle = None
         subset.is_training = is_training
         subset.augment_geometry = self.config.get('augment_geometry', False) and is_training
@@ -1098,7 +1094,6 @@ class MeshGraphDataset(Dataset):
         state = self.__dict__.copy()
         state['_h5_handle'] = None
         state['_coarse_cache'] = {}    # workers start with empty cache; they build lazily
-        state['_pos_feat_cache'] = {}
         return state
 
     def __setstate__(self, state):
@@ -1200,16 +1195,11 @@ class MeshGraphDataset(Dataset):
             target_delta = y_raw - x_phys  # [N, output_var]
 
         # Append rotation-invariant positional features (geometry + topology)
-        # All features (centroid_dist, mean_edge_len, LPE) are rotation-invariant and topology-fixed,
-        # so we cache per sample_id to avoid recomputing eigenvectors every __getitem__ call.
+        # Computed on-the-fly per __getitem__ call; workers parallelize this naturally.
         if self.num_pos_features > 0:
-            if sample_id not in self._pos_feat_cache:
-                if len(self._pos_feat_cache) >= self._pos_feat_cache_max:
-                    self._pos_feat_cache.pop(next(iter(self._pos_feat_cache)))
-                self._pos_feat_cache[sample_id] = _compute_positional_features(
-                    pos, edge_index, self.num_pos_features, self.positional_encoding
-                )
-            x_pos = self._pos_feat_cache[sample_id]
+            x_pos = _compute_positional_features(
+                pos, edge_index, self.num_pos_features, self.positional_encoding
+            )
             x_raw = np.concatenate([x_phys, x_pos], axis=1)  # [N, input_var + pos_features]
         else:
             x_raw = x_phys
