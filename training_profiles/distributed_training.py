@@ -71,9 +71,6 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
-    # Disable HDF5 file locking — multiple ranks + workers open the same file read-only
-    os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
-
     # Enable NCCL flight recorder for debugging collective mismatches
     os.environ.setdefault('TORCH_NCCL_TRACE_BUFFER_SIZE', '1000')
 

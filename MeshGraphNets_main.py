@@ -1,6 +1,9 @@
 # MeshGraphNets
-import argparse
 import os
+# Must be set before h5py is imported (transitively via data_loader/mesh_dataset)
+os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
+
+import argparse
 import socket
 import torch.multiprocessing as mp
 from torch.multiprocessing.spawn import ProcessExitedException

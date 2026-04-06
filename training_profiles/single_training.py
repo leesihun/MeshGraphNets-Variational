@@ -19,9 +19,6 @@ from training_profiles.training_loop import (
     validate_epoch,
 )
 
-# Disable HDF5 file locking for persistent SWMR handles with multiple DataLoader workers
-os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
-
 def single_worker(config, config_filename='config.txt'):
     # Single GPU/CPU training
     gpu_ids = config.get('gpu_ids')
