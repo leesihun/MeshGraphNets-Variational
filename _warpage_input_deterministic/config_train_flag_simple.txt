@@ -1,0 +1,47 @@
+model   MeshGraphNets
+mode    train  # Train / Inference
+gpu_ids 0,1    # -1 for CPU, comma-separated for DDP
+log_file_dir    train_flag_simple.log
+modelpath   ./outputs/flag_simple.pth
+%   Datasets: DeepMind flag_simple (fixed mesh), converted to ./dataset/flag_simple.h5 — 1200 trajectories, T=401, N=1579
+dataset_dir ./dataset/flag_simple.h5
+infer_dataset   ./dataset/flag_simple.h5
+infer_timesteps 400  # Rollout steps (trajectory length 401 in HDF5)
+%   Common params (cloth: xyz displacement; stress=0; node_type in channel 8)
+input_var   3
+output_var  3
+feature_loss_weights  1.0, 1.0, 1.0
+edge_var    8
+positional_features  4
+%   Network parameters
+message_passing_num 15
+Training_epochs	200
+Batch_size	1
+LearningR	0.0001
+Latent_dim	256
+num_workers 8
+std_noise   0.01
+residual_scale  1
+augment_geometry True   # Z-rotation + reflection (train only)
+grad_accum_steps    1
+% Memory Optimization
+use_checkpointing   True
+% Performance Optimization
+use_amp             True
+use_ema             True
+ema_decay           0.99
+test_interval       1
+% Node Type Parameters
+use_node_types  True
+% World Edges
+use_world_edges         True
+% Test set control
+test_batch_idx  0, 1, 2, 3, 4, 5, 6, 7, 8, 9
+plot_feature_idx    2
+% Multi-Scale
+use_multiscale      True
+coarsening_type     voronoi
+voronoi_clusters    200
+multiscale_levels   1
+mp_per_level        4, 12, 4
+bipartite_unpool    True

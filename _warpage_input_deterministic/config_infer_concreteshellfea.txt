@@ -1,0 +1,26 @@
+model   MeshGraphNets
+mode    inference
+gpu_ids 0
+% Put your trained checkpoint here (must match architecture + normalization below).
+modelpath   ./outputs/ConcreteShellFEA_best.pth
+% Input HDF5: DATASET_FORMAT.md layout (data/<id>/nodal_data, mesh_edge). Place file or fix path.
+infer_dataset   ./dataset/ConcreteShellFEA.h5
+infer_timesteps 34
+inference_output_dir   outputs/rollout_concreteshellfea
+% Must match the training run used to produce modelpath (checkpoint overrides overlapping keys).
+input_var   3
+output_var  3
+edge_var    8
+positional_features  4
+positional_encoding  rwpe
+use_node_types  False
+use_world_edges         False
+use_checkpointing   True
+use_multiscale      True
+coarsening_type     bfs, voronoi
+voronoi_clusters    0, 200
+multiscale_levels   2
+mp_per_level        2, 4, 12, 4, 2
+bipartite_unpool    True
+message_passing_num 15
+Latent_dim	256
