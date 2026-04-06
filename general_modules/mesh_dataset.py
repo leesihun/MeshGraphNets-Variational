@@ -354,7 +354,7 @@ class MeshGraphDataset(Dataset):
         self.multiscale_levels = int(config.get('multiscale_levels', 1))
         self.coarse_edge_means: List = []   # per-level: [mean_level_0, mean_level_1, ...]
         self.coarse_edge_stds: List = []    # per-level: [std_level_0, std_level_1, ...]
-        self._coarse_cache_max = int(config.get('coarse_cache_per_worker', 2000))
+        self._coarse_cache_max = int(config.get('coarse_cache_per_worker', 500))
         self._coarse_cache: Dict = {}  # {sample_id: {'levels': L, 'fine_to_coarse_0':..., 'coarse_edge_index_0':..., 'num_coarse_0':..., ...}}
 
         # Per-level coarsening method ('bfs' or 'voronoi')

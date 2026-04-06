@@ -136,7 +136,7 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=num_workers > 0,
-        prefetch_factor=8 if num_workers > 0 else None,
+        prefetch_factor=2 if num_workers > 0 else None,
     )
 
     if rank == 0:
@@ -147,7 +147,7 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
             num_workers=num_workers,
             pin_memory=True,
             persistent_workers=num_workers > 0,
-            prefetch_factor=8 if num_workers > 0 else None,
+            prefetch_factor=2 if num_workers > 0 else None,
         )
     else:
         val_loader = None
