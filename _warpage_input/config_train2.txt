@@ -10,14 +10,14 @@ infer_timesteps 1
 %   Common params
 input_var   3   # number of input variables: x_disp, y_disp, z_disp, stress (excluding node types)
 output_var  3   # number of output variables: x_disp, y_disp, z_disp, stress (excluding node types)
-feature_loss_weights  0.1, 0.1, 1.0  # Per-feature loss weights for [x_disp, y_disp, z_disp]
+feature_loss_weights  1, 1, 1.0  # Per-feature loss weights for [x_disp, y_disp, z_disp]
 edge_var    8   # deformed dx/dy/dz/dist + reference dx/dy/dz/dist
 positional_features  4   # Rotation-invariant node features: [centroid_dist, mean_edge_len, + encoding]
 '
 %   Network parameters
 message_passing_num 15
-Training_epochs	500
-Batch_size	2
+Training_epochs	1000
+Batch_size	8
 LearningR	0.0001  # Scaled by sqrt(8/1) from 0.0001 for larger batch size
 Latent_dim	256	# MeshGraphNets latent dimension
 num_workers 8
@@ -58,5 +58,5 @@ bipartite_unpool    True    # Learned bipartite MP unpool (False = broadcast)
 use_vae             True   # Enable conditional VAE (encodes target delta during training)
 vae_latent_dim      8      # Global latent z dimension
 beta_kl             0.001   # KL divergence weight
-alpha_recon         1000     # Reconstruction loss weight
-kl_anneal_epochs    200       # Linearly ramp beta from 0 over N epochs (0 = disabled)
+alpha_recon         1000000     # Reconstruction loss weight
+kl_anneal_epochs    1000       # Linearly ramp beta from 0 over N epochs (0 = disabled)
