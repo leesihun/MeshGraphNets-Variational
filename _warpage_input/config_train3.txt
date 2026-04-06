@@ -57,6 +57,6 @@ bipartite_unpool    True    # Learned bipartite MP unpool (False = broadcast)
 % Variational Autoencoder (cVAE) Parameters
 use_vae             True   # Enable conditional VAE (encodes target delta during training)
 vae_latent_dim      256      # Global latent z dimension
-beta_kl             1   # KL divergence weight
+beta_kl             0.001   # KL divergence weight
 alpha_recon         1000     # Reconstruction loss weight
-kl_anneal_epochs    20       # Linearly ramp beta from 0 over N epochs (0 = disabled)
+kl_anneal_epochs    200       # Linearly ramp beta from 0 over N epochs (0 = disabled)
