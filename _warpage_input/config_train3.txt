@@ -1,10 +1,10 @@
 model   MeshGraphNets
 mode    train  # Train / Inference
 gpu_ids 0    # -1 for CPU, GPU ids for multi-GPU training (DDP with both H200s)
-log_file_dir    train1.log
+log_file_dir    train3.log
 modelpath   ./outputs/warpage1.pth
 %   Datasets
-dataset_dir ./dataset/B8_REV04_SEC_BOTcopy.h5
+dataset_dir ./dataset/B8_REV04_SEC_BOTcopy2.h5
 infer_dataset   ./dataset/warpage_infer.h5
 infer_timesteps 1
 %   Common params
@@ -56,7 +56,7 @@ bipartite_unpool    True    # Learned bipartite MP unpool (False = broadcast)
 '
 % Variational Autoencoder (cVAE) Parameters
 use_vae             True   # Enable conditional VAE (encodes target delta during training)
-vae_latent_dim      32      # Global latent z dimension
+vae_latent_dim      256      # Global latent z dimension
 beta_kl             1   # KL divergence weight
 alpha_recon         1000     # Reconstruction loss weight
 kl_anneal_epochs    20       # Linearly ramp beta from 0 over N epochs (0 = disabled)

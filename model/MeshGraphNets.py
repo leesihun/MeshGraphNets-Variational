@@ -215,11 +215,6 @@ class EncoderProcessorDecoder(nn.Module):
         self.decoder = Decoder(self.latent_dim, self.node_output_size)
 
         # Gated encoder→decoder skip connection: learns when to use encoder features
-        self.skip_gate = nn.Sequential(
-            nn.Linear(self.latent_dim * 2, self.latent_dim),
-            nn.Sigmoid()
-        )
-
         # Variational conditioning (conditional VAE — encodes target delta during training)
         self.use_vae = config.get('use_vae', False)
         if self.use_vae:
@@ -305,7 +300,7 @@ class EncoderProcessorDecoder(nn.Module):
             original_edge_index = graph.edge_index
 
             graph = self.encoder(graph)
-            encoder_x = graph.x  # save encoder output for gated skip connection
+
             if debug:
                 print(f"  After Encoder: x std={graph.x.std().item():.4f}, mean={graph.x.mean().item():.4f}")
 
@@ -340,9 +335,6 @@ class EncoderProcessorDecoder(nn.Module):
                     if debug and i == len(self.processer_list) - 1:
                         print(f"  After MP block {i}: x std={graph.x.std().item():.4f}, mean={graph.x.mean().item():.4f}")
 
-            # Gated skip: blend encoder features back into processed output
-            gate = self.skip_gate(torch.cat([graph.x, encoder_x], dim=-1))
-            graph = Data(x=graph.x + gate * encoder_x, edge_attr=graph.edge_attr, edge_index=graph.edge_index)
             output = self.decoder(graph)
             if debug:
                 print(f"  After Decoder: out std={output.std().item():.4f}, mean={output.mean().item():.4f}")
@@ -490,9 +482,6 @@ class EncoderProcessorDecoder(nn.Module):
             if debug:
                 print(f"  [MS] After post[{i}] ({len(self.post_blocks[i])} blocks): x std={current_graph.x.std().item():.4f}")
 
-        # Gated skip: blend encoder features back into processed output
-        gate = self.skip_gate(torch.cat([current_graph.x, encoder_x], dim=-1))
-        current_graph = Data(x=current_graph.x + gate * encoder_x, edge_attr=current_graph.edge_attr, edge_index=current_graph.edge_index)
         # Decode
         output = self.decoder(current_graph)
         if debug:
