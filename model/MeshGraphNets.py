@@ -27,11 +27,8 @@ class MeshGraphNets(nn.Module):
         self.model = EncoderProcessorDecoder(config).to(device)
         self.model.apply(init_weights)
 
-        # Zero-init all z_proj layers so the VAE starts as a no-op.
-        # At epoch 0, z_proj(z)=0 → processor runs identically to non-VAE MGN.
-        # Weights grow during training as z becomes useful.
-        if self.model.use_vae:
-            self.model._zero_init_z_projs()
+        # Leave VAE fusion layers on their standard random init so reconstruction
+        # depends on z from the first training step.
 
         # Scale decoder's last layer for better initial predictions.
         # T>1 (delta prediction): scale to ~0 ("predict no change" prior)
@@ -230,33 +227,33 @@ class EncoderProcessorDecoder(nn.Module):
                 self.node_output_size, self.edge_input_size,
                 self.latent_dim, self.vae_latent_dim, num_mp_layers=vae_mp_layers
             )
-            # Per-layer z injection: ADDITIVE — project z alone to processor dim, then add.
-            # Zero-initialized so at init the processor is identical to non-VAE MGN.
-            # z gradually learns to perturb node features during training.
+            # Per-layer z conditioning: concatenate broadcast z with current node
+            # features, then fuse back to latent_dim before each processor block.
+            # This keeps reconstruction gradients flowing into q(z|y) immediately.
             if not self.use_multiscale:
-                self.z_projs = nn.ModuleList([
-                    nn.Linear(self.vae_latent_dim, self.latent_dim)
+                self.z_fusers = nn.ModuleList([
+                    nn.Linear(self.latent_dim + self.vae_latent_dim, self.latent_dim)
                     for _ in range(self.message_passing_num)
                 ])
             else:
                 # Inject z at every level: pre-blocks, coarsest, and post-blocks
                 L = self.multiscale_levels
-                self.ms_z_projs_pre = nn.ModuleList()
-                self.ms_z_projs_post = nn.ModuleList()
+                self.ms_z_fusers_pre = nn.ModuleList()
+                self.ms_z_fusers_post = nn.ModuleList()
                 for i in range(L):
                     pre_count = self.mp_per_level[i]
                     post_count = self.mp_per_level[2 * L - i]
-                    self.ms_z_projs_pre.append(nn.ModuleList([
-                        nn.Linear(self.vae_latent_dim, self.latent_dim)
+                    self.ms_z_fusers_pre.append(nn.ModuleList([
+                        nn.Linear(self.latent_dim + self.vae_latent_dim, self.latent_dim)
                         for _ in range(pre_count)
                     ]))
-                    self.ms_z_projs_post.append(nn.ModuleList([
-                        nn.Linear(self.vae_latent_dim, self.latent_dim)
+                    self.ms_z_fusers_post.append(nn.ModuleList([
+                        nn.Linear(self.latent_dim + self.vae_latent_dim, self.latent_dim)
                         for _ in range(post_count)
                     ]))
                 coarsest_count = self.mp_per_level[L]
-                self.ms_z_projs_coarsest = nn.ModuleList([
-                    nn.Linear(self.vae_latent_dim, self.latent_dim)
+                self.ms_z_fusers_coarsest = nn.ModuleList([
+                    nn.Linear(self.latent_dim + self.vae_latent_dim, self.latent_dim)
                     for _ in range(coarsest_count)
                 ])
             # Auxiliary decoder: z → global stats of target delta per graph.
@@ -269,30 +266,9 @@ class EncoderProcessorDecoder(nn.Module):
             )
             print(f"  VAE: ENABLED (z_dim={self.vae_latent_dim}, vae_mp_layers={vae_mp_layers})")
 
-    def _zero_init_z_projs(self):
-        """Zero-initialize all z injection projections.
-
-        Called after init_weights() so z_proj(z) == 0 at the start of training.
-        This guarantees the VAE-enabled model produces identical output to the
-        non-VAE MGN at epoch 0 — the working MGN baseline is preserved.
-        z_proj weights grow as z becomes informative during training.
-        """
-        def _zero(linear):
-            nn.init.zeros_(linear.weight)
-            nn.init.zeros_(linear.bias)
-
-        if not self.use_multiscale:
-            for proj in self.z_projs:
-                _zero(proj)
-        else:
-            for level_projs in self.ms_z_projs_pre:
-                for proj in level_projs:
-                    _zero(proj)
-            for level_projs in self.ms_z_projs_post:
-                for proj in level_projs:
-                    _zero(proj)
-            for proj in self.ms_z_projs_coarsest:
-                _zero(proj)
+    def _fuse_z(self, x, z_per_node, fuse_layer):
+        """Condition node latents on z via concatenation."""
+        return fuse_layer(torch.cat([x, z_per_node], dim=-1))
 
     def _encode_vae(self, original_y, original_edge_index, original_edge_attr,
                     original_batch, N, device, dtype, use_posterior):
@@ -364,13 +340,12 @@ class EncoderProcessorDecoder(nn.Module):
 
             if self.use_checkpointing and self.training:
                 graph = process_with_checkpointing(self.processer_list, graph,
-                                                   z_projs=self.z_projs if self.use_vae else None,
+                                                   z_fusers=self.z_fusers if self.use_vae else None,
                                                    z_per_node=z_per_node)
             else:
                 for i, model in enumerate(self.processer_list):
                     if self.use_vae and z_per_node is not None:
-                        # Additive z injection: project z to processor dim and add (preserves x)
-                        graph.x = graph.x + self.z_projs[i](z_per_node)
+                        graph.x = self._fuse_z(graph.x, z_per_node, self.z_fusers[i])
                     graph = model(graph)
                     if debug and i == len(self.processer_list) - 1:
                         print(f"  After MP block {i}: x std={graph.x.std().item():.4f}, mean={graph.x.mean().item():.4f}")
@@ -442,15 +417,15 @@ class EncoderProcessorDecoder(nn.Module):
 
         for i in range(actual_levels):
             # Run pre-blocks at level i (inject z at all levels)
-            z_projs_pre = self.ms_z_projs_pre[i] if (self.use_vae and current_z_per_node is not None) else None
+            z_fusers_pre = self.ms_z_fusers_pre[i] if (self.use_vae and current_z_per_node is not None) else None
             if self.use_checkpointing and self.training:
                 current_graph = process_with_checkpointing(self.pre_blocks[i], current_graph,
-                                                           z_projs=z_projs_pre,
+                                                           z_fusers=z_fusers_pre,
                                                            z_per_node=current_z_per_node)
             else:
                 for j, block in enumerate(self.pre_blocks[i]):
-                    if z_projs_pre is not None and current_z_per_node is not None:
-                        current_graph.x = current_graph.x + z_projs_pre[j](current_z_per_node)
+                    if z_fusers_pre is not None and current_z_per_node is not None:
+                        current_graph.x = self._fuse_z(current_graph.x, current_z_per_node, z_fusers_pre[j])
                     current_graph = block(current_graph)
 
             if debug:
@@ -482,15 +457,15 @@ class EncoderProcessorDecoder(nn.Module):
                 print(f"  [MS] After pool[{i}]: {skip_states[-1]['x'].shape[0]} → {h_coarse.shape[0]} nodes")
 
         # ── COARSEST LEVEL ────────────────────────────────────────────────────
-        z_projs_coarsest = self.ms_z_projs_coarsest if (self.use_vae and current_z_per_node is not None) else None
+        z_fusers_coarsest = self.ms_z_fusers_coarsest if (self.use_vae and current_z_per_node is not None) else None
         if self.use_checkpointing and self.training:
             current_graph = process_with_checkpointing(self.coarsest_blocks, current_graph,
-                                                       z_projs=z_projs_coarsest,
+                                                       z_fusers=z_fusers_coarsest,
                                                        z_per_node=current_z_per_node)
         else:
             for j, block in enumerate(self.coarsest_blocks):
-                if z_projs_coarsest is not None and current_z_per_node is not None:
-                    current_graph.x = current_graph.x + z_projs_coarsest[j](current_z_per_node)
+                if z_fusers_coarsest is not None and current_z_per_node is not None:
+                    current_graph.x = self._fuse_z(current_graph.x, current_z_per_node, z_fusers_coarsest[j])
                 current_graph = block(current_graph)
 
         if debug:
@@ -525,15 +500,15 @@ class EncoderProcessorDecoder(nn.Module):
             # Restore z broadcast for this level from skip state
             level_z_per_node = skip_states[i].get('z_per_node') if self.use_vae else None
             # Run post-blocks at level i (inject z at all levels)
-            z_projs_post = self.ms_z_projs_post[i] if (self.use_vae and level_z_per_node is not None) else None
+            z_fusers_post = self.ms_z_fusers_post[i] if (self.use_vae and level_z_per_node is not None) else None
             if self.use_checkpointing and self.training:
                 current_graph = process_with_checkpointing(self.post_blocks[i], current_graph,
-                                                           z_projs=z_projs_post,
+                                                           z_fusers=z_fusers_post,
                                                            z_per_node=level_z_per_node)
             else:
                 for j, block in enumerate(self.post_blocks[i]):
-                    if z_projs_post is not None and level_z_per_node is not None:
-                        current_graph.x = current_graph.x + z_projs_post[j](level_z_per_node)
+                    if z_fusers_post is not None and level_z_per_node is not None:
+                        current_graph.x = self._fuse_z(current_graph.x, level_z_per_node, z_fusers_post[j])
                     current_graph = block(current_graph)
 
             if debug:

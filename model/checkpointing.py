@@ -49,14 +49,14 @@ def checkpoint_gn_block(block, x, edge_attr, edge_index, world_edge_attr=None, w
     )
 
 
-def process_with_checkpointing(processor_list, graph, z_projs=None, z_per_node=None):
+def process_with_checkpointing(processor_list, graph, z_fusers=None, z_per_node=None):
     """
     Run processor blocks with gradient checkpointing.
 
     Args:
         processor_list: nn.ModuleList of GnBlock modules
         graph: PyG Data object (after encoding)
-        z_projs: optional nn.ModuleList of Linear layers for VAE z injection (one per block)
+        z_fusers: optional nn.ModuleList of Linear layers for concat-based VAE conditioning
         z_per_node: optional [N, vae_latent_dim] tensor broadcast per node
 
     Returns:
@@ -69,10 +69,9 @@ def process_with_checkpointing(processor_list, graph, z_projs=None, z_per_node=N
     world_edge_index = graph.world_edge_index if hasattr(graph, 'world_edge_index') else None
 
     for i, block in enumerate(processor_list):
-        # Additive VAE z injection: project z to processor dim and add (preserves x)
-        if z_projs is not None and z_per_node is not None:
-            import torch
-            x = x + z_projs[i](z_per_node)
+        # Concat-based VAE conditioning keeps z on the reconstruction path.
+        if z_fusers is not None and z_per_node is not None:
+            x = z_fusers[i](torch.cat([x, z_per_node], dim=-1))
         x, edge_attr, world_edge_attr, world_edge_index = checkpoint_gn_block(
             block, x, edge_attr, edge_index, world_edge_attr, world_edge_index
         )
