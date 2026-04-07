@@ -72,7 +72,8 @@
       "Bash(curl -s \"https://api.search.brave.com/res/v1/web/search?q=information+preference+conditional+VAE+decoder+ignores+latent+posterior+collapse+solutions&count=10\" -H 'Accept: application/json' -H 'Accept-Encoding: gzip' -H 'X-Subscription-Token: $BRAVE_SEARCH_API_KEY')",
       "Bash(curl -s \"https://api.search.brave.com/res/v1/web/search?q=auxiliary+decoder+VAE+prevent+posterior+collapse+latent+variable&count=10\" -H 'Accept: application/json' -H 'Accept-Encoding: gzip' -H 'X-Subscription-Token: $BRAVE_SEARCH_API_KEY')",
       "Bash(curl -s \"https://api.search.brave.com/res/v1/web/search?q=IWAE+importance+weighted+autoencoder+multi+sample+ELBO+posterior+collapse&count=10\" -H 'Accept: application/json' -H 'Accept-Encoding: gzip' -H 'X-Subscription-Token: $BRAVE_SEARCH_API_KEY')",
-      "Bash(curl -s \"https://api.search.brave.com/res/v1/web/search?q=normalizing+flow+posterior+VAE+scientific+simulation+physics&count=10\" -H 'Accept: application/json' -H 'Accept-Encoding: gzip' -H 'X-Subscription-Token: $BRAVE_SEARCH_API_KEY')"
+      "Bash(curl -s \"https://api.search.brave.com/res/v1/web/search?q=normalizing+flow+posterior+VAE+scientific+simulation+physics&count=10\" -H 'Accept: application/json' -H 'Accept-Encoding: gzip' -H 'X-Subscription-Token: $BRAVE_SEARCH_API_KEY')",
+      "Bash(grep -l \"use_vae\\\\|beta_kl\\\\|vae_latent\" \"c:\\\\Users\\\\Lee\\\\Desktop\\\\Huni\\\\MeshGraphNets - variational\"/_warpage_input/*.txt)"
     ]
   }
 }

@@ -232,17 +232,25 @@ class EncoderProcessorDecoder(nn.Module):
                     for _ in range(self.message_passing_num)
                 ])
             else:
-                # Inject z only at finest level (level 0) pre and post blocks
+                # Inject z at every level: pre-blocks, coarsest, and post-blocks
                 L = self.multiscale_levels
-                pre_count_0  = self.mp_per_level[0]
-                post_count_0 = self.mp_per_level[2 * L]
-                self.ms_z_projs_pre_0 = nn.ModuleList([
+                self.ms_z_projs_pre = nn.ModuleList()
+                self.ms_z_projs_post = nn.ModuleList()
+                for i in range(L):
+                    pre_count = self.mp_per_level[i]
+                    post_count = self.mp_per_level[2 * L - i]
+                    self.ms_z_projs_pre.append(nn.ModuleList([
+                        nn.Linear(self.latent_dim + self.vae_latent_dim, self.latent_dim)
+                        for _ in range(pre_count)
+                    ]))
+                    self.ms_z_projs_post.append(nn.ModuleList([
+                        nn.Linear(self.latent_dim + self.vae_latent_dim, self.latent_dim)
+                        for _ in range(post_count)
+                    ]))
+                coarsest_count = self.mp_per_level[L]
+                self.ms_z_projs_coarsest = nn.ModuleList([
                     nn.Linear(self.latent_dim + self.vae_latent_dim, self.latent_dim)
-                    for _ in range(pre_count_0)
-                ])
-                self.ms_z_projs_post_0 = nn.ModuleList([
-                    nn.Linear(self.latent_dim + self.vae_latent_dim, self.latent_dim)
-                    for _ in range(post_count_0)
+                    for _ in range(coarsest_count)
                 ])
             # Auxiliary decoder: z → global stats of target delta per graph.
             # Forces z to encode useful summary info (mean + std per output feature).
@@ -378,7 +386,9 @@ class EncoderProcessorDecoder(nn.Module):
         # VAE: encode target delta → z
         kl = 0.0
         aux_loss = 0.0
-        z_per_node = None
+        z = None
+        current_z_per_node = None
+        current_batch = None
         if self.use_vae:
             N = graph.x.shape[0]
             device = graph.x.device
@@ -389,7 +399,8 @@ class EncoderProcessorDecoder(nn.Module):
                 original_y, original_edge_index, original_edge_attr,
                 original_batch, N, device, dtype, use_posterior
             )
-            z_per_node = z[batch_bc]  # [N, vae_latent_dim]
+            current_z_per_node = z[batch_bc]  # [N, vae_latent_dim]
+            current_batch = batch_bc
             if self.training and original_y is not None:
                 aux_loss = self._aux_loss(z, original_y, original_batch, N, device)
 
@@ -398,28 +409,29 @@ class EncoderProcessorDecoder(nn.Module):
         current_graph = graph
 
         for i in range(actual_levels):
-            # Run pre-blocks at level i (inject z at finest level only)
-            z_projs_pre = self.ms_z_projs_pre_0 if (self.use_vae and i == 0) else None
+            # Run pre-blocks at level i (inject z at all levels)
+            z_projs_pre = self.ms_z_projs_pre[i] if (self.use_vae and current_z_per_node is not None) else None
             if self.use_checkpointing and self.training:
                 current_graph = process_with_checkpointing(self.pre_blocks[i], current_graph,
                                                            z_projs=z_projs_pre,
-                                                           z_per_node=z_per_node)
+                                                           z_per_node=current_z_per_node)
             else:
                 for j, block in enumerate(self.pre_blocks[i]):
-                    if z_projs_pre is not None and z_per_node is not None:
-                        current_graph.x = z_projs_pre[j](torch.cat([current_graph.x, z_per_node], dim=-1))
+                    if z_projs_pre is not None and current_z_per_node is not None:
+                        current_graph.x = z_projs_pre[j](torch.cat([current_graph.x, current_z_per_node], dim=-1))
                     current_graph = block(current_graph)
 
             if debug:
                 print(f"  [MS] After pre[{i}] ({len(self.pre_blocks[i])} blocks): x std={current_graph.x.std().item():.4f}")
 
-            # Save skip connection state
+            # Save skip connection state (including z broadcast for ascending arm)
             skip_states.append({
                 'x': current_graph.x,
                 'edge_attr': current_graph.edge_attr,
                 'edge_index': current_graph.edge_index,
                 'w_attr': getattr(current_graph, 'world_edge_attr', None) if i == 0 and self.use_world_edges else None,
                 'w_idx': getattr(current_graph, 'world_edge_index', None) if i == 0 and self.use_world_edges else None,
+                'z_per_node': current_z_per_node,
             })
 
             # Pool: level i → level i+1
@@ -428,14 +440,25 @@ class EncoderProcessorDecoder(nn.Module):
             e_coarse = self.coarse_eb_encoders[i](ld['c_ea'])
             current_graph = Data(x=h_coarse, edge_attr=e_coarse, edge_index=ld['c_ei'])
 
+            # Update z broadcast for coarser level
+            if self.use_vae and z is not None:
+                current_batch = scatter(current_batch, ld['ftc'], dim=0,
+                                        dim_size=ld['n_c'], reduce='min')
+                current_z_per_node = z[current_batch]
+
             if debug:
                 print(f"  [MS] After pool[{i}]: {skip_states[-1]['x'].shape[0]} → {h_coarse.shape[0]} nodes")
 
         # ── COARSEST LEVEL ────────────────────────────────────────────────────
+        z_projs_coarsest = self.ms_z_projs_coarsest if (self.use_vae and current_z_per_node is not None) else None
         if self.use_checkpointing and self.training:
-            current_graph = process_with_checkpointing(self.coarsest_blocks, current_graph)
+            current_graph = process_with_checkpointing(self.coarsest_blocks, current_graph,
+                                                       z_projs=z_projs_coarsest,
+                                                       z_per_node=current_z_per_node)
         else:
-            for block in self.coarsest_blocks:
+            for j, block in enumerate(self.coarsest_blocks):
+                if z_projs_coarsest is not None and current_z_per_node is not None:
+                    current_graph.x = z_projs_coarsest[j](torch.cat([current_graph.x, current_z_per_node], dim=-1))
                 current_graph = block(current_graph)
 
         if debug:
@@ -467,16 +490,18 @@ class EncoderProcessorDecoder(nn.Module):
                 current_graph.world_edge_attr = skip['w_attr']
                 current_graph.world_edge_index = skip['w_idx']
 
-            # Run post-blocks at level i (inject z at finest level only)
-            z_projs_post = self.ms_z_projs_post_0 if (self.use_vae and i == 0) else None
+            # Restore z broadcast for this level from skip state
+            level_z_per_node = skip_states[i].get('z_per_node') if self.use_vae else None
+            # Run post-blocks at level i (inject z at all levels)
+            z_projs_post = self.ms_z_projs_post[i] if (self.use_vae and level_z_per_node is not None) else None
             if self.use_checkpointing and self.training:
                 current_graph = process_with_checkpointing(self.post_blocks[i], current_graph,
                                                            z_projs=z_projs_post,
-                                                           z_per_node=z_per_node)
+                                                           z_per_node=level_z_per_node)
             else:
                 for j, block in enumerate(self.post_blocks[i]):
-                    if z_projs_post is not None and z_per_node is not None:
-                        current_graph.x = z_projs_post[j](torch.cat([current_graph.x, z_per_node], dim=-1))
+                    if z_projs_post is not None and level_z_per_node is not None:
+                        current_graph.x = z_projs_post[j](torch.cat([current_graph.x, level_z_per_node], dim=-1))
                     current_graph = block(current_graph)
 
             if debug:
