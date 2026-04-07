@@ -69,10 +69,10 @@ def process_with_checkpointing(processor_list, graph, z_projs=None, z_per_node=N
     world_edge_index = graph.world_edge_index if hasattr(graph, 'world_edge_index') else None
 
     for i, block in enumerate(processor_list):
-        # VAE z injection: concat z to node features before each block
+        # Additive VAE z injection: project z to processor dim and add (preserves x)
         if z_projs is not None and z_per_node is not None:
             import torch
-            x = z_projs[i](torch.cat([x, z_per_node], dim=-1))
+            x = x + z_projs[i](z_per_node)
         x, edge_attr, world_edge_attr, world_edge_index = checkpoint_gn_block(
             block, x, edge_attr, edge_index, world_edge_attr, world_edge_index
         )
