@@ -4,13 +4,13 @@ gpu_ids 0    # -1 for CPU, GPU ids for multi-GPU training (DDP with both H200s)
 log_file_dir    train3.log
 modelpath   ./outputs/warpage1.pth
 %   Datasets
-dataset_dir ./dataset/B8_REV04_SEC_BOTcopy2.h5
+dataset_dir ./dataset/B8_REV04_SEC_BOT_10samples.h5
 infer_dataset   ./dataset/warpage_infer.h5
 infer_timesteps 1
 %   Common params
 input_var   3   # number of input variables: x_disp, y_disp, z_disp, stress (excluding node types)
 output_var  3   # number of output variables: x_disp, y_disp, z_disp, stress (excluding node types)
-feature_loss_weights  0.1, 0.1, 1.0  # Per-feature loss weights for [x_disp, y_disp, z_disp]
+feature_loss_weights  1, 1, 1.0  # Per-feature loss weights for [x_disp, y_disp, z_disp]
 edge_var    8   # deformed dx/dy/dz/dist + reference dx/dy/dz/dist
 positional_features  4   # Rotation-invariant node features: [centroid_dist, mean_edge_len, + encoding]
 '
@@ -56,7 +56,7 @@ bipartite_unpool    True    # Learned bipartite MP unpool (False = broadcast)
 '
 % Variational Autoencoder (cVAE) Parameters
 use_vae             True   # Enable conditional VAE (encodes target delta during training)
-vae_latent_dim      256      # Global latent z dimension
+vae_latent_dim      32      # Global latent z dimension
 beta_kl             0.001   # KL divergence weight
 alpha_recon         1000     # Reconstruction loss weight
-kl_anneal_epochs    200       # Linearly ramp beta from 0 over N epochs (0 = disabled)
+kl_anneal_epochs    1000       # Linearly ramp beta from 0 over N epochs (0 = disabled)
