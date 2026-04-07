@@ -78,6 +78,42 @@ def _loss_from_errors(errors, loss_weights):
     return loss_sum / loss_count, loss_sum.item(), loss_count
 
 
+def _compute_beta_eff(beta_kl, epoch, config):
+    """Compute effective KL weight for the current epoch.
+
+    Schedules:
+      'linear'      — ramp from 0 to beta_kl over kl_anneal_epochs (legacy).
+      'three_phase' — three phases controlled by fractions of total epochs:
+          Phase 1 (0 → phase1_end):  constant small beta  (beta_kl * kl_min_beta_ratio)
+          Phase 2 (phase1_end → phase2_end): linear ramp to full beta_kl
+          Phase 3 (phase2_end → end): full beta_kl
+    """
+    kl_anneal_epochs = int(config.get('kl_anneal_epochs', 0))
+    schedule = config.get('kl_anneal_schedule', 'linear')
+
+    if schedule == 'three_phase':
+        total_epochs = int(config.get('training_epochs', 1))
+        phase1_frac = float(config.get('kl_phase1_ratio', 0.3))
+        phase2_frac = float(config.get('kl_phase2_ratio', 0.4))
+        min_ratio = float(config.get('kl_min_beta_ratio', 0.01))
+
+        phase1_end = phase1_frac * total_epochs
+        phase2_end = (phase1_frac + phase2_frac) * total_epochs
+
+        if epoch < phase1_end:
+            return beta_kl * min_ratio
+        elif epoch < phase2_end:
+            t = (epoch - phase1_end) / (phase2_end - phase1_end)
+            return beta_kl * (min_ratio + t * (1.0 - min_ratio))
+        else:
+            return beta_kl
+    else:
+        # Legacy linear schedule
+        if kl_anneal_epochs > 0:
+            return beta_kl * min(1.0, epoch / kl_anneal_epochs)
+        return beta_kl
+
+
 def _accum_window_size(batch_idx, total_batches, actual_accum):
     """Return the number of batches in the current accumulation window."""
     window_start = (batch_idx // actual_accum) * actual_accum
@@ -104,8 +140,18 @@ def log_training_config(config):
         beta    = config.get('beta_kl', 0.001)
         b_aux   = config.get('beta_aux', 0.1)
         alpha   = config.get('alpha_recon', 1.0)
-        anneal  = config.get('kl_anneal_epochs', 0)
-        anneal_str = f", KL anneal {anneal} epochs" if anneal > 0 else ""
+        schedule = config.get('kl_anneal_schedule', 'linear')
+        if schedule == 'three_phase':
+            p1 = float(config.get('kl_phase1_ratio', 0.3))
+            p2 = float(config.get('kl_phase2_ratio', 0.4))
+            mr = float(config.get('kl_min_beta_ratio', 0.01))
+            anneal_str = (f", KL schedule=three_phase "
+                          f"[0-{p1:.0%} β={beta*mr:.1e}, "
+                          f"{p1:.0%}-{p1+p2:.0%} ramp, "
+                          f"{p1+p2:.0%}-100% β={beta}]")
+        else:
+            anneal = config.get('kl_anneal_epochs', 0)
+            anneal_str = f", KL anneal {anneal} epochs" if anneal > 0 else ""
         print(f"VAE: ENABLED (z_dim={z_dim}, vae_mp_layers={mp_enc}, "
               f"beta_kl={beta}, beta_aux={b_aux}, alpha_recon={alpha}{anneal_str})")
     else:
@@ -153,9 +199,8 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
     alpha_recon = float(config.get('alpha_recon', 1.0))
     beta_kl = float(config.get('beta_kl', 0.001))
     beta_aux = float(config.get('beta_aux', 0.1))
-    kl_anneal_epochs = int(config.get('kl_anneal_epochs', 0))
-    if use_vae and kl_anneal_epochs > 0:
-        beta_eff = beta_kl * min(1.0, epoch / kl_anneal_epochs)
+    if use_vae:
+        beta_eff = _compute_beta_eff(beta_kl, epoch, config)
     else:
         beta_eff = beta_kl
 
@@ -261,6 +306,7 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
                 aux_val = aux_loss_val.item() if hasattr(aux_loss_val, 'item') else float(aux_loss_val)
                 postfix['kl']  = f'{kl_val:.2e}'
                 postfix['aux'] = f'{aux_val:.2e}'
+                postfix['β'] = f'{beta_eff:.1e}'
                 postfix['total'] = f'{loss.item():.2e}'
             if monitor_gradients:
                 postfix['grad'] = f'{grad_norm.item():.2e}'
@@ -317,6 +363,10 @@ def _evaluate_epoch(model, dataloader, device, config, epoch=0, *,
     use_vae = config.get('use_vae', False)
     alpha_recon = float(config.get('alpha_recon', 1.0))
     beta_kl = float(config.get('beta_kl', 0.001))
+    if use_vae:
+        beta_eff = _compute_beta_eff(beta_kl, epoch, config)
+    else:
+        beta_eff = beta_kl
 
     with torch.no_grad():
         total_loss_sum = 0.0
@@ -358,7 +408,7 @@ def _evaluate_epoch(model, dataloader, device, config, epoch=0, *,
 
             recon_loss, batch_loss_sum, batch_loss_count = _loss_from_errors(errors, loss_weights)
             if use_vae:
-                opt_loss = alpha_recon * recon_loss + beta_kl * kl_loss_val
+                opt_loss = alpha_recon * recon_loss + beta_eff * kl_loss_val
             else:
                 opt_loss = recon_loss
 

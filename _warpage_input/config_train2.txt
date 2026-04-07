@@ -1,4 +1,4 @@
-model   MeshGraphNets
+model   MeshGraphNets-V
 mode    train  # Train / Inference
 gpu_ids 1    # -1 for CPU, GPU ids for multi-GPU training (DDP with both H200s)
 log_file_dir    train2.log
@@ -16,9 +16,9 @@ positional_features  4   # Rotation-invariant node features: [centroid_dist, mea
 '
 %   Network parameters
 message_passing_num 15
-Training_epochs	1000
+Training_epochs	5000
 Batch_size	8
-LearningR	0.0001  # Scaled by sqrt(8/1) from 0.0001 for larger batch size
+LearningR	0.001  # Scaled by sqrt(8/1) from 0.0001 for larger batch size
 Latent_dim	256	# MeshGraphNets latent dimension
 num_workers 8
 std_noise   0.01
@@ -57,6 +57,9 @@ bipartite_unpool    True    # Learned bipartite MP unpool (False = broadcast)
 % Variational Autoencoder (cVAE) Parameters
 use_vae             True   # Enable conditional VAE (encodes target delta during training)
 vae_latent_dim      8      # Global latent z dimension
-beta_kl             0.001   # KL divergence weight
+beta_kl             0.001   # KL divergence weight (full value after ramp)
 alpha_recon         1000000     # Reconstruction loss weight
-kl_anneal_epochs    1000       # Linearly ramp beta from 0 over N epochs (0 = disabled)
+kl_anneal_schedule  three_phase  # 'linear' or 'three_phase'
+kl_phase1_ratio     0.3     # Fraction of epochs: constant low beta (warmup)
+kl_phase2_ratio     0.4     # Fraction of epochs: linear ramp to full beta
+kl_min_beta_ratio   0.01    # Phase 1 beta = beta_kl * this (1% of full beta)
