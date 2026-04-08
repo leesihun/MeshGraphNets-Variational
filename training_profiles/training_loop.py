@@ -557,7 +557,7 @@ def test_model(model, dataloader, device, config, epoch, dataset=None, output_pr
 
             graph = graph.to(device)
             with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
-                predicted, target, _, _ = model(graph)
+                predicted, target, _, _ = model(graph, use_posterior=True)
                 errors = torch.nn.functional.huber_loss(predicted, target, reduction='none', delta=1.0)
                 loss, batch_loss_sum, batch_loss_count = _loss_from_errors(errors, loss_weights)
 
