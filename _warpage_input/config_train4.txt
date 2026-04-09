@@ -1,6 +1,6 @@
-model   MeshGraphNets
+model   MeshGraphNets-V
 mode    train  # Train / Inference
-gpu_ids 1    # -1 for CPU, GPU ids for multi-GPU training (DDP with both H200s)
+gpu_ids 0,1    # -1 for CPU, GPU ids for multi-GPU training (DDP with both H200s)
 log_file_dir    train4.log
 modelpath   ./outputs/warpage1.pth
 %   Datasets
@@ -10,16 +10,16 @@ infer_timesteps 1
 %   Common params
 input_var   3   # number of input variables: x_disp, y_disp, z_disp, stress (excluding node types)
 output_var  3   # number of output variables: x_disp, y_disp, z_disp, stress (excluding node types)
-feature_loss_weights  0.1, 0.1, 1.0  # Per-feature loss weights for [x_disp, y_disp, z_disp]
+feature_loss_weights  1, 1, 1.0  # Per-feature loss weights for [x_disp, y_disp, z_disp]
 edge_var    8   # deformed dx/dy/dz/dist + reference dx/dy/dz/dist
 positional_features  4   # Rotation-invariant node features: [centroid_dist, mean_edge_len, + encoding]
 '
 %   Network parameters
 message_passing_num 15
-Training_epochs	500
-Batch_size	2
+Training_epochs	5000
+Batch_size	4
 LearningR	0.0001  # Scaled by sqrt(8/1) from 0.0001 for larger batch size
-Latent_dim	256	# MeshGraphNets latent dimension
+Latent_dim	128	# MeshGraphNets latent dimension
 num_workers 8
 std_noise   0.01
 residual_scale  1  # Scale factor for residual connections (1.0 = full residual, matches NVIDIA/DeepMind)
@@ -57,6 +57,9 @@ bipartite_unpool    True    # Learned bipartite MP unpool (False = broadcast)
 % Variational Autoencoder (cVAE) Parameters
 use_vae             True   # Enable conditional VAE (encodes target delta during training)
 vae_latent_dim      32      # Global latent z dimension
-beta_kl             1   # KL divergence weight
+beta_kl             1   # KL divergence weight (full value after ramp)
 alpha_recon         1000     # Reconstruction loss weight
-kl_anneal_epochs    200       # Linearly ramp beta from 0 over N epochs (0 = disabled)
+kl_anneal_schedule  three_phase  # 'linear' or 'three_phase'
+kl_phase1_ratio     0.3     # Fraction of epochs: constant low beta (warmup)
+kl_phase2_ratio     0.4     # Fraction of epochs: linear ramp to full beta
+kl_min_beta_ratio   0.000001    # Phase 1 beta = beta_kl * this (1% of full beta)

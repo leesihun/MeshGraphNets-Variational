@@ -238,7 +238,7 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
 
     # Initialize learning rate scheduler: linear warmup + cosine warm restarts
     total_epochs = config.get('training_epochs')
-    warmup_epochs = 3
+    warmup_epochs = 5
     remaining_epochs = max(total_epochs - warmup_epochs, 1)
     # T_0 sized so 2 full cosine cycles fit in remaining epochs (T_0 + 2*T_0 = 3*T_0)
     cosine_T0 = max(remaining_epochs // 3, 1)
@@ -246,7 +246,7 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
         optimizer, start_factor=0.01, total_iters=warmup_epochs
     )
     cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=cosine_T0, T_mult=2, eta_min=1e-8
+        optimizer, T_0=cosine_T0, T_mult=2, eta_min=1e-6
     )
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs]
