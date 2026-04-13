@@ -271,15 +271,18 @@ class EncoderProcessorDecoder(nn.Module):
         return fuse_layer(torch.cat([x, z_per_node], dim=-1))
 
     def _encode_vae(self, original_y, original_edge_index, original_edge_attr,
-                    original_batch, N, device, dtype, use_posterior):
+                    original_batch, N, device, dtype, use_posterior, fixed_z=None):
         """
         Encode target delta into VAE latent z.
+          fixed_z provided:   use it directly (inference with pre-sampled z), KL=0.
           use_posterior=True  + y available: GNN-encode y → (z, mu, logvar), compute KL.
           use_posterior=False or y missing:  sample z ~ N(0, I), KL=0.
         Returns:
             z:   [B, vae_latent_dim]
             kl:  scalar
         """
+        if fixed_z is not None:
+            return fixed_z.to(device=device, dtype=dtype), 0.0
         if use_posterior and original_y is not None:
             batch = (original_batch if original_batch is not None
                      else torch.zeros(N, dtype=torch.long, device=device))
@@ -303,7 +306,7 @@ class EncoderProcessorDecoder(nn.Module):
         aux_pred = self.aux_decoder(z)                                            # [B, 2*output_var]
         return torch.nn.functional.mse_loss(aux_pred, aux_target)
 
-    def forward(self, graph, debug=False, use_posterior=None):
+    def forward(self, graph, debug=False, use_posterior=None, fixed_z=None):
         if use_posterior is None:
             use_posterior = self.training and self.use_vae
 
@@ -332,7 +335,8 @@ class EncoderProcessorDecoder(nn.Module):
                             else torch.zeros(N, dtype=torch.long, device=device))
                 z, kl = self._encode_vae(
                     original_y, original_edge_index, original_edge_attr,
-                    original_batch, N, device, dtype, use_posterior
+                    original_batch, N, device, dtype, use_posterior,
+                    fixed_z=fixed_z
                 )
                 z_per_node = z[batch_bc]  # [N, vae_latent_dim]
                 if self.training and original_y is not None:
@@ -404,7 +408,8 @@ class EncoderProcessorDecoder(nn.Module):
                         else torch.zeros(N, dtype=torch.long, device=device))
             z, kl = self._encode_vae(
                 original_y, original_edge_index, original_edge_attr,
-                original_batch, N, device, dtype, use_posterior
+                original_batch, N, device, dtype, use_posterior,
+                fixed_z=fixed_z
             )
             current_z_per_node = z[batch_bc]  # [N, vae_latent_dim]
             current_batch = batch_bc
