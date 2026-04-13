@@ -75,7 +75,18 @@
       "Bash(curl -s \"https://api.search.brave.com/res/v1/web/search?q=normalizing+flow+posterior+VAE+scientific+simulation+physics&count=10\" -H 'Accept: application/json' -H 'Accept-Encoding: gzip' -H 'X-Subscription-Token: $BRAVE_SEARCH_API_KEY')",
       "Bash(grep -l \"use_vae\\\\|beta_kl\\\\|vae_latent\" \"c:\\\\Users\\\\Lee\\\\Desktop\\\\Huni\\\\MeshGraphNets - variational\"/_warpage_input/*.txt)",
       "Bash(find '/c/Users/Lee/Desktop/Huni/MeshGraphNets - variational' -maxdepth 3 -name *.h5)",
-      "Bash(find '/c/Users/Lee/Desktop/Huni/MeshGraphNets - variational/_warpage_input' -type f -name *.txt)"
+      "Bash(find '/c/Users/Lee/Desktop/Huni/MeshGraphNets - variational/_warpage_input' -type f -name *.txt)",
+      "Bash(curl -s \"https://scholar.google.com/scholar?q=VAE+KL+divergence+optimal+value+rate+distortion+tradeoff&hl=en\")",
+      "Bash(curl -s \"https://scholar.google.com/scholar?q=beta-VAE+KL+target+value+faithful+reconstruction+distribution&hl=en\")",
+      "Bash(curl -s \"https://scholar.google.com/scholar?q=VAE+posterior+collapse+active+units+latent+dimension&hl=en\")",
+      "WebFetch(domain:blog.alexalemi.com)",
+      "WebFetch(domain:www.emergentmind.com)",
+      "WebFetch(domain:lilianweng.github.io)",
+      "Bash(curl -s https://scholar.google.com/scholar?q=optimal+KL+divergence+value+VAE+generation+diverse+samples)",
+      "Bash(curl -s \"https://arxiv.org/search/?query=VAE+rate+distortion+optimal+KL+divergence&searchtype=all\")",
+      "Bash(curl -s https://arxiv.org/html/2309.13160v3)",
+      "Bash(sed 's/<[^>]*>//g')",
+      "Bash(curl -s https://blog.alexalemi.com/kl-is-all-you-need.html)"
     ]
   }
 }
