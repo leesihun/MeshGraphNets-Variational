@@ -462,7 +462,7 @@ def run_rollout(config, config_filename='config.txt'):
             with h5py.File(output_path, 'w') as f:
                 # Root attributes (mimics DATASET_FORMAT.md)
                 f.attrs['num_samples'] = 1
-                f.attrs['num_features'] = 8
+                f.attrs['num_features'] = 3 + output_dim + 1
                 f.attrs['num_timesteps'] = steps_this_sample + 1
 
                 # ========================================
@@ -471,27 +471,25 @@ def run_rollout(config, config_filename='config.txt'):
                 data_grp = f.create_group('data')
                 sample_grp = data_grp.create_group(str(sample_id))
 
-                # Build nodal_data: [8, timesteps, nodes]
-                # Features: [x, y, z, x_disp, y_disp, z_disp, stress, part_number]
-                nodal_data = np.zeros((8, steps_this_sample + 1, num_nodes), dtype=np.float32)
+                # Build nodal_data: [3 + output_dim + 1, timesteps, nodes]
+                # Layout: [x, y, z, <output_dim predicted channels>, part_number]
+                num_save_features = 3 + output_dim + 1
+                nodal_data = np.zeros((num_save_features, steps_this_sample + 1, num_nodes), dtype=np.float32)
 
                 # Reference position (constant across timesteps)
-                nodal_data[0, :, :] = ref_pos[:, 0]  # x_coord
-                nodal_data[1, :, :] = ref_pos[:, 1]  # y_coord
-                nodal_data[2, :, :] = ref_pos[:, 2]  # z_coord
+                nodal_data[0, :, :] = ref_pos[:, 0]
+                nodal_data[1, :, :] = ref_pos[:, 1]
+                nodal_data[2, :, :] = ref_pos[:, 2]
 
-                # Displacements and stress from predicted states
-                # all_states shape: [steps+1, nodes, output_dim] where output_dim=4
-                nodal_data[3, :, :] = all_states[:, :, 0]  # x_disp
-                nodal_data[4, :, :] = all_states[:, :, 1]  # y_disp
-                nodal_data[5, :, :] = all_states[:, :, 2]  # z_disp
-                nodal_data[6, :, :] = all_states[:, :, 3]  # stress
+                # Predicted state channels (all_states shape: [steps+1, nodes, output_dim])
+                for ch in range(output_dim):
+                    nodal_data[3 + ch, :, :] = all_states[:, :, ch]
 
                 # Part number (constant across timesteps)
                 if part_ids is not None:
-                    nodal_data[7, :, :] = part_ids[np.newaxis, :]
+                    nodal_data[3 + output_dim, :, :] = part_ids[np.newaxis, :]
                 else:
-                    nodal_data[7, :, :] = 0  # Default if no part info
+                    nodal_data[3 + output_dim, :, :] = 0
 
                 sample_grp.create_dataset(
                     'nodal_data', data=nodal_data,
