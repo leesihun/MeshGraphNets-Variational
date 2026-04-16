@@ -8,6 +8,7 @@ from torch_geometric.data import Data
 from scipy.spatial import KDTree
 
 from general_modules.edge_features import EDGE_FEATURE_DIM, compute_edge_attr
+from general_modules.mesh_dataset import _compute_positional_features
 from model.MeshGraphNets import MeshGraphNets
 
 # Multiscale coarsening (only needed when use_multiscale=True)
@@ -181,6 +182,8 @@ def run_rollout(config, config_filename='config.txt'):
     num_rollout_steps = config.get('infer_timesteps')
     input_dim = config.get('input_var')
     output_dim = config.get('output_var')
+    num_pos_features = int(config.get('positional_features', 0))
+    positional_encoding = str(config.get('positional_encoding', 'rwpe')).lower().strip()
     use_vae = config.get('use_vae', False)
     vae_latent_dim = int(config.get('vae_latent_dim', 8))
     num_vae_samples = int(config.get('num_vae_samples', 1)) if use_vae else 1
@@ -240,6 +243,15 @@ def run_rollout(config, config_filename='config.txt'):
 
         # Make edges bidirectional
         edge_index = np.concatenate([mesh_edge, mesh_edge[[1, 0], :]], axis=1)  # [2, 2M]
+
+        # Pre-compute static positional features (geometry + topology, rotation-invariant)
+        if num_pos_features > 0:
+            pos_features = _compute_positional_features(
+                ref_pos, edge_index, num_pos_features, positional_encoding
+            )  # [N, num_pos_features]
+            print(f"  Positional features: {pos_features.shape} ({positional_encoding})")
+        else:
+            pos_features = None
 
         # Pre-compute per-level coarsening topology (static — same for all rollout steps)
         use_multiscale = config.get('use_multiscale', False)
@@ -322,9 +334,12 @@ def run_rollout(config, config_filename='config.txt'):
                 for step in range(steps_this_sample):
                     step_start = time.time()
 
-                    # Nodal feature
-                    x_raw = current_state  # [N, input_dim]
-                    x_norm = (x_raw - node_mean) / node_std  # [N, input_dim]
+                    # Nodal feature: physical state + positional features (must match training)
+                    if pos_features is not None:
+                        x_raw = np.concatenate([current_state, pos_features], axis=1)  # [N, input_dim + pos]
+                    else:
+                        x_raw = current_state  # [N, input_dim]
+                    x_norm = (x_raw - node_mean) / node_std
 
                     # --- c. Add node type one-hot if enabled ---
                     if use_node_types and part_ids is not None and node_type_to_idx is not None:
