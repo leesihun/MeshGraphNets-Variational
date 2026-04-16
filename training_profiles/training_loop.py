@@ -198,7 +198,7 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
     use_vae = config.get('use_vae', False)
     alpha_recon = float(config.get('alpha_recon', 1.0))
     beta_kl = float(config.get('beta_kl', 0.001))
-    beta_aux = float(config.get('beta_aux', 0.1))
+    beta_aux = float(config.get('beta_aux', 1.0))
     if use_vae:
         beta_eff = _compute_beta_eff(beta_kl, epoch, config)
     else:

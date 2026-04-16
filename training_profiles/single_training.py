@@ -294,7 +294,7 @@ def single_worker(config, config_filename='config.txt'):
                     'use_vae': config.get('use_vae', False),
                     'vae_latent_dim': config.get('vae_latent_dim', 32),
                     'vae_mp_layers': config.get('vae_mp_layers', 2),
-                    'beta_aux': config.get('beta_aux', 0.1),
+                    'beta_aux': config.get('beta_aux', 1.0),
                 }
                 save_dict = {
                     'epoch': epoch,
