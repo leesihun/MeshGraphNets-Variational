@@ -516,15 +516,16 @@ def run_rollout(config, config_filename='config.txt'):
                     meta_grp.attrs['vae_sample_idx'] = vae_sample_idx
 
                 # Feature statistics (per-feature, computed from predicted data)
-                feature_names = np.array([
+                _all_feature_names = [
                     b'x_coord', b'y_coord', b'z_coord',
                     b'x_disp(mm)', b'y_disp(mm)', b'z_disp(mm)',
                     b'stress(MPa)', b'Part No.'
-                ])
-                feature_min = np.array([nodal_data[i].min() for i in range(8)], dtype=np.float32)
-                feature_max = np.array([nodal_data[i].max() for i in range(8)], dtype=np.float32)
-                feature_mean = np.array([nodal_data[i].mean() for i in range(8)], dtype=np.float32)
-                feature_std = np.array([nodal_data[i].std() for i in range(8)], dtype=np.float32)
+                ]
+                feature_names = np.array(_all_feature_names[:3 + output_dim] + [b'Part No.'])
+                feature_min  = np.array([nodal_data[i].min()  for i in range(num_save_features)], dtype=np.float32)
+                feature_max  = np.array([nodal_data[i].max()  for i in range(num_save_features)], dtype=np.float32)
+                feature_mean = np.array([nodal_data[i].mean() for i in range(num_save_features)], dtype=np.float32)
+                feature_std  = np.array([nodal_data[i].std()  for i in range(num_save_features)], dtype=np.float32)
 
                 meta_grp.create_dataset('feature_min', data=feature_min)
                 meta_grp.create_dataset('feature_max', data=feature_max)
