@@ -5,7 +5,7 @@ log_file_dir    train3.log
 modelpath   ./outputs/warpage0.pth
 %   Datasets
 dataset_dir ./dataset/b8_train.h5
-infer_dataset   ./dataset/warpage_infer.h5
+infer_dataset   ./dataset/infer_dataset_b8_test.h5
 infer_timesteps 1
 num_vae_samples 177
 %   Common params
@@ -57,7 +57,7 @@ bipartite_unpool    True    # Learned bipartite MP unpool (False = broadcast)
 '
 % Variational Autoencoder (cVAE) Parameters
 use_vae             True   # Enable conditional VAE (encodes target delta during training)
-vae_latent_dim      128      # Global latent z dimension
+vae_latent_dim      8      # Global latent z dimension
 beta_kl             1   # KL divergence weight (full value after ramp)
 alpha_recon         1000     # Reconstruction loss weight
 kl_anneal_schedule  three_phase  # 'linear' or 'three_phase'

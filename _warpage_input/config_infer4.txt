@@ -5,7 +5,7 @@ log_file_dir    train4.log
 modelpath   ./outputs/warpage1.pth
 %   Datasets
 dataset_dir ./dataset/b8_train.h5
-infer_dataset   ./dataset/warpage_infer.h5
+infer_dataset   ./dataset/infer_dataset_b8_test.h5
 infer_timesteps 1
 num_vae_samples 177
 %   Common params
