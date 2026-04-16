@@ -417,7 +417,7 @@ def run_rollout(config, config_filename='config.txt'):
                             cur_ref, cur_def = coarse_ref, coarse_def
 
                     # --- i. Forward pass ---
-                    predicted_delta_norm, _, _ = model(graph, fixed_z=fixed_z)  # [N, output_var]
+                    predicted_delta_norm, _, _, _ = model(graph, fixed_z=fixed_z)  # [N, output_var]
 
                     # --- j. Denormalize delta ---
                     predicted_delta_norm_np = predicted_delta_norm.cpu().numpy()

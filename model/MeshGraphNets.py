@@ -45,7 +45,7 @@ class MeshGraphNets(nn.Module):
         """Enable or disable gradient checkpointing."""
         self.model.set_checkpointing(enabled)
 
-    def forward(self, graph, debug=False, add_noise=None, use_posterior=None):
+    def forward(self, graph, debug=False, add_noise=None, use_posterior=None, fixed_z=None):
         """
         Forward pass of the simulator.
 
@@ -87,6 +87,7 @@ class MeshGraphNets(nn.Module):
             graph,
             debug=debug,
             use_posterior=use_posterior,
+            fixed_z=fixed_z,
         )
 
         return predicted, graph.y, kl, aux_loss
