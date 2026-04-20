@@ -193,8 +193,8 @@ def collect_vae_mus(model, dataloader, device, config):
 
 def train_latent_flow(mu_data, latent_dim=8, device='cpu',
                       hidden_dim=64, num_coupling_layers=6,
-                      lr=1e-3, max_epochs=500, batch_size=256,
-                      patience=50):
+                      lr=1e-3, weight_decay=0.0, max_epochs=500,
+                      batch_size=256, patience=50):
     """Train a RealNVP flow on collected mu vectors.
 
     Parameters
@@ -236,7 +236,7 @@ def train_latent_flow(mu_data, latent_dim=8, device='cpu',
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
 
-    optimizer = torch.optim.Adam(flow.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(flow.parameters(), lr=lr, weight_decay=weight_decay)
 
     best_val_nll = float('inf')
     best_state = None
@@ -363,14 +363,22 @@ def run_posthoc_flow_training(checkpoint_path, train_dataset, config, device):
 
     # 4. Train the normalizing flow
     vae_latent_dim = int(config.get('vae_latent_dim', 8))
-    flow = train_latent_flow(mus, latent_dim=vae_latent_dim, device=device)
+    flow_hidden_dim = int(config.get('flow_hidden_dim', 64))
+    flow_num_layers = int(config.get('flow_num_layers', 6))
+    flow_lr = float(config.get('flow_lr', 1e-3))
+    flow_weight_decay = float(config.get('flow_weight_decay', 0.0))
+    flow = train_latent_flow(
+        mus, latent_dim=vae_latent_dim, device=device,
+        hidden_dim=flow_hidden_dim, num_coupling_layers=flow_num_layers,
+        lr=flow_lr, weight_decay=flow_weight_decay,
+    )
 
     # 5. Save flow into checkpoint
     checkpoint['latent_flow_state_dict'] = flow.state_dict()
     checkpoint['latent_flow_config'] = {
         'latent_dim': vae_latent_dim,
-        'hidden_dim': 64,
-        'num_coupling_layers': 6,
+        'hidden_dim': flow_hidden_dim,
+        'num_coupling_layers': flow_num_layers,
     }
     torch.save(checkpoint, checkpoint_path)
     print(f"  Flow saved to checkpoint: {checkpoint_path}")
