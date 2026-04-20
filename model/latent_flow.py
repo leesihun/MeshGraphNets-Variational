@@ -11,6 +11,7 @@ import math
 import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader, random_split
+from torch_geometric.loader import DataLoader as PyGDataLoader
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +343,7 @@ def run_posthoc_flow_training(checkpoint_path, train_dataset, config, device):
 
     # 3. Collect mu vectors
     num_workers = config.get('num_workers', 0)
-    mu_loader = DataLoader(
+    mu_loader = PyGDataLoader(
         train_dataset,
         batch_size=config.get('batch_size', 4),
         shuffle=False,
