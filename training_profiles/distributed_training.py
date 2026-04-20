@@ -526,6 +526,11 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
         else:
             print(f"\nTraining finished. Best model at epoch {best_epoch} with validation loss {best_valid_loss:.2e}")
 
+    # Post-hoc latent flow training (rank 0 only)
+    if rank == 0 and config.get('use_vae', False) and config.get('train_latent_flow', False):
+        from model.latent_flow import run_posthoc_flow_training
+        run_posthoc_flow_training(modelname, train_dataset, config, device)
+
     # Analyze debug files if they exist
     if rank == 0 and log_dir:
         debug_files = sorted(glob.glob(os.path.join(log_dir, 'debug_*.npz')))

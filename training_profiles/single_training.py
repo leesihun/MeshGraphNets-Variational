@@ -360,6 +360,11 @@ def single_worker(config, config_filename='config.txt'):
     except KeyboardInterrupt:
         print(f"\nTraining interrupted by user. Best model at epoch {best_epoch} with validation loss {best_valid_loss:.2e}")
 
+    # Post-hoc latent flow training
+    if config.get('use_vae', False) and config.get('train_latent_flow', False):
+        from model.latent_flow import run_posthoc_flow_training
+        run_posthoc_flow_training(modelname, train_dataset, config, device)
+
     # Analyze debug files if they exist
     if log_dir:
         debug_files = sorted(glob.glob(os.path.join(log_dir, 'debug_*.npz')))

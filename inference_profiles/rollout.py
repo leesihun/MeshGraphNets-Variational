@@ -175,6 +175,12 @@ def run_rollout(config, config_filename='config.txt'):
     print(f"  Checkpoint epoch: {checkpoint.get('epoch', 'unknown')}")
     print(f"  Checkpoint valid loss: {checkpoint.get('valid_loss', 'unknown')}")
 
+    # Load latent flow for VAE sampling (if available in checkpoint)
+    latent_flow = None
+    if use_vae:
+        from model.latent_flow import load_latent_flow
+        latent_flow = load_latent_flow(checkpoint, device)
+
     # -------------------------------------------------------------------------
     # 4. Load initial condition from HDF5
     # -------------------------------------------------------------------------
@@ -314,10 +320,15 @@ def run_rollout(config, config_filename='config.txt'):
                 print(f"\n{'=' * 60}")
                 print(f"VAE sample {vae_sample_idx + 1}/{num_vae_samples}")
 
-            # Sample a fixed z for this entire trajectory (prior N(0,I))
+            # Sample a fixed z for this entire trajectory
             fixed_z = None
             if use_vae:
-                fixed_z = torch.randn(1, vae_latent_dim, device=device)
+                if latent_flow is not None:
+                    with torch.no_grad():
+                        u = torch.randn(1, vae_latent_dim, device=device)
+                        fixed_z, _ = latent_flow(u)
+                else:
+                    fixed_z = torch.randn(1, vae_latent_dim, device=device)
 
             print(f"\n{'=' * 60}")
             print(f"Starting rollout: {steps_this_sample} steps")
