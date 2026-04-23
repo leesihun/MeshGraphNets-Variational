@@ -17,7 +17,7 @@ positional_features  4   # Rotation-invariant node features: [centroid_dist, mea
 %   Network parameters
 message_passing_num 15
 Training_epochs	3000
-Batch_size	32
+Batch_size	16
 LearningR	0.0001  # Scaled by sqrt(8/1) from 0.0001 for larger batch size
 Latent_dim	128	# MeshGraphNets latent dimension
 num_workers 8
@@ -33,7 +33,7 @@ use_checkpointing   True
 use_amp             True    # Mixed precision training with bfloat16 (1.5-2x speedup on Ampere+ GPUs)
 use_ema             True    # EMA shadow model for validation/inference (smooths SGD noise, ~free precision)
 ema_decay           0.99   # EMA decay factor (0.999 = ~1000-step averaging window)
-test_interval       10      # Run test/visualization every N epochs (1 = every epoch, 10 = every 10th)
+test_interval       100      # Run test/visualization every N epochs (1 = every epoch, 10 = every 10th)
 '
 % Node Type Parameters
 use_node_types  False    # Add one-hot encoded node types to node features
