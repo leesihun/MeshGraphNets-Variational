@@ -55,17 +55,8 @@ multiscale_levels   1
 mp_per_level        4, 12, 4
 bipartite_unpool    True    # Learned bipartite MP unpool (False = broadcast)
 '
-% Variational Autoencoder (cVAE) Parameters
+% Variational Autoencoder (MMD-VAE / InfoVAE) Parameters
 use_vae             True   # Enable conditional VAE (encodes target delta during training)
-vae_latent_dim      64      # Global latent z dimension
-beta_kl             1   # KL divergence weight (full value after ramp)
-alpha_recon         100     # Reconstruction loss weight
-kl_anneal_schedule  three_phase  # 'linear' or 'three_phase'
-kl_phase1_ratio     0.2     # Fraction of epochs: constant low beta (warmup)
-kl_phase2_ratio     0.2     # Fraction of epochs: linear ramp to full beta
-kl_min_beta_ratio   0.0001    # Phase 1 beta = beta_kl * this (1% of full beta)
-train_latent_flow   False      # Train post-hoc RealNVP flow on VAE latent codes after training
-flow_hidden_dim     32         # Hidden dim of scale/shift MLPs in RealNVP (reduce for small datasets)
-flow_num_layers     3          # Number of coupling layers (reduce for small datasets)
-flow_lr             1e-3       # Learning rate for flow training
-flow_weight_decay   1e-4       # L2 regularization for flow (helps generalization with small N)
+vae_latent_dim      64     # Global latent z dimension
+alpha_recon         100    # Reconstruction loss weight
+lambda_mmd          100    # MMD(q(z), N(0,I)) weight; matches aggregate posterior to prior

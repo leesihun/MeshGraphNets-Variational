@@ -145,20 +145,20 @@ def single_worker(config, config_filename='config.txt'):
 
             current_lr = optimizer.param_groups[0]['lr']
             if use_vae:
-                train_kl    = train_metrics.get('kl_mean', 0.0)
+                train_mmd   = train_metrics.get('mmd_mean', 0.0)
                 train_aux   = train_metrics.get('aux_mean', 0.0)
                 train_total = train_metrics.get('total_mean', train_loss)
-                train_eval_kl    = train_eval_metrics.get('kl_mean', 0.0)
+                train_eval_mmd   = train_eval_metrics.get('mmd_mean', 0.0)
                 train_eval_total = train_eval_metrics.get('total_mean', train_eval_loss)
-                valid_kl    = valid_metrics.get('kl_mean', 0.0)
+                valid_mmd   = valid_metrics.get('mmd_mean', 0.0)
                 valid_total = valid_metrics.get('total_mean', valid_loss)
                 valid_prior_loss = valid_prior_metrics['mean']
                 prior_gap = valid_prior_loss - valid_loss
                 print(
                     f"Epoch {epoch}/{total_epochs} LR: {current_lr:.2e} | "
-                    f"TrainOpt  recon={train_loss:.2e} kl={train_kl:.2e} aux={train_aux:.2e} total={train_total:.2e} | "
-                    f"TrainEvalQ recon={train_eval_loss:.2e} kl={train_eval_kl:.2e} total={train_eval_total:.2e} | "
-                    f"ValidQ    recon={valid_loss:.2e} kl={valid_kl:.2e} total={valid_total:.2e} | "
+                    f"TrainOpt  recon={train_loss:.2e} mmd={train_mmd:.2e} aux={train_aux:.2e} total={train_total:.2e} | "
+                    f"TrainEvalQ recon={train_eval_loss:.2e} mmd={train_eval_mmd:.2e} total={train_eval_total:.2e} | "
+                    f"ValidQ    recon={valid_loss:.2e} mmd={valid_mmd:.2e} total={valid_total:.2e} | "
                     f"ValidPrior@{vae_valid_prior_samples} recon={valid_prior_loss:.2e} gap={prior_gap:.2e}"
                 )
             else:
@@ -187,11 +187,11 @@ def single_worker(config, config_filename='config.txt'):
                     if use_vae:
                         f.write(
                             f"Elapsed: {elapsed:.2f}s Epoch {epoch} LR: {current_lr:.4e} | "
-                            f"TrainOpt recon={train_loss:.4e} kl={train_metrics.get('kl_mean',0):.4e} "
+                            f"TrainOpt recon={train_loss:.4e} mmd={train_metrics.get('mmd_mean',0):.4e} "
                             f"total={train_metrics.get('total_mean',train_loss):.4e} | "
-                            f"TrainEvalQ recon={train_eval_loss:.4e} kl={train_eval_metrics.get('kl_mean',0):.4e} "
+                            f"TrainEvalQ recon={train_eval_loss:.4e} mmd={train_eval_metrics.get('mmd_mean',0):.4e} "
                             f"total={train_eval_metrics.get('total_mean',train_eval_loss):.4e} | "
-                            f"ValidQ recon={valid_loss:.4e} kl={valid_metrics.get('kl_mean',0):.4e} "
+                            f"ValidQ recon={valid_loss:.4e} mmd={valid_metrics.get('mmd_mean',0):.4e} "
                             f"total={valid_metrics.get('total_mean',valid_loss):.4e} | "
                             f"ValidPrior@{vae_valid_prior_samples} recon={valid_prior_loss:.4e} "
                             f"gap={prior_gap:.4e}\n"
@@ -230,9 +230,10 @@ def single_worker(config, config_filename='config.txt'):
     except KeyboardInterrupt:
         print(f"\nTraining interrupted by user. Best model at epoch {best_epoch} with validation loss {best_valid_loss:.2e}")
 
-    # Post-hoc latent flow training
-    if use_vae and config.get('train_latent_flow', False):
-        from model.latent_flow import run_posthoc_flow_training
-        run_posthoc_flow_training(modelname, train_dataset, config, device)
+    # Post-hoc GMM fitting on VAE latent codes
+    if use_vae and config.get('fit_latent_gmm', False):
+        from model.latent_gmm import run_posthoc_gmm_fitting
+        gmm_model = ema_model.module if ema_model is not None else model
+        run_posthoc_gmm_fitting(gmm_model, train_dataset, config, device, modelname)
 
     analyze_debug_files(log_dir)

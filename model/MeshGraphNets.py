@@ -65,10 +65,10 @@ class MeshGraphNets(nn.Module):
                     graph.y = graph.y - noise_gamma * noise * ratio
                 graph.edge_attr = graph.edge_attr + torch.randn_like(graph.edge_attr) * noise_std
 
-        predicted, kl, aux_loss = self.model(
+        predicted, mmd, aux_loss = self.model(
             graph, debug=debug, use_posterior=use_posterior, fixed_z=fixed_z,
         )
-        return predicted, graph.y, kl, aux_loss
+        return predicted, graph.y, mmd, aux_loss
 
 
 class EncoderProcessorDecoder(nn.Module):
@@ -240,17 +240,17 @@ class EncoderProcessorDecoder(nn.Module):
     def _encode_vae(self, original_y, original_edge_index, original_edge_attr,
                     original_batch, N, device, dtype, use_posterior, fixed_z=None):
         if fixed_z is not None:
-            return fixed_z.to(device=device, dtype=dtype), 0.0
+            return fixed_z.to(device=device, dtype=dtype), torch.zeros((), device=device, dtype=torch.float32)
         if use_posterior and original_y is not None:
             batch = (original_batch if original_batch is not None
                      else torch.zeros(N, dtype=torch.long, device=device))
-            z, mu, logvar = self.vae_encoder(original_y, original_edge_index, original_edge_attr, batch)
-            kl = GNNVariationalEncoder.kl_loss(mu, logvar)
+            z, _mu, _logvar = self.vae_encoder(original_y, original_edge_index, original_edge_attr, batch)
+            mmd = GNNVariationalEncoder.mmd_loss(z.float())
         else:
             B = int(original_batch.max().item()) + 1 if original_batch is not None else 1
             z = torch.randn(B, self.vae_latent_dim, device=device, dtype=dtype)
-            kl = 0.0
-        return z, kl
+            mmd = torch.zeros((), device=device, dtype=torch.float32)
+        return z, mmd
 
     def _aux_loss(self, z, original_y, original_batch, N, device):
         batch = (original_batch if original_batch is not None
@@ -282,7 +282,7 @@ class EncoderProcessorDecoder(nn.Module):
         if debug:
             print(f"  After Encoder: x std={graph.x.std().item():.4f}, mean={graph.x.mean().item():.4f}")
 
-        kl = 0.0
+        mmd = torch.zeros((), device=graph.x.device, dtype=torch.float32)
         aux_loss = 0.0
         z_per_node = None
         if self.use_vae:
@@ -291,7 +291,7 @@ class EncoderProcessorDecoder(nn.Module):
             dtype = graph.x.dtype
             batch_bc = (original_batch if original_batch is not None
                         else torch.zeros(N, dtype=torch.long, device=device))
-            z, kl = self._encode_vae(
+            z, mmd = self._encode_vae(
                 original_y, original_edge_index, original_edge_attr,
                 original_batch, N, device, dtype, use_posterior, fixed_z=fixed_z
             )
@@ -316,7 +316,7 @@ class EncoderProcessorDecoder(nn.Module):
         output = self.decoder(graph)
         if debug:
             print(f"  After Decoder: out std={output.std().item():.4f}, mean={output.mean().item():.4f}")
-        return output, kl, aux_loss
+        return output, mmd, aux_loss
 
     def _forward_multiscale(self, graph, debug, use_posterior, fixed_z):
         L = self.multiscale_levels
@@ -333,7 +333,7 @@ class EncoderProcessorDecoder(nn.Module):
         if debug:
             print(f"  [MS] After Encoder: x std={graph.x.std().item():.4f}")
 
-        kl = 0.0
+        mmd = torch.zeros((), device=graph.x.device, dtype=torch.float32)
         aux_loss = 0.0
         z = None
         current_z_per_node = None
@@ -344,7 +344,7 @@ class EncoderProcessorDecoder(nn.Module):
             dtype = graph.x.dtype
             batch_bc = (original_batch if original_batch is not None
                         else torch.zeros(N, dtype=torch.long, device=device))
-            z, kl = self._encode_vae(
+            z, mmd = self._encode_vae(
                 original_y, original_edge_index, original_edge_attr,
                 original_batch, N, device, dtype, use_posterior, fixed_z=fixed_z
             )
@@ -427,7 +427,7 @@ class EncoderProcessorDecoder(nn.Module):
         output = self.decoder(current_graph)
         if debug:
             print(f"  [MS] After Decoder: out std={output.std().item():.4f}")
-        return output, kl, aux_loss
+        return output, mmd, aux_loss
 
     def _extract_level_data(self, graph, L):
         """Extract per-level coarsening topology from graph before encoder drops custom attrs."""

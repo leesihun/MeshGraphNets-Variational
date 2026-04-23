@@ -73,30 +73,24 @@ Key-value pairs, one per line. `%` for full-line comments, `#` for inline commen
 | `use_vae` | bool | Conditional VAE latent conditioning |
 | `vae_latent_dim` | int | VAE latent code dimension |
 | `vae_mp_layers` | int | GnBlocks in VAE encoder |
-| `beta_kl` | float | KL divergence loss weight |
+| `lambda_mmd` | float | Weight on MMD between aggregate posterior q(z) and N(0,I) |
 | `alpha_recon` | float | Reconstruction loss weight |
 | `beta_aux` | float | Auxiliary prediction loss weight |
-| `kl_anneal_schedule` | str | `linear` or `three_phase` |
-| `kl_phase1_ratio` | float | Fraction of training in constant-low-β phase |
-| `kl_phase2_ratio` | float | Fraction of training in β ramp phase |
-| `kl_min_beta_ratio` | float | Phase 1 β = `beta_kl × kl_min_beta_ratio` |
-| `train_latent_flow` | bool | Train RealNVP normalizing flow on VAE latents post-training |
-| `flow_hidden_dim` | int | RealNVP MLP hidden dimension |
-| `flow_num_layers` | int | RealNVP coupling layers |
-| `flow_lr` | float | Flow training learning rate |
-| `flow_weight_decay` | float | Flow L2 regularization weight |
+| `fit_latent_gmm` | bool | Fit GMM on posterior means after training; stored in checkpoint |
+| `gmm_components` | int | Number of GMM components (capped to n_train if smaller) |
+| `gmm_covariance_type` | str | `full` \| `diag` \| `tied` \| `spherical` |
 | `use_parallel_stats` | bool | Parallel preprocessing stats computation |
 
 ## Architecture Overview
 
-**Encode–Process–Decode GNN** on FEA mesh graphs, with optional VAE conditioning, multiscale V-cycle, and normalizing flow.
+**Encode–Process–Decode GNN** on FEA mesh graphs, with optional MMD-VAE (InfoVAE) conditioning and multiscale V-cycle.
 
 - **Input:** Nodes carry physical state (displacements, stress) + optional positional features + optional one-hot node types. Edges are 8D: `[deformed_dx/dy/dz/dist, ref_dx/dy/dz/dist]`. Always bidirectional.
 - **Prediction target:** Normalized state deltas (`Δstate = state_{t+1} − state_t`). Rollout: `state_{t+1} = state_t + denormalize(delta_pred)`.
 - **Encoder:** MLP per node, MLP per edge → latent embeddings.
 - **Processor (flat):** Stack of `message_passing_num` GnBlocks. Each block: EdgeBlock (MLP on `[sender‖receiver‖edge]`) then NodeBlock (sum-aggregate msgs, MLP update). Residual on both nodes and edges.
 - **Processor (multiscale):** BFS Bi-Stride V-cycle. Pool = mean, Unpool = broadcast or learned bipartite. Skip connections via `Linear(2·D, D)`. World edges only at finest level.
-- **VAE conditioning (`use_vae True`):** `GNNVariationalEncoder` encodes target `y` → `(μ, log σ²)` → `z` via reparameterization. `z` fused into each GnBlock. At inference, `z` sampled from trained RealNVP flow prior.
+- **MMD-VAE conditioning (`use_vae True`):** `GNNVariationalEncoder` encodes target `y` → `(μ, log σ²)` → `z` via reparameterization; `z` is fused into each GnBlock. Training regularizer is a multi-scale RBF MMD² between the batch of reparameterized `z` samples and `N(0, I)` (Zhao et al. 2019, InfoVAE). This directly matches the aggregate posterior to the prior — avoiding posterior collapse and the prior/posterior mismatch that afflicts standard KL-VAE — so `z ∼ N(0, I)` sampling at inference lands in the decoder's training support. Optionally (`fit_latent_gmm True`), a GMM is fit on the training-set posterior means after training and saved to the checkpoint; rollout then samples from the GMM instead of `N(0, I)`, capturing the true shape of the aggregate posterior.
 - **Decoder:** Single MLP, **no LayerNorm on output**. Last-layer weights ×0.01 when T>1.
 - **Activation:** SiLU (Swish) hardcoded — not configurable.
 - **Aggregation:** Sum (not mean) in NodeBlock.
@@ -124,7 +118,7 @@ Key-value pairs, one per line. `%` for full-line comments, `#` for inline commen
 
 **Rollout output:** `rollout_sample{id}_steps{N}.h5`, `nodal_data` shape `[8, timesteps, nodes]`.
 
-**Checkpoints:** model weights, optimizer state, `checkpoint['normalization']`, optionally `ema_state_dict`, `coarse_edge_means`/`coarse_edge_stds`, `flow_state_dict`.
+**Checkpoints:** model weights, optimizer state, `checkpoint['normalization']`, optionally `ema_state_dict`, `coarse_edge_means`/`coarse_edge_stds`.
 
 ## Key Files
 
@@ -135,9 +129,9 @@ Key-value pairs, one per line. `%` for full-line comments, `#` for inline commen
 | `model/encoder_decoder.py` | Encoder, GnBlock, Decoder |
 | `model/blocks.py` | EdgeBlock, NodeBlock, HybridNodeBlock, UnpoolBlock |
 | `model/mlp.py` | `build_mlp` utility and weight initialization |
-| `model/vae.py` | GNNVariationalEncoder (conditional VAE) |
+| `model/vae.py` | GNNVariationalEncoder (conditional MMD-VAE) |
+| `model/latent_gmm.py` | Post-hoc GMM fitting + inference sampling on VAE latent space |
 | `model/coarsening.py` | BFS Bi-Stride and Voronoi FPS coarsening, pool/unpool |
-| `model/latent_flow.py` | RealNVP normalizing flow for VAE latent space |
 | `model/checkpointing.py` | Activation checkpointing wrapper |
 | `training_profiles/setup.py` | Dataset/model/optimizer builders |
 | `training_profiles/training_loop.py` | Loss, optimizer, epoch loop, EMA, VAE losses |

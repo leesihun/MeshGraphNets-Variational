@@ -78,42 +78,6 @@ def _loss_from_errors(errors, loss_weights):
     return loss_sum / loss_count, loss_sum.item(), loss_count
 
 
-def _compute_beta_eff(beta_kl, epoch, config):
-    """Compute effective KL weight for the current epoch.
-
-    Schedules:
-      'linear'      — ramp from 0 to beta_kl over kl_anneal_epochs (legacy).
-      'three_phase' — three phases controlled by fractions of total epochs:
-          Phase 1 (0 → phase1_end):  constant small beta  (beta_kl * kl_min_beta_ratio)
-          Phase 2 (phase1_end → phase2_end): linear ramp to full beta_kl
-          Phase 3 (phase2_end → end): full beta_kl
-    """
-    kl_anneal_epochs = int(config.get('kl_anneal_epochs', 0))
-    schedule = config.get('kl_anneal_schedule', 'linear')
-
-    if schedule == 'three_phase':
-        total_epochs = int(config.get('training_epochs', 1))
-        phase1_frac = float(config.get('kl_phase1_ratio', 0.3))
-        phase2_frac = float(config.get('kl_phase2_ratio', 0.4))
-        min_ratio = float(config.get('kl_min_beta_ratio', 0.01))
-
-        phase1_end = phase1_frac * total_epochs
-        phase2_end = (phase1_frac + phase2_frac) * total_epochs
-
-        if epoch < phase1_end:
-            return beta_kl * min_ratio
-        elif epoch < phase2_end:
-            t = (epoch - phase1_end) / (phase2_end - phase1_end)
-            return beta_kl * (min_ratio + t * (1.0 - min_ratio))
-        else:
-            return beta_kl
-    else:
-        # Legacy linear schedule
-        if kl_anneal_epochs > 0:
-            return beta_kl * min(1.0, epoch / kl_anneal_epochs)
-        return beta_kl
-
-
 def _accum_window_size(batch_idx, total_batches, actual_accum):
     """Return the number of batches in the current accumulation window."""
     window_start = (batch_idx // actual_accum) * actual_accum
@@ -137,23 +101,11 @@ def log_training_config(config):
     if config.get('use_vae', False):
         z_dim   = config.get('vae_latent_dim', 32)
         mp_enc  = config.get('vae_mp_layers', 2)
-        beta    = config.get('beta_kl', 0.001)
+        lam     = config.get('lambda_mmd', 100.0)
         b_aux   = config.get('beta_aux', 0.1)
         alpha   = config.get('alpha_recon', 1.0)
-        schedule = config.get('kl_anneal_schedule', 'linear')
-        if schedule == 'three_phase':
-            p1 = float(config.get('kl_phase1_ratio', 0.3))
-            p2 = float(config.get('kl_phase2_ratio', 0.4))
-            mr = float(config.get('kl_min_beta_ratio', 0.01))
-            anneal_str = (f", KL schedule=three_phase "
-                          f"[0-{p1:.0%} β={beta*mr:.1e}, "
-                          f"{p1:.0%}-{p1+p2:.0%} ramp, "
-                          f"{p1+p2:.0%}-100% β={beta}]")
-        else:
-            anneal = config.get('kl_anneal_epochs', 0)
-            anneal_str = f", KL anneal {anneal} epochs" if anneal > 0 else ""
-        print(f"VAE: ENABLED (z_dim={z_dim}, vae_mp_layers={mp_enc}, "
-              f"beta_kl={beta}, beta_aux={b_aux}, alpha_recon={alpha}{anneal_str})")
+        print(f"VAE (MMD): ENABLED (z_dim={z_dim}, vae_mp_layers={mp_enc}, "
+              f"lambda_mmd={lam}, beta_aux={b_aux}, alpha_recon={alpha})")
     else:
         print("VAE: disabled")
 
@@ -179,11 +131,11 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
     model.train()
     total_loss_sum = 0.0
     total_loss_count = 0
-    total_opt_loss_sum = 0.0  # actual optimization loss (recon + beta*kl when VAE)
+    total_opt_loss_sum = 0.0  # actual optimization loss (recon + lambda_mmd*mmd when VAE)
     total_grad_norm = 0.0
-    total_kl_sum = 0.0
+    total_mmd_sum = 0.0
     total_aux_sum = 0.0
-    kl_count = 0
+    mmd_count = 0
     num_batches = 0
     num_steps = 0  # number of optimizer steps taken
 
@@ -194,15 +146,11 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
     use_compile = config.get('use_compile', False)
     amp_dtype = torch.bfloat16
 
-    # VAE config
+    # VAE config (MMD objective: InfoVAE-style aggregate-posterior matching)
     use_vae = config.get('use_vae', False)
     alpha_recon = float(config.get('alpha_recon', 1.0))
-    beta_kl = float(config.get('beta_kl', 0.001))
+    lambda_mmd = float(config.get('lambda_mmd', 100.0))
     beta_aux = float(config.get('beta_aux', 1.0))
-    if use_vae:
-        beta_eff = _compute_beta_eff(beta_kl, epoch, config)
-    else:
-        beta_eff = beta_kl
 
     # Gradient accumulation: 0 = full epoch (1 step/epoch), 1 = per-batch (default), N = every N batches
     grad_accum_steps = config.get('grad_accum_steps', 1)
@@ -220,7 +168,7 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
         graph = graph.to(device)
 
         with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
-            predicted_acc, target_acc, kl_loss_val, aux_loss_val = model(graph, debug=debug_internal)
+            predicted_acc, target_acc, mmd_loss_val, aux_loss_val = model(graph, debug=debug_internal)
 
             if batch_idx == 0 and verbose:
                 tqdm.tqdm.write(f"\n=== DEBUG Epoch {epoch} Batch 0 ===")
@@ -235,7 +183,7 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
             errors = torch.nn.functional.huber_loss(predicted_acc, target_acc, reduction='none', delta=1.0)
             recon_loss, batch_loss_sum, batch_loss_count = _loss_from_errors(errors, loss_weights)
             if use_vae:
-                loss = alpha_recon * recon_loss + beta_eff * kl_loss_val + beta_aux * aux_loss_val
+                loss = alpha_recon * recon_loss + lambda_mmd * mmd_loss_val + beta_aux * aux_loss_val
             else:
                 loss = recon_loss
             # Scale loss so accumulated gradients equal the mean within each accumulation window.
@@ -260,11 +208,11 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
         total_opt_loss_sum += loss.item() * batch_loss_count
         num_batches += 1
         if use_vae:
-            kl_scalar  = kl_loss_val.item()  if hasattr(kl_loss_val,  'item') else float(kl_loss_val)
+            mmd_scalar = mmd_loss_val.item() if hasattr(mmd_loss_val, 'item') else float(mmd_loss_val)
             aux_scalar = aux_loss_val.item() if hasattr(aux_loss_val, 'item') else float(aux_loss_val)
-            total_kl_sum  += kl_scalar
+            total_mmd_sum += mmd_scalar
             total_aux_sum += aux_scalar
-            kl_count += 1
+            mmd_count += 1
 
         # Step optimizer at end of accumulation window or final batch
         is_last_batch = (batch_idx == total_batches - 1)
@@ -302,11 +250,11 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
             mem_gb = torch.cuda.memory_allocated() / 1e9
             postfix = {'rec': f'{loss_val:.2e}', 'mem': f'{mem_gb:.1f}GB'}
             if use_vae:
-                kl_val  = kl_loss_val.item()  if hasattr(kl_loss_val,  'item') else float(kl_loss_val)
+                mmd_val = mmd_loss_val.item() if hasattr(mmd_loss_val, 'item') else float(mmd_loss_val)
                 aux_val = aux_loss_val.item() if hasattr(aux_loss_val, 'item') else float(aux_loss_val)
-                postfix['kl']  = f'{kl_val:.2e}'
+                postfix['mmd'] = f'{mmd_val:.2e}'
                 postfix['aux'] = f'{aux_val:.2e}'
-                postfix['β'] = f'{beta_eff:.1e}'
+                postfix['λ']   = f'{lambda_mmd:.1e}'
                 postfix['total'] = f'{loss.item():.2e}'
             if monitor_gradients:
                 postfix['grad'] = f'{grad_norm.item():.2e}'
@@ -328,14 +276,14 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
         'sum': total_loss_sum,
         'count': total_loss_count,
     }
-    if use_vae and kl_count > 0:
-        result['kl_mean']  = total_kl_sum  / kl_count
-        result['aux_mean'] = total_aux_sum / kl_count
+    if use_vae and mmd_count > 0:
+        result['mmd_mean'] = total_mmd_sum / mmd_count
+        result['aux_mean'] = total_aux_sum / mmd_count
     return result
 
 def _eval_forward_errors(model, graph, use_amp, amp_dtype, use_posterior):
     with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
-        predicted, target, kl_loss_val, _ = model(
+        predicted, target, mmd_loss_val, _ = model(
             graph,
             add_noise=False,
             use_posterior=use_posterior,
@@ -343,7 +291,7 @@ def _eval_forward_errors(model, graph, use_amp, amp_dtype, use_posterior):
         errors = torch.nn.functional.huber_loss(
             predicted, target, reduction='none', delta=1.0
         )
-    return errors, kl_loss_val
+    return errors, mmd_loss_val
 
 
 def _evaluate_epoch(model, dataloader, device, config, epoch=0, *,
@@ -362,18 +310,14 @@ def _evaluate_epoch(model, dataloader, device, config, epoch=0, *,
 
     use_vae = config.get('use_vae', False)
     alpha_recon = float(config.get('alpha_recon', 1.0))
-    beta_kl = float(config.get('beta_kl', 0.001))
-    if use_vae:
-        beta_eff = _compute_beta_eff(beta_kl, epoch, config)
-    else:
-        beta_eff = beta_kl
+    lambda_mmd = float(config.get('lambda_mmd', 100.0))
 
     with torch.no_grad():
         total_loss_sum = 0.0
         total_loss_count = 0
         total_opt_loss_sum = 0.0
-        total_kl_sum = 0.0
-        kl_count = 0
+        total_mmd_sum = 0.0
+        mmd_count = 0
 
         # Accumulate per-feature losses across all batches
         accumulated_per_feature_loss = None
@@ -400,15 +344,15 @@ def _evaluate_epoch(model, dataloader, device, config, epoch=0, *,
                     else:
                         errors_sum += sample_errors
                 errors = errors_sum / num_prior_samples
-                kl_loss_val = errors.new_zeros(())
+                mmd_loss_val = errors.new_zeros(())
             else:
-                errors, kl_loss_val = _eval_forward_errors(
+                errors, mmd_loss_val = _eval_forward_errors(
                     model, graph, use_amp, amp_dtype, use_posterior=use_posterior
                 )
 
             recon_loss, batch_loss_sum, batch_loss_count = _loss_from_errors(errors, loss_weights)
             if use_vae:
-                opt_loss = alpha_recon * recon_loss + beta_eff * kl_loss_val
+                opt_loss = alpha_recon * recon_loss + lambda_mmd * mmd_loss_val
             else:
                 opt_loss = recon_loss
 
@@ -429,8 +373,8 @@ def _evaluate_epoch(model, dataloader, device, config, epoch=0, *,
             mem_gb = torch.cuda.memory_allocated() / 1e9
             postfix = {'rec': f'{recon_loss.item():.2e}', 'mem': f'{mem_gb:.1f}GB'}
             if use_vae:
-                kl_scalar = kl_loss_val.item() if hasattr(kl_loss_val, 'item') else float(kl_loss_val)
-                postfix['kl'] = f'{kl_scalar:.2e}'
+                mmd_scalar = mmd_loss_val.item() if hasattr(mmd_loss_val, 'item') else float(mmd_loss_val)
+                postfix['mmd'] = f'{mmd_scalar:.2e}'
                 postfix['total'] = f'{opt_loss.item():.2e}'
             pbar.set_postfix(postfix)
 
@@ -438,9 +382,9 @@ def _evaluate_epoch(model, dataloader, device, config, epoch=0, *,
             total_loss_count += batch_loss_count
             total_opt_loss_sum += opt_loss.item() * batch_loss_count
             if use_vae:
-                kl_scalar = kl_loss_val.item() if hasattr(kl_loss_val, 'item') else float(kl_loss_val)
-                total_kl_sum += kl_scalar
-                kl_count += 1
+                mmd_scalar = mmd_loss_val.item() if hasattr(mmd_loss_val, 'item') else float(mmd_loss_val)
+                total_mmd_sum += mmd_scalar
+                mmd_count += 1
 
         # Print per-feature validation loss breakdown
         if verbose and accumulated_per_feature_loss is not None and accumulated_per_feature_count > 0:
@@ -457,8 +401,8 @@ def _evaluate_epoch(model, dataloader, device, config, epoch=0, *,
         'sum': total_loss_sum,
         'count': total_loss_count,
     }
-    if use_vae and kl_count > 0:
-        result['kl_mean'] = total_kl_sum / kl_count
+    if use_vae and mmd_count > 0:
+        result['mmd_mean'] = total_mmd_sum / mmd_count
     return result
 
 

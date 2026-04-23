@@ -1,6 +1,6 @@
 # MeshGraphNets — Variational
 
-A Graph Neural Network surrogate for FEA (Finite Element Analysis) simulations implementing an **Encode–Process–Decode** architecture with optional **Conditional VAE**, **Multiscale V-cycle coarsening**, and **RealNVP Normalizing Flow** latent prior.
+A Graph Neural Network surrogate for FEA (Finite Element Analysis) simulations implementing an **Encode–Process–Decode** architecture with optional **Conditional MMD-VAE (InfoVAE)** and **Multiscale V-cycle coarsening**.
 
 Designed for learning and autoregressively rolling out time-transient structural mechanics simulations (warpage, displacement, stress) on unstructured FEA meshes.
 
@@ -11,8 +11,7 @@ Designed for learning and autoregressively rolling out time-transient structural
 ## Features
 
 - **GNN surrogate for FEA** — predicts normalized state deltas autoregressively on mesh graphs
-- **Conditional VAE** — encodes target trajectory into a global latent `z`; supports stochastic rollout at inference
-- **RealNVP normalizing flow** — structured latent sampling at inference after post-training flow fitting
+- **Conditional MMD-VAE (InfoVAE)** — encodes target trajectory into a global latent `z`; aggregate posterior matched to `N(0, I)` via multi-scale RBF MMD so `z ∼ N(0, I)` sampling works directly at inference
 - **Multiscale V-cycle** — BFS Bi-Stride or Voronoi FPS coarsening with pool/unpool and skip connections
 - **World edges** — radius-based collision/contact edges alongside mesh connectivity
 - **Rotation-invariant positional features** — RWPE, LPE, or both
@@ -131,12 +130,12 @@ Input Graph
    state_{t+1} = state_t + denormalize(Δstate)
 ```
 
-### VAE Conditioning (`use_vae true`)
+### MMD-VAE Conditioning (`use_vae true`)
 
 - `GNNVariationalEncoder` runs GnBlocks on the **target** delta graph → GlobalAttention pool → `(μ, log σ²)` → reparameterized `z`
 - `z` is fused into every GnBlock during training
-- At inference, `z` is sampled from a **RealNVP** flow trained post-training on the aggregate posterior
-- KL annealing: `linear` or `three_phase` schedule
+- Regularizer is a multi-scale RBF **MMD²** between the batch of reparameterized `z` samples and `N(0, I)` (InfoVAE, Zhao et al. 2019) — **not** per-sample KL
+- At inference, `z ∼ N(0, I)` directly; aggregate-posterior matching ensures this lands in the decoder's training support
 
 ### Key design choices
 
@@ -210,25 +209,16 @@ Config files are plain text: one `key    value` pair per line. `%` = full-line c
 | `voronoi_clusters` | Target cluster counts per Voronoi level |
 | `bipartite_unpool` | Learned bipartite unpool (vs. broadcast) |
 
-### VAE / Normalizing Flow
+### MMD-VAE (InfoVAE)
 
 | Key | Description |
 |-----|-------------|
-| `use_vae` | Conditional VAE latent conditioning |
-| `vae_latent_dim` | VAE latent code dimension |
+| `use_vae` | Conditional MMD-VAE latent conditioning |
+| `vae_latent_dim` | Latent code dimension |
 | `vae_mp_layers` | GnBlocks in VAE encoder |
-| `beta_kl` | KL divergence weight |
+| `lambda_mmd` | Weight on MMD(q(z), N(0,I)) |
 | `alpha_recon` | Reconstruction loss weight |
 | `beta_aux` | Auxiliary prediction loss weight |
-| `kl_anneal_schedule` | `linear` or `three_phase` |
-| `kl_phase1_ratio` | Fraction of training in constant-low-β phase |
-| `kl_phase2_ratio` | Fraction of training in β ramp phase |
-| `kl_min_beta_ratio` | Phase 1 β = `beta_kl × kl_min_beta_ratio` |
-| `train_latent_flow` | Train RealNVP flow post-training |
-| `flow_hidden_dim` | Flow MLP hidden dim |
-| `flow_num_layers` | RealNVP coupling layers |
-| `flow_lr` | Flow learning rate |
-| `flow_weight_decay` | Flow L2 regularization |
 
 ### World Edges
 
@@ -258,7 +248,7 @@ Config files are plain text: one `key    value` pair per line. `%` = full-line c
 
 **Rollout output** — `rollout_sample{id}_steps{N}.h5`, same layout, shape `[8, T, N]`
 
-**Checkpoints** contain: model weights, optimizer/scheduler state, `checkpoint['normalization']`, optionally `ema_state_dict`, `coarse_edge_means`/`coarse_edge_stds`, `flow_state_dict`, `model_config`.
+**Checkpoints** contain: model weights, optimizer/scheduler state, `checkpoint['normalization']`, optionally `ema_state_dict`, `coarse_edge_means`/`coarse_edge_stds`, `model_config`.
 
 ---
 
@@ -273,7 +263,6 @@ model/
   mlp.py                           build_mlp and weight initialization
   vae.py                           GNNVariationalEncoder
   coarsening.py                    BFS Bi-Stride + Voronoi FPS coarsening
-  latent_flow.py                   RealNVP normalizing flow
   checkpointing.py                 Gradient checkpointing wrapper
 training_profiles/
   setup.py                         Dataset / model / optimizer builders

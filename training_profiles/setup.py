@@ -81,7 +81,7 @@ def log_model_summary(model, config, ema_model=None):
     if ema_model is not None:
         print(f"EMA: ENABLED (decay={config.get('ema_decay', 0.999)})")
     if config.get('use_vae', False):
-        print(f"VAE: ENABLED (z_dim={config.get('vae_latent_dim', 32)}, beta_kl={config.get('beta_kl', 0.001)})")
+        print(f"VAE (MMD): ENABLED (z_dim={config.get('vae_latent_dim', 32)}, lambda_mmd={config.get('lambda_mmd', 100.0)})")
     else:
         print("VAE: disabled")
     total_params = sum(p.numel() for p in model.parameters())

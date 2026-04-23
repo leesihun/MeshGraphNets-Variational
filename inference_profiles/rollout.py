@@ -184,18 +184,23 @@ def run_rollout(config, config_filename='config.txt'):
     use_vae = config.get('use_vae', False)
     vae_latent_dim = int(config.get('vae_latent_dim', 8))
 
-    # Load latent flow for VAE sampling (if available in checkpoint)
-    latent_flow = None
-    if use_vae:
-        from model.latent_flow import load_latent_flow
-        latent_flow = load_latent_flow(checkpoint, device)
     num_vae_samples = int(config.get('num_vae_samples', 1)) if use_vae else 1
+
+    # Load GMM prior if present in checkpoint (falls back to N(0,I) if absent)
+    gmm_params = None
+    if use_vae:
+        from model.latent_gmm import load_latent_gmm
+        gmm_params = load_latent_gmm(checkpoint)
 
     print(f"\nLoading initial condition...")
     print(f"  Dataset: {dataset_dir}")
     print(f"  Rollout steps: {num_rollout_steps}")
     if use_vae:
-        print(f"  VAE sampling: {num_vae_samples} sample(s) per scene (z_dim={vae_latent_dim})")
+        sampler_desc = (f"GMM ({gmm_params['n_components']} components, "
+                        f"{gmm_params['covariance_type']} cov)"
+                        if gmm_params is not None else "N(0, I)")
+        print(f"  VAE sampling: {num_vae_samples} sample(s) per scene "
+              f"(z_dim={vae_latent_dim}, prior={sampler_desc})")
 
     # We need to infer all samples in the dataset
     # Gather sample IDs (may not be sequential 0..N-1)
@@ -311,10 +316,9 @@ def run_rollout(config, config_filename='config.txt'):
             # Sample a fixed z for this entire trajectory
             fixed_z = None
             if use_vae:
-                if latent_flow is not None:
-                    with torch.no_grad():
-                        u = torch.randn(1, vae_latent_dim, device=device)
-                        fixed_z, _ = latent_flow(u)
+                if gmm_params is not None:
+                    from model.latent_gmm import sample_from_gmm
+                    fixed_z = sample_from_gmm(gmm_params, 1, device)
                 else:
                     fixed_z = torch.randn(1, vae_latent_dim, device=device)
 

@@ -19,6 +19,9 @@ class GNNVariationalEncoder(nn.Module):
         → num_mp_layers GnBlocks (message passing on mesh topology)
         → GlobalAttention pool → [B, latent_dim]
         → mu_head, logvar_head → z [B, vae_latent_dim]
+
+    Note: mu/logvar heads are retained for reparameterization; the training
+    regularizer is MMD between the sampled z and N(0,I), NOT per-sample KL.
     """
 
     def __init__(self, node_output_size, edge_input_size, latent_dim, vae_latent_dim, num_mp_layers=2):
@@ -59,6 +62,33 @@ class GNNVariationalEncoder(nn.Module):
         return z, mu, logvar
 
     @staticmethod
-    def kl_loss(mu, logvar):
-        """KL(q||p) = -1/2 * mean(1 + logvar - mu^2 - exp(logvar))"""
-        return -0.5 * torch.mean(1.0 + logvar - mu.pow(2) - logvar.exp())
+    def mmd_loss(z_posterior, kernel_sigmas=(0.5, 1.0, 2.0, 4.0, 8.0)):
+        """Multi-scale RBF MMD² between z_posterior and N(0, I).
+
+        Implements the InfoVAE objective (Zhao et al. 2019): match the aggregate
+        posterior q(z) to the prior p(z) = N(0, I). This replaces the standard
+        VAE per-sample KL term, preventing posterior collapse and ensuring that
+        N(0, I) sampling at inference lands in the decoder's training support.
+
+        A multi-bandwidth kernel avoids single-bandwidth sensitivity; the sum
+        acts as a characteristic kernel across a range of scales.
+
+        Args:
+            z_posterior:    [B, D] reparameterized samples from q(z|x).
+            kernel_sigmas:  RBF bandwidths to sum over.
+
+        Returns:
+            Scalar MMD² estimate (biased V-statistic). Non-negative.
+        """
+        z_prior = torch.randn_like(z_posterior)
+        mmd_total = z_posterior.new_zeros(())
+        for sigma in kernel_sigmas:
+            two_sigma_sq = 2.0 * sigma * sigma
+            xx = torch.cdist(z_posterior, z_posterior).pow(2)
+            yy = torch.cdist(z_prior, z_prior).pow(2)
+            xy = torch.cdist(z_posterior, z_prior).pow(2)
+            k_xx = torch.exp(-xx / two_sigma_sq)
+            k_yy = torch.exp(-yy / two_sigma_sq)
+            k_xy = torch.exp(-xy / two_sigma_sq)
+            mmd_total = mmd_total + (k_xx.mean() + k_yy.mean() - 2.0 * k_xy.mean())
+        return mmd_total / len(kernel_sigmas)
