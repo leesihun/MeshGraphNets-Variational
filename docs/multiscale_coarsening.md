@@ -318,12 +318,9 @@ depends on the final cluster assignments and the original fine edge list.
 
 ### 5.2 Coarse Edge Features (8D)
 
-```python
-def compute_coarse_edge_attr(reference_pos, deformed_pos, fine_to_coarse,
-                              coarse_edge_index, num_coarse):
-```
-
-Coarse nodes are positioned at the **centroid** of their constituent fine nodes:
+Coarse edge features are computed by `attach_coarse_levels_to_graph` in
+`general_modules/multiscale_helpers.py`. Coarse nodes are positioned at the
+**centroid** of their constituent fine nodes:
 ```
 coarse_ref_pos[c]  = mean(reference_pos[i]  for i where fine_to_coarse[i] = c)
 coarse_def_pos[c]  = mean(deformed_pos[i]   for i where fine_to_coarse[i] = c)

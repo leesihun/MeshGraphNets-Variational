@@ -1,38 +1,27 @@
-import torch.nn.init as init
-
-import torch.nn as nn
 import torch
+import torch.nn as nn
 from torch_geometric.data import Data
-from torch_geometric.nn import global_mean_pool, GlobalAttention
 from torch_geometric.utils import scatter
+
 from general_modules.edge_features import EDGE_FEATURE_DIM
-from model.blocks import EdgeBlock, NodeBlock, HybridNodeBlock
 from model.checkpointing import process_with_checkpointing
 from model.coarsening import pool_features, unpool_features
-
-def init_weights(m):
-    if isinstance(m, nn.Linear):
-        # Kaiming/He initialization for ReLU activation
-        init.kaiming_uniform_(m.weight, nonlinearity='relu')
-        if m.bias is not None:
-            init.zeros_(m.bias)
+from model.encoder_decoder import Decoder, Encoder, GnBlock
+from model.mlp import build_mlp, init_weights
+from model.vae import GNNVariationalEncoder
 
 
 class MeshGraphNets(nn.Module):
     def __init__(self, config, device: str):
-        super(MeshGraphNets, self).__init__()
+        super().__init__()
         self.config = config
         self.device = device
 
         self.model = EncoderProcessorDecoder(config).to(device)
         self.model.apply(init_weights)
 
-        # Leave VAE fusion layers on their standard random init so reconstruction
-        # depends on z from the first training step.
-
         # Scale decoder's last layer for better initial predictions.
         # T>1 (delta prediction): scale to ~0 ("predict no change" prior)
-        # T=1 (static prediction): keep Kaiming init (targets are full displacements, not small deltas)
         num_timesteps = config.get('num_timesteps', None)
         if num_timesteps is None or num_timesteps > 1:
             with torch.no_grad():
@@ -42,7 +31,6 @@ class MeshGraphNets(nn.Module):
         print('MeshGraphNets model created successfully')
 
     def set_checkpointing(self, enabled: bool):
-        """Enable or disable gradient checkpointing."""
         self.model.set_checkpointing(enabled)
 
     def forward(self, graph, debug=False, add_noise=None, use_posterior=None, fixed_z=None):
@@ -61,48 +49,37 @@ class MeshGraphNets(nn.Module):
         if add_noise is None:
             add_noise = self.training
 
-        # Noise injection during training (node + edge noise for regularization)
         if add_noise:
             noise_std = self.config.get('std_noise', 0.0)
             if noise_std > 0:
                 output_var = self.config['output_var']
-                # Node noise: physical features only (not node type one-hot)
                 noise = torch.randn(graph.x.shape[0], output_var,
                                     device=graph.x.device, dtype=graph.x.dtype) * noise_std
                 noise_padded = torch.zeros_like(graph.x)
                 noise_padded[:, :output_var] = noise
                 graph.x = graph.x + noise_padded
-                # Target correction (DeepMind: delta -= gamma * noise)
                 noise_gamma = self.config.get('noise_gamma', 0.1)
                 noise_std_ratio = self.config.get('noise_std_ratio', None)
                 if noise_std_ratio is not None:
-                    ratio = torch.tensor(noise_std_ratio, device=graph.x.device,
-                                         dtype=graph.x.dtype)
+                    ratio = torch.tensor(noise_std_ratio, device=graph.x.device, dtype=graph.x.dtype)
                     graph.y = graph.y - noise_gamma * noise * ratio
-                # Edge noise: same std on all edge features (normalized space)
-                edge_noise = torch.randn_like(graph.edge_attr) * noise_std
-                graph.edge_attr = graph.edge_attr + edge_noise
-        # Forward through encoder-processor-decoder
-        predicted, kl, aux_loss = self.model(
-            graph,
-            debug=debug,
-            use_posterior=use_posterior,
-            fixed_z=fixed_z,
-        )
+                graph.edge_attr = graph.edge_attr + torch.randn_like(graph.edge_attr) * noise_std
 
+        predicted, kl, aux_loss = self.model(
+            graph, debug=debug, use_posterior=use_posterior, fixed_z=fixed_z,
+        )
         return predicted, graph.y, kl, aux_loss
+
 
 class EncoderProcessorDecoder(nn.Module):
     def __init__(self, config):
-        super(EncoderProcessorDecoder, self).__init__()
+        super().__init__()
         self.config = config
 
         self.message_passing_num = config['message_passing_num']
         self.edge_input_size = int(config['edge_var'])
         if self.edge_input_size != EDGE_FEATURE_DIM:
-            raise ValueError(
-                f"edge_var must be {EDGE_FEATURE_DIM}, got {self.edge_input_size}"
-            )
+            raise ValueError(f"edge_var must be {EDGE_FEATURE_DIM}, got {self.edge_input_size}")
         self.latent_dim = config['latent_dim']
         self.use_checkpointing = config.get('use_checkpointing', False)
         self.use_world_edges = config.get('use_world_edges', False)
@@ -122,7 +99,6 @@ class EncoderProcessorDecoder(nn.Module):
             if num_pos_features > 0:
                 print(f"  Model input: {config['input_var']} physical + {num_pos_features} positional = {self.node_input_size}")
 
-        # Output is always physical features only (node types don't change)
         self.node_output_size = config['output_var']
 
         self.encoder = Encoder(
@@ -131,157 +107,138 @@ class EncoderProcessorDecoder(nn.Module):
         )
 
         if not self.use_multiscale:
-            # ── Original flat processor ──────────────────────────────────────
-            processer_list = []
-            for _ in range(self.message_passing_num):
-                processer_list.append(GnBlock(config, self.latent_dim, use_world_edges=self.use_world_edges))
-            self.processer_list = nn.ModuleList(processer_list)
-        else:
-            # ── Hierarchical N-level V-cycle processor ───────────────────────
-            L = int(config.get('multiscale_levels', 1))
-            self.multiscale_levels = L
-            self.mp_per_level = None  # set after parsing below
-
-            # Parse mp_per_level or construct from legacy keys
-            mp_per_level = config.get('mp_per_level', None)
-            if mp_per_level is None:
-                fine_pre = int(config.get('fine_mp_pre', 5))
-                coarse_mp = int(config.get('coarse_mp_num', 5))
-                fine_post = int(config.get('fine_mp_post', 5))
-                mp_per_level = [fine_pre] + [coarse_mp] + [fine_post]
-            if not isinstance(mp_per_level, list):
-                mp_per_level = [int(mp_per_level)]
-            else:
-                mp_per_level = [int(x) for x in mp_per_level]
-
-            self.mp_per_level = mp_per_level  # save for VAE z_projs construction
-
-            expected_len = 2 * L + 1
-            if len(mp_per_level) != expected_len:
-                raise ValueError(
-                    f"mp_per_level must have {expected_len} entries for {L} levels, "
-                    f"got {len(mp_per_level)}: {mp_per_level}"
-                )
-
-            # Print V-cycle structure
-            parts = []
-            for i in range(L):
-                parts.append(f"pre[{i}]={mp_per_level[i]}")
-            parts.append(f"coarsest={mp_per_level[L]}")
-            for i in range(L - 1, -1, -1):
-                parts.append(f"post[{i}]={mp_per_level[2 * L - i]}")
-            print(f"  Multiscale V-cycle ({L} levels): {', '.join(parts)}")
-
-            coarse_config = dict(config)
-            coarse_config['use_world_edges'] = False
-
-            # Build per-level pre-blocks, post-blocks, edge encoders, skip projections
-            self.pre_blocks = nn.ModuleList()
-            self.post_blocks = nn.ModuleList()
-            self.coarse_eb_encoders = nn.ModuleList()
-            self.skip_projs = nn.ModuleList()
-
-            for i in range(L):
-                pre_count = mp_per_level[i]
-                post_count = mp_per_level[2 * L - i]
-                use_we = self.use_world_edges if i == 0 else False
-                cfg = config if i == 0 else coarse_config
-
-                self.pre_blocks.append(nn.ModuleList([
-                    GnBlock(cfg, self.latent_dim, use_world_edges=use_we)
-                    for _ in range(pre_count)
-                ]))
-                self.post_blocks.append(nn.ModuleList([
-                    GnBlock(cfg, self.latent_dim, use_world_edges=use_we)
-                    for _ in range(post_count)
-                ]))
-                self.coarse_eb_encoders.append(
-                    build_mlp(self.edge_input_size, self.latent_dim, self.latent_dim)
-                )
-                self.skip_projs.append(nn.Linear(2 * self.latent_dim, self.latent_dim))
-
-            # Bipartite message passing unpool (learned coarse→fine)
-            self.bipartite_unpool = config.get('bipartite_unpool', False)
-            if self.bipartite_unpool:
-                from model.blocks import UnpoolBlock
-                self.unpool_blocks = nn.ModuleList([
-                    UnpoolBlock(self.latent_dim, build_mlp)
-                    for _ in range(L)
-                ])
-
-            # Coarsest level blocks
-            coarsest_count = mp_per_level[L]
-            self.coarsest_blocks = nn.ModuleList([
-                GnBlock(coarse_config, self.latent_dim, use_world_edges=False)
-                for _ in range(coarsest_count)
+            self.processer_list = nn.ModuleList([
+                GnBlock(config, self.latent_dim, use_world_edges=self.use_world_edges)
+                for _ in range(self.message_passing_num)
             ])
+        else:
+            self._build_multiscale_processor(config)
 
         self.decoder = Decoder(self.latent_dim, self.node_output_size)
 
-        # Gated encoder→decoder skip connection: learns when to use encoder features
-        # Variational conditioning (conditional VAE — encodes target delta during training)
         self.use_vae = config.get('use_vae', False)
         if self.use_vae:
-            self.vae_latent_dim = int(config.get('vae_latent_dim', 32))
-            vae_mp_layers = int(config.get('vae_mp_layers', 2))
-            self.vae_encoder = GNNVariationalEncoder(
-                self.node_output_size, self.edge_input_size,
-                self.latent_dim, self.vae_latent_dim, num_mp_layers=vae_mp_layers
+            self._build_vae_components(config)
+
+    def _build_multiscale_processor(self, config):
+        L = int(config.get('multiscale_levels', 1))
+        self.multiscale_levels = L
+
+        mp_per_level = config.get('mp_per_level', None)
+        if mp_per_level is None:
+            fine_pre = int(config.get('fine_mp_pre', 5))
+            coarse_mp = int(config.get('coarse_mp_num', 5))
+            fine_post = int(config.get('fine_mp_post', 5))
+            mp_per_level = [fine_pre] + [coarse_mp] + [fine_post]
+        if not isinstance(mp_per_level, list):
+            mp_per_level = [int(mp_per_level)]
+        else:
+            mp_per_level = [int(x) for x in mp_per_level]
+        self.mp_per_level = mp_per_level
+
+        expected_len = 2 * L + 1
+        if len(mp_per_level) != expected_len:
+            raise ValueError(
+                f"mp_per_level must have {expected_len} entries for {L} levels, "
+                f"got {len(mp_per_level)}: {mp_per_level}"
             )
-            # Per-layer z conditioning: concatenate broadcast z with current node
-            # features, then fuse back to latent_dim before each processor block.
-            # This keeps reconstruction gradients flowing into q(z|y) immediately.
-            if not self.use_multiscale:
-                self.z_fusers = nn.ModuleList([
-                    nn.Linear(self.latent_dim + self.vae_latent_dim, self.latent_dim)
-                    for _ in range(self.message_passing_num)
-                ])
-            else:
-                # Inject z at every level: pre-blocks, coarsest, and post-blocks
-                L = self.multiscale_levels
-                self.ms_z_fusers_pre = nn.ModuleList()
-                self.ms_z_fusers_post = nn.ModuleList()
-                for i in range(L):
-                    pre_count = self.mp_per_level[i]
-                    post_count = self.mp_per_level[2 * L - i]
-                    self.ms_z_fusers_pre.append(nn.ModuleList([
-                        nn.Linear(self.latent_dim + self.vae_latent_dim, self.latent_dim)
-                        for _ in range(pre_count)
-                    ]))
-                    self.ms_z_fusers_post.append(nn.ModuleList([
-                        nn.Linear(self.latent_dim + self.vae_latent_dim, self.latent_dim)
-                        for _ in range(post_count)
-                    ]))
-                coarsest_count = self.mp_per_level[L]
-                self.ms_z_fusers_coarsest = nn.ModuleList([
-                    nn.Linear(self.latent_dim + self.vae_latent_dim, self.latent_dim)
-                    for _ in range(coarsest_count)
-                ])
-            # Auxiliary decoder: z → global stats of target delta per graph.
-            # Forces z to encode useful summary info (mean + std per output feature).
-            # Provides direct gradient signal to the VAE encoder independent of the processor.
-            self.aux_decoder = build_mlp(
-                self.vae_latent_dim, self.latent_dim,
-                2 * self.node_output_size,
-                layer_norm=False, decoder=True
+
+        parts = []
+        for i in range(L):
+            parts.append(f"pre[{i}]={mp_per_level[i]}")
+        parts.append(f"coarsest={mp_per_level[L]}")
+        for i in range(L - 1, -1, -1):
+            parts.append(f"post[{i}]={mp_per_level[2 * L - i]}")
+        print(f"  Multiscale V-cycle ({L} levels): {', '.join(parts)}")
+
+        coarse_config = dict(config)
+        coarse_config['use_world_edges'] = False
+
+        self.pre_blocks = nn.ModuleList()
+        self.post_blocks = nn.ModuleList()
+        self.coarse_eb_encoders = nn.ModuleList()
+        self.skip_projs = nn.ModuleList()
+
+        for i in range(L):
+            pre_count = mp_per_level[i]
+            post_count = mp_per_level[2 * L - i]
+            use_we = self.use_world_edges if i == 0 else False
+            cfg = config if i == 0 else coarse_config
+
+            self.pre_blocks.append(nn.ModuleList([
+                GnBlock(cfg, self.latent_dim, use_world_edges=use_we)
+                for _ in range(pre_count)
+            ]))
+            self.post_blocks.append(nn.ModuleList([
+                GnBlock(cfg, self.latent_dim, use_world_edges=use_we)
+                for _ in range(post_count)
+            ]))
+            self.coarse_eb_encoders.append(
+                build_mlp(self.edge_input_size, self.latent_dim, self.latent_dim)
             )
-            print(f"  VAE: ENABLED (z_dim={self.vae_latent_dim}, vae_mp_layers={vae_mp_layers})")
+            self.skip_projs.append(nn.Linear(2 * self.latent_dim, self.latent_dim))
+
+        self.bipartite_unpool = config.get('bipartite_unpool', False)
+        if self.bipartite_unpool:
+            from model.blocks import UnpoolBlock
+            self.unpool_blocks = nn.ModuleList([
+                UnpoolBlock(self.latent_dim, build_mlp) for _ in range(L)
+            ])
+
+        coarsest_count = mp_per_level[L]
+        self.coarsest_blocks = nn.ModuleList([
+            GnBlock(coarse_config, self.latent_dim, use_world_edges=False)
+            for _ in range(coarsest_count)
+        ])
+
+    def _build_vae_components(self, config):
+        self.vae_latent_dim = int(config.get('vae_latent_dim', 32))
+        vae_mp_layers = int(config.get('vae_mp_layers', 2))
+        self.vae_encoder = GNNVariationalEncoder(
+            self.node_output_size, self.edge_input_size,
+            self.latent_dim, self.vae_latent_dim, num_mp_layers=vae_mp_layers
+        )
+
+        if not self.use_multiscale:
+            self.z_fusers = nn.ModuleList([
+                nn.Linear(self.latent_dim + self.vae_latent_dim, self.latent_dim)
+                for _ in range(self.message_passing_num)
+            ])
+        else:
+            L = self.multiscale_levels
+            self.ms_z_fusers_pre = nn.ModuleList()
+            self.ms_z_fusers_post = nn.ModuleList()
+            for i in range(L):
+                pre_count = self.mp_per_level[i]
+                post_count = self.mp_per_level[2 * L - i]
+                self.ms_z_fusers_pre.append(nn.ModuleList([
+                    nn.Linear(self.latent_dim + self.vae_latent_dim, self.latent_dim)
+                    for _ in range(pre_count)
+                ]))
+                self.ms_z_fusers_post.append(nn.ModuleList([
+                    nn.Linear(self.latent_dim + self.vae_latent_dim, self.latent_dim)
+                    for _ in range(post_count)
+                ]))
+            coarsest_count = self.mp_per_level[L]
+            self.ms_z_fusers_coarsest = nn.ModuleList([
+                nn.Linear(self.latent_dim + self.vae_latent_dim, self.latent_dim)
+                for _ in range(coarsest_count)
+            ])
+
+        self.aux_decoder = build_mlp(
+            self.vae_latent_dim, self.latent_dim,
+            2 * self.node_output_size,
+            layer_norm=False
+        )
+        print(f"  VAE: ENABLED (z_dim={self.vae_latent_dim}, vae_mp_layers={vae_mp_layers})")
+
+    # ── VAE helpers ──────────────────────────────────────────────────────────
 
     def _fuse_z(self, x, z_per_node, fuse_layer):
-        """Condition node latents on z via concatenation."""
         return fuse_layer(torch.cat([x, z_per_node], dim=-1))
 
     def _encode_vae(self, original_y, original_edge_index, original_edge_attr,
                     original_batch, N, device, dtype, use_posterior, fixed_z=None):
-        """
-        Encode target delta into VAE latent z.
-          fixed_z provided:   use it directly (inference with pre-sampled z), KL=0.
-          use_posterior=True  + y available: GNN-encode y → (z, mu, logvar), compute KL.
-          use_posterior=False or y missing:  sample z ~ N(0, I), KL=0.
-        Returns:
-            z:   [B, vae_latent_dim]
-            kl:  scalar
-        """
         if fixed_z is not None:
             return fixed_z.to(device=device, dtype=dtype), 0.0
         if use_posterior and original_y is not None:
@@ -296,106 +253,86 @@ class EncoderProcessorDecoder(nn.Module):
         return z, kl
 
     def _aux_loss(self, z, original_y, original_batch, N, device):
-        """Auxiliary loss: z should predict global stats (mean+std) of target delta per graph."""
         batch = (original_batch if original_batch is not None
                  else torch.zeros(N, dtype=torch.long, device=device))
         B = z.shape[0]
-        y_mean = scatter(original_y, batch, dim=0, dim_size=B, reduce='mean')   # [B, output_var]
-        y_centered = original_y - y_mean[batch]                                  # [N, output_var]
-        y_std = scatter(y_centered.pow(2), batch, dim=0, dim_size=B, reduce='mean').sqrt()  # [B, output_var]
-        aux_target = torch.cat([y_mean, y_std], dim=-1)                          # [B, 2*output_var]
-        aux_pred = self.aux_decoder(z)                                            # [B, 2*output_var]
-        return torch.nn.functional.mse_loss(aux_pred, aux_target)
+        y_mean = scatter(original_y, batch, dim=0, dim_size=B, reduce='mean')
+        y_centered = original_y - y_mean[batch]
+        y_std = scatter(y_centered.pow(2), batch, dim=0, dim_size=B, reduce='mean').sqrt()
+        aux_target = torch.cat([y_mean, y_std], dim=-1)
+        return torch.nn.functional.mse_loss(self.aux_decoder(z), aux_target)
+
+    # ── Forward ──────────────────────────────────────────────────────────────
 
     def forward(self, graph, debug=False, use_posterior=None, fixed_z=None):
         if use_posterior is None:
             use_posterior = self.training and self.use_vae
 
         if not self.use_multiscale:
-            # ── Original flat path ────────────────────────────────────────────
-            # Save y, batch, and raw edge features BEFORE encoder (encoder drops them)
-            original_y         = getattr(graph, 'y', None)
-            original_batch     = getattr(graph, 'batch', None)
-            original_edge_attr = graph.edge_attr
-            original_edge_index = graph.edge_index
+            return self._forward_flat(graph, debug, use_posterior, fixed_z)
+        return self._forward_multiscale(graph, debug, use_posterior, fixed_z)
 
-            graph = self.encoder(graph)
-
-            if debug:
-                print(f"  After Encoder: x std={graph.x.std().item():.4f}, mean={graph.x.mean().item():.4f}")
-
-            # VAE: encode target delta → z, then inject z at every processor layer
-            kl = 0.0
-            aux_loss = 0.0
-            z_per_node = None
-            if self.use_vae:
-                N = graph.x.shape[0]
-                device = graph.x.device
-                dtype = graph.x.dtype
-                batch_bc = (original_batch if original_batch is not None
-                            else torch.zeros(N, dtype=torch.long, device=device))
-                z, kl = self._encode_vae(
-                    original_y, original_edge_index, original_edge_attr,
-                    original_batch, N, device, dtype, use_posterior,
-                    fixed_z=fixed_z
-                )
-                z_per_node = z[batch_bc]  # [N, vae_latent_dim]
-                if self.training and original_y is not None:
-                    aux_loss = self._aux_loss(z, original_y, original_batch, N, device)
-
-            if self.use_checkpointing and self.training:
-                graph = process_with_checkpointing(self.processer_list, graph,
-                                                   z_fusers=self.z_fusers if self.use_vae else None,
-                                                   z_per_node=z_per_node)
-            else:
-                for i, model in enumerate(self.processer_list):
-                    if self.use_vae and z_per_node is not None:
-                        graph.x = self._fuse_z(graph.x, z_per_node, self.z_fusers[i])
-                    graph = model(graph)
-                    if debug and i == len(self.processer_list) - 1:
-                        print(f"  After MP block {i}: x std={graph.x.std().item():.4f}, mean={graph.x.mean().item():.4f}")
-
-            output = self.decoder(graph)
-            if debug:
-                print(f"  After Decoder: out std={output.std().item():.4f}, mean={output.mean().item():.4f}")
-            return output, kl, aux_loss
-
-        # ── Hierarchical N-level V-cycle path ─────────────────────────────────
-        L = self.multiscale_levels
-
-        # Save y, batch, and raw edge features BEFORE encoder (encoder drops them)
-        original_y          = getattr(graph, 'y', None)
-        original_batch      = getattr(graph, 'batch', None)
-        original_edge_attr  = graph.edge_attr
+    def _forward_flat(self, graph, debug, use_posterior, fixed_z):
+        original_y = getattr(graph, 'y', None)
+        original_batch = getattr(graph, 'batch', None)
+        original_edge_attr = graph.edge_attr
         original_edge_index = graph.edge_index
 
-        # Extract per-level topology BEFORE encoder (encoder drops custom attrs)
-        level_data = {}
-        for i in range(L):
-            ftc_key = f'fine_to_coarse_{i}'
-            if not hasattr(graph, ftc_key):
-                # Graph has fewer levels than model (degeneracy) — stop here
-                break
-            ld = {
-                'ftc': graph[ftc_key],
-                'c_ei': graph[f'coarse_edge_index_{i}'],
-                'c_ea': graph[f'coarse_edge_attr_{i}'],
-                'n_c': int(graph[f'num_coarse_{i}'].sum()),
-            }
-            if self.use_multiscale and getattr(self, 'bipartite_unpool', False):
-                ld['up_ei'] = graph[f'unpool_edge_index_{i}']
-                ld['coarse_centroid'] = graph[f'coarse_centroid_{i}']
-                ld['fine_pos'] = graph.pos if i == 0 else graph[f'coarse_centroid_{i - 1}']
-            level_data[i] = ld
+        graph = self.encoder(graph)
+        if debug:
+            print(f"  After Encoder: x std={graph.x.std().item():.4f}, mean={graph.x.mean().item():.4f}")
+
+        kl = 0.0
+        aux_loss = 0.0
+        z_per_node = None
+        if self.use_vae:
+            N = graph.x.shape[0]
+            device = graph.x.device
+            dtype = graph.x.dtype
+            batch_bc = (original_batch if original_batch is not None
+                        else torch.zeros(N, dtype=torch.long, device=device))
+            z, kl = self._encode_vae(
+                original_y, original_edge_index, original_edge_attr,
+                original_batch, N, device, dtype, use_posterior, fixed_z=fixed_z
+            )
+            z_per_node = z[batch_bc]
+            if self.training and original_y is not None:
+                aux_loss = self._aux_loss(z, original_y, original_batch, N, device)
+
+        if self.use_checkpointing and self.training:
+            graph = process_with_checkpointing(
+                self.processer_list, graph,
+                z_fusers=self.z_fusers if self.use_vae else None,
+                z_per_node=z_per_node
+            )
+        else:
+            for i, model in enumerate(self.processer_list):
+                if self.use_vae and z_per_node is not None:
+                    graph.x = self._fuse_z(graph.x, z_per_node, self.z_fusers[i])
+                graph = model(graph)
+                if debug and i == len(self.processer_list) - 1:
+                    print(f"  After MP block {i}: x std={graph.x.std().item():.4f}, mean={graph.x.mean().item():.4f}")
+
+        output = self.decoder(graph)
+        if debug:
+            print(f"  After Decoder: out std={output.std().item():.4f}, mean={output.mean().item():.4f}")
+        return output, kl, aux_loss
+
+    def _forward_multiscale(self, graph, debug, use_posterior, fixed_z):
+        L = self.multiscale_levels
+
+        original_y = getattr(graph, 'y', None)
+        original_batch = getattr(graph, 'batch', None)
+        original_edge_attr = graph.edge_attr
+        original_edge_index = graph.edge_index
+
+        level_data = self._extract_level_data(graph, L)
         actual_levels = len(level_data)
 
-        # Encode fine graph
         graph = self.encoder(graph)
-        encoder_x = graph.x  # save encoder output for gated skip connection
         if debug:
             print(f"  [MS] After Encoder: x std={graph.x.std().item():.4f}")
 
-        # VAE: encode target delta → z
         kl = 0.0
         aux_loss = 0.0
         z = None
@@ -409,35 +346,25 @@ class EncoderProcessorDecoder(nn.Module):
                         else torch.zeros(N, dtype=torch.long, device=device))
             z, kl = self._encode_vae(
                 original_y, original_edge_index, original_edge_attr,
-                original_batch, N, device, dtype, use_posterior,
-                fixed_z=fixed_z
+                original_batch, N, device, dtype, use_posterior, fixed_z=fixed_z
             )
-            current_z_per_node = z[batch_bc]  # [N, vae_latent_dim]
+            current_z_per_node = z[batch_bc]
             current_batch = batch_bc
             if self.training and original_y is not None:
                 aux_loss = self._aux_loss(z, original_y, original_batch, N, device)
 
-        # ── DESCENDING ARM (fine → coarse) ───────────────────────────────────
+        # Descending arm (fine → coarse)
         skip_states = []
         current_graph = graph
 
         for i in range(actual_levels):
-            # Run pre-blocks at level i (inject z at all levels)
             z_fusers_pre = self.ms_z_fusers_pre[i] if (self.use_vae and current_z_per_node is not None) else None
-            if self.use_checkpointing and self.training:
-                current_graph = process_with_checkpointing(self.pre_blocks[i], current_graph,
-                                                           z_fusers=z_fusers_pre,
-                                                           z_per_node=current_z_per_node)
-            else:
-                for j, block in enumerate(self.pre_blocks[i]):
-                    if z_fusers_pre is not None and current_z_per_node is not None:
-                        current_graph.x = self._fuse_z(current_graph.x, current_z_per_node, z_fusers_pre[j])
-                    current_graph = block(current_graph)
-
+            current_graph = self._run_processor_blocks(
+                self.pre_blocks[i], current_graph, z_fusers_pre, current_z_per_node
+            )
             if debug:
                 print(f"  [MS] After pre[{i}] ({len(self.pre_blocks[i])} blocks): x std={current_graph.x.std().item():.4f}")
 
-            # Save skip connection state (including z broadcast for ascending arm)
             skip_states.append({
                 'x': current_graph.x,
                 'edge_attr': current_graph.edge_attr,
@@ -447,39 +374,28 @@ class EncoderProcessorDecoder(nn.Module):
                 'z_per_node': current_z_per_node,
             })
 
-            # Pool: level i → level i+1
             ld = level_data[i]
             h_coarse = pool_features(current_graph.x, ld['ftc'], ld['n_c'])
             e_coarse = self.coarse_eb_encoders[i](ld['c_ea'])
             current_graph = Data(x=h_coarse, edge_attr=e_coarse, edge_index=ld['c_ei'])
 
-            # Update z broadcast for coarser level
             if self.use_vae and z is not None:
-                current_batch = scatter(current_batch, ld['ftc'], dim=0,
-                                        dim_size=ld['n_c'], reduce='min')
+                current_batch = scatter(current_batch, ld['ftc'], dim=0, dim_size=ld['n_c'], reduce='min')
                 current_z_per_node = z[current_batch]
 
             if debug:
                 print(f"  [MS] After pool[{i}]: {skip_states[-1]['x'].shape[0]} → {h_coarse.shape[0]} nodes")
 
-        # ── COARSEST LEVEL ────────────────────────────────────────────────────
+        # Coarsest level
         z_fusers_coarsest = self.ms_z_fusers_coarsest if (self.use_vae and current_z_per_node is not None) else None
-        if self.use_checkpointing and self.training:
-            current_graph = process_with_checkpointing(self.coarsest_blocks, current_graph,
-                                                       z_fusers=z_fusers_coarsest,
-                                                       z_per_node=current_z_per_node)
-        else:
-            for j, block in enumerate(self.coarsest_blocks):
-                if z_fusers_coarsest is not None and current_z_per_node is not None:
-                    current_graph.x = self._fuse_z(current_graph.x, current_z_per_node, z_fusers_coarsest[j])
-                current_graph = block(current_graph)
-
+        current_graph = self._run_processor_blocks(
+            self.coarsest_blocks, current_graph, z_fusers_coarsest, current_z_per_node
+        )
         if debug:
             print(f"  [MS] After coarsest ({len(self.coarsest_blocks)} blocks): x std={current_graph.x.std().item():.4f}")
 
-        # ── ASCENDING ARM (coarse → fine) ─────────────────────────────────────
+        # Ascending arm (coarse → fine)
         for i in range(actual_levels - 1, -1, -1):
-            # Unpool: level i+1 → level i
             ld = level_data[i]
             if getattr(self, 'bipartite_unpool', False):
                 src, dst = ld['up_ei']
@@ -493,268 +409,55 @@ class EncoderProcessorDecoder(nn.Module):
             else:
                 h_up = unpool_features(current_graph.x, ld['ftc'])
 
-            # Skip connection merge
             skip = skip_states[i]
             h_merged = self.skip_projs[i](torch.cat([skip['x'], h_up], dim=-1))
-
-            # Reconstruct graph at level i with saved edge topology
             current_graph = Data(x=h_merged, edge_attr=skip['edge_attr'], edge_index=skip['edge_index'])
             if i == 0 and self.use_world_edges and skip['w_attr'] is not None:
                 current_graph.world_edge_attr = skip['w_attr']
                 current_graph.world_edge_index = skip['w_idx']
 
-            # Restore z broadcast for this level from skip state
             level_z_per_node = skip_states[i].get('z_per_node') if self.use_vae else None
-            # Run post-blocks at level i (inject z at all levels)
             z_fusers_post = self.ms_z_fusers_post[i] if (self.use_vae and level_z_per_node is not None) else None
-            if self.use_checkpointing and self.training:
-                current_graph = process_with_checkpointing(self.post_blocks[i], current_graph,
-                                                           z_fusers=z_fusers_post,
-                                                           z_per_node=level_z_per_node)
-            else:
-                for j, block in enumerate(self.post_blocks[i]):
-                    if z_fusers_post is not None and level_z_per_node is not None:
-                        current_graph.x = self._fuse_z(current_graph.x, level_z_per_node, z_fusers_post[j])
-                    current_graph = block(current_graph)
-
+            current_graph = self._run_processor_blocks(
+                self.post_blocks[i], current_graph, z_fusers_post, level_z_per_node
+            )
             if debug:
                 print(f"  [MS] After post[{i}] ({len(self.post_blocks[i])} blocks): x std={current_graph.x.std().item():.4f}")
 
-        # Decode
         output = self.decoder(current_graph)
         if debug:
             print(f"  [MS] After Decoder: out std={output.std().item():.4f}")
         return output, kl, aux_loss
 
+    def _extract_level_data(self, graph, L):
+        """Extract per-level coarsening topology from graph before encoder drops custom attrs."""
+        level_data = {}
+        for i in range(L):
+            ftc_key = f'fine_to_coarse_{i}'
+            if not hasattr(graph, ftc_key):
+                break
+            ld = {
+                'ftc': graph[ftc_key],
+                'c_ei': graph[f'coarse_edge_index_{i}'],
+                'c_ea': graph[f'coarse_edge_attr_{i}'],
+                'n_c': int(graph[f'num_coarse_{i}'].sum()),
+            }
+            if self.use_multiscale and getattr(self, 'bipartite_unpool', False):
+                ld['up_ei'] = graph[f'unpool_edge_index_{i}']
+                ld['coarse_centroid'] = graph[f'coarse_centroid_{i}']
+                ld['fine_pos'] = graph.pos if i == 0 else graph[f'coarse_centroid_{i - 1}']
+            level_data[i] = ld
+        return level_data
+
+    def _run_processor_blocks(self, blocks, graph, z_fusers, z_per_node):
+        """Run a list of GnBlocks with optional per-block z injection."""
+        if self.use_checkpointing and self.training:
+            return process_with_checkpointing(blocks, graph, z_fusers=z_fusers, z_per_node=z_per_node)
+        for j, block in enumerate(blocks):
+            if z_fusers is not None and z_per_node is not None:
+                graph.x = self._fuse_z(graph.x, z_per_node, z_fusers[j])
+            graph = block(graph)
+        return graph
+
     def set_checkpointing(self, enabled: bool):
-        """Enable or disable gradient checkpointing."""
         self.use_checkpointing = enabled
-
-def build_mlp(in_size, hidden_size, out_size, layer_norm=True, activation='silu', decoder=False):
-    """
-    Build a multi-layer perceptron following the original DeepMind MeshGraphNets architecture.
-
-    Original paper (ICLR 2021): "all MLPs have two hidden layers with ReLU activation
-    and the output layer (except for that of the decoding MLP) is normalized by LayerNorm"
-
-    Structure: Input -> Hidden1 -> Hidden2 -> Output (3 Linear layers, 2 hidden)
-    - ReLU activation between layers (original paper default)
-    - LayerNorm on output (except decoder)
-    """
-    if activation == 'relu':
-        activation_fn = nn.ReLU
-    elif activation == 'gelu':
-        activation_fn = nn.GELU
-    elif activation == 'silu':
-        activation_fn = nn.SiLU
-    elif activation == 'tanh':
-        activation_fn = nn.Tanh
-    elif activation == 'sigmoid':
-        activation_fn = nn.Sigmoid
-    else:
-        raise ValueError(f'Invalid activation function: {activation}')
-
-    if layer_norm:
-        # Standard MLP with 2 hidden layers + LayerNorm on output
-        module = nn.Sequential(
-            nn.Linear(in_size, hidden_size),
-            activation_fn(),
-            nn.Linear(hidden_size, hidden_size),
-            activation_fn(),
-            nn.Linear(hidden_size, out_size),
-            nn.LayerNorm(normalized_shape=out_size),
-        )
-    elif decoder:
-        # Decoder: 2 hidden layers, NO LayerNorm on final output
-        # This allows the decoder to output values with full range
-        module = nn.Sequential(
-            nn.Linear(in_size, hidden_size),
-            activation_fn(),
-            nn.Linear(hidden_size, hidden_size),
-            activation_fn(),
-            nn.Linear(hidden_size, out_size)
-        )
-
-    return module
-
-class GNNVariationalEncoder(nn.Module):
-    """GNN-based cVAE encoder: encodes target delta into a global stochastic latent z.
-
-    Runs message passing on the mesh graph before pooling, so z captures spatially
-    correlated patterns in the deformation field (e.g. manufacturing variation that
-    affects a whole region) rather than just per-node averages.
-
-    Architecture:
-        y [N, output_var]  → node_encoder MLP  → [N, latent_dim]
-        edge_attr [E, 8]   → edge_encoder MLP  → [E, latent_dim]
-        → num_mp_layers GnBlocks (message passing on mesh topology)
-        → GlobalAttention pool → [B, latent_dim]
-        → mu_head, logvar_head → z [B, vae_latent_dim]
-    """
-
-    def __init__(self, node_output_size, edge_input_size, latent_dim, vae_latent_dim, num_mp_layers=2):
-        super().__init__()
-        self.node_encoder = build_mlp(node_output_size, latent_dim, latent_dim)
-        self.edge_encoder = build_mlp(edge_input_size, latent_dim, latent_dim)
-        minimal_config = {'residual_scale': 1.0, 'use_pairnorm': False}
-        self.mp_layers = nn.ModuleList([
-            GnBlock(minimal_config, latent_dim, use_world_edges=False)
-            for _ in range(num_mp_layers)
-        ])
-        # Attention pooling: focus on high-variation nodes (e.g. stress concentrations)
-        self.attention_pool = GlobalAttention(nn.Linear(latent_dim, 1))
-        self.mu_head = nn.Linear(latent_dim, vae_latent_dim)
-        self.logvar_head = nn.Linear(latent_dim, vae_latent_dim)
-
-    def forward(self, y, edge_index, edge_attr, batch):
-        """
-        Args:
-            y:          [N, node_output_size] per-node target delta
-            edge_index: [2, E] mesh edge connectivity
-            edge_attr:  [E, 8] raw edge features
-            batch:      [N] PyG batch assignment index
-        Returns:
-            z:      [B, vae_latent_dim] reparameterized latent
-            mu:     [B, vae_latent_dim]
-            logvar: [B, vae_latent_dim]
-        """
-        h = self.node_encoder(y)              # [N, latent_dim]
-        e = self.edge_encoder(edge_attr)      # [E, latent_dim]
-        g = Data(x=h, edge_attr=e, edge_index=edge_index)
-        for mp in self.mp_layers:
-            g = mp(g)                         # message passing on target delta field
-        h_graph = self.attention_pool(g.x, batch)  # [B, latent_dim]
-        mu = self.mu_head(h_graph)
-        logvar = self.logvar_head(h_graph)
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        z = mu + std * eps
-        return z, mu, logvar
-
-    @staticmethod
-    def kl_loss(mu, logvar):
-        """KL(q||p) = -1/2 * mean(1 + logvar - mu^2 - exp(logvar))"""
-        return -0.5 * torch.mean(1.0 + logvar - mu.pow(2) - logvar.exp())
-
-
-class Encoder(nn.Module):
-
-    def __init__(self,
-                edge_input_size,
-                node_input_size,
-                latent_dim,
-                use_world_edges=False):
-        super(Encoder, self).__init__()
-
-        self.use_world_edges = use_world_edges
-        self.eb_encoder = build_mlp(edge_input_size, latent_dim, latent_dim)
-        self.nb_encoder = build_mlp(node_input_size, latent_dim, latent_dim)
-        if use_world_edges:
-            self.world_eb_encoder = build_mlp(edge_input_size, latent_dim, latent_dim)
-
-    def forward(self, graph):
-        node_attr, edge_attr = graph.x, graph.edge_attr
-        node_ = self.nb_encoder(node_attr)
-        edge_ = self.eb_encoder(edge_attr)
-
-        out = Data(x=node_, edge_attr=edge_, edge_index=graph.edge_index)
-
-        if self.use_world_edges and hasattr(graph, 'world_edge_attr') and graph.world_edge_index.shape[1] > 0:
-            world_edge_ = self.world_eb_encoder(graph.world_edge_attr)
-            out.world_edge_attr = world_edge_
-            out.world_edge_index = graph.world_edge_index
-        elif self.use_world_edges:
-            out.world_edge_attr = torch.zeros(0, edge_.shape[1], device=edge_.device)
-            out.world_edge_index = torch.zeros(2, 0, dtype=torch.long, device=edge_.device)
-
-        return out
-
-class GnBlock(nn.Module):
-
-    def __init__(self, config, latent_dim, use_world_edges=False):
-        super(GnBlock, self).__init__()
-
-        self.use_world_edges = use_world_edges
-        self.residual_scale = config.get('residual_scale', 1.0)
-        self.use_pairnorm = config.get('use_pairnorm', False)
-        # Residual connections applied to both nodes and edges (matches DeepMind original)
-
-        eb_input_dim = 3 * latent_dim  # Sender, Receiver, edge latent dim
-        eb_custom_func = build_mlp(eb_input_dim, latent_dim, latent_dim)
-        self.eb_module = EdgeBlock(custom_func=eb_custom_func)
-
-        if use_world_edges:
-            # World edge block (separate from mesh edge block)
-            world_eb_custom_func = build_mlp(eb_input_dim, latent_dim, latent_dim)
-            self.world_eb_module = EdgeBlock(custom_func=world_eb_custom_func)
-            # Hybrid node block aggregates from both edge types
-            nb_input_dim = 3 * latent_dim  # Node + mesh_agg + world_agg
-            nb_custom_func = build_mlp(nb_input_dim, latent_dim, latent_dim)
-            self.nb_module = HybridNodeBlock(custom_func=nb_custom_func)
-        else:
-            nb_input_dim = 2 * latent_dim  # Node + aggregated edges
-            nb_custom_func = build_mlp(nb_input_dim, latent_dim, latent_dim)
-            self.nb_module = NodeBlock(custom_func=nb_custom_func)
-
-    def forward(self, graph):
-        x_input = graph.x  # Save input for residual
-
-        # Save world edge info before mesh edge block (which creates new Data)
-        world_edge_index = graph.world_edge_index if self.use_world_edges and hasattr(graph, 'world_edge_index') else None
-        world_edge_attr = graph.world_edge_attr if self.use_world_edges and hasattr(graph, 'world_edge_attr') and graph.world_edge_attr is not None and graph.world_edge_attr.shape[0] > 0 else None
-
-        # Update mesh edge features (raw MLP output, residual applied after node update)
-        mesh_graph = self.eb_module(graph)
-        edge_mlp_out = mesh_graph.edge_attr  # Raw MLP output (no residual yet)
-
-        # Update world edge features if present (raw MLP output)
-        world_edge_mlp_out = None
-        if self.use_world_edges and world_edge_attr is not None and world_edge_attr.shape[0] > 0:
-            world_graph = Data(
-                x=x_input,
-                edge_attr=world_edge_attr,
-                edge_index=world_edge_index
-            )
-            world_graph = self.world_eb_module(world_graph)
-            world_edge_mlp_out = world_graph.edge_attr  # Raw MLP output (no residual yet)
-
-        # Node update uses RAW edge MLP output (matches DeepMind: residuals applied after)
-        node_graph = Data(
-            x=x_input,
-            edge_attr=edge_mlp_out,
-            edge_index=mesh_graph.edge_index
-        )
-        if self.use_world_edges:
-            node_graph.world_edge_attr = world_edge_mlp_out if world_edge_mlp_out is not None else torch.zeros(0, edge_mlp_out.shape[1], device=x_input.device)
-            node_graph.world_edge_index = world_edge_index if world_edge_index is not None else torch.zeros(2, 0, dtype=torch.long, device=x_input.device)
-
-        node_graph = self.nb_module(node_graph)
-
-        # Apply all residuals AFTER node update (matches DeepMind original)
-        x = x_input + self.residual_scale * node_graph.x
-
-        # PairNorm: center and rescale node features AFTER residual to prevent over-smoothing
-        # Applied between layers (not on aggregation) to avoid scale mismatch at depth
-        if self.use_pairnorm:
-            x_centered = x - x.mean(dim=0, keepdim=True)
-            rms = (x_centered.norm(p=2) / (x.shape[0] ** 0.5)) + 1e-8
-            x = x_centered / rms
-
-        edge_attr = graph.edge_attr + self.residual_scale * edge_mlp_out  # Edge residual
-        updated_world_edge_attr = (world_edge_attr + self.residual_scale * world_edge_mlp_out) if world_edge_mlp_out is not None else world_edge_attr
-
-        out = Data(x=x, edge_attr=edge_attr, edge_index=node_graph.edge_index)
-        if self.use_world_edges:
-            out.world_edge_attr = updated_world_edge_attr if updated_world_edge_attr is not None else torch.zeros(0, edge_attr.shape[1], device=x.device)
-            out.world_edge_index = world_edge_index if world_edge_index is not None else torch.zeros(2, 0, dtype=torch.long, device=x.device)
-
-        return out
-
-class Decoder(nn.Module):
-
-    def __init__(self, latent_dim, node_output_size):
-        super(Decoder, self).__init__()
-        self.decode_module = build_mlp(latent_dim, latent_dim, node_output_size, layer_norm=False, decoder=True)
-
-    def forward(self, graph):
-        return self.decode_module(graph.x)

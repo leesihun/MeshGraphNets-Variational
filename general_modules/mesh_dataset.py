@@ -2,26 +2,23 @@ import h5py
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from typing import Dict, Optional, Set, Tuple, List
+from typing import Dict, Tuple, List
 from torch_geometric.data import Data
-from scipy.spatial import KDTree
 import multiprocessing as mp
 
 from general_modules.edge_features import EDGE_FEATURE_DIM, compute_edge_attr
+from general_modules.world_edges import HAS_TORCH_CLUSTER, compute_world_edges
 
 # Multiscale coarsening (optional — only imported when use_multiscale=True)
 try:
-    from model.coarsening import bfs_bistride_coarsen, coarsen_graph, compute_coarse_edge_attr, compute_coarse_centroids, MultiscaleData
+    from model.coarsening import MultiscaleData, compute_coarse_centroids
+    from general_modules.multiscale_helpers import (
+        attach_coarse_levels_to_graph,
+        build_multiscale_hierarchy,
+    )
     HAS_COARSENING = True
 except ImportError:
     HAS_COARSENING = False
-
-# Try to import torch_cluster for GPU acceleration; fall back to scipy.KDTree if unavailable
-try:
-    from torch_cluster import radius_graph
-    HAS_TORCH_CLUSTER = True
-except ImportError:
-    HAS_TORCH_CLUSTER = False
 
 def _compute_rwpe(edge_index, N, num_rwpe):
     """RWPE: random walk return probabilities (purely topological).
@@ -355,7 +352,7 @@ class MeshGraphDataset(Dataset):
         self.coarse_edge_means: List = []   # per-level: [mean_level_0, mean_level_1, ...]
         self.coarse_edge_stds: List = []    # per-level: [std_level_0, std_level_1, ...]
         self._coarse_cache_max = int(config.get('coarse_cache_per_worker', 500))
-        self._coarse_cache: Dict = {}  # {sample_id: {'levels': L, 'fine_to_coarse_0':..., 'coarse_edge_index_0':..., 'num_coarse_0':..., ...}}
+        self._coarse_cache: Dict = {}  # {sample_id: list[dict]} — list from build_multiscale_hierarchy
 
         # Per-level coarsening method ('bfs' or 'voronoi')
         raw_ct = config.get('coarsening_type', 'bfs')
@@ -865,29 +862,12 @@ class MeshGraphDataset(Dataset):
                 first_pos_data = data_h5[:3, 0, :]  # [3, nodes] — ref xyz
                 level_ref_pos = first_pos_data.T     # [N, 3]
 
-                local_entry = {}
-                current_ei, current_n = edge_idx, num_nodes
-                actual_levels = 0
-                for level in range(L):
-                    method = self.coarsening_types[level] if level < len(self.coarsening_types) else 'bfs'
-                    n_clusters = self.voronoi_clusters[level] if level < len(self.voronoi_clusters) else 0
-                    ftc, c_ei, n_c = coarsen_graph(
-                        current_ei, current_n, method=method,
-                        num_clusters=n_clusters, ref_pos=level_ref_pos,
-                    )
-                    local_entry[f'fine_to_coarse_{level}'] = ftc
-                    local_entry[f'coarse_edge_index_{level}'] = c_ei
-                    local_entry[f'num_coarse_{level}'] = n_c
-                    if self.bipartite_unpool:
-                        from model.coarsening import build_unpool_edges
-                        local_entry[f'unpool_edge_index_{level}'] = build_unpool_edges(ftc, c_ei, n_c)
-                    actual_levels += 1
-                    if n_c <= 1 or c_ei.shape[1] == 0:
-                        break
-                    # Chain centroids for next level
-                    level_ref_pos = compute_coarse_centroids(level_ref_pos, ftc, n_c).astype(np.float32)
-                    current_ei, current_n = c_ei, n_c
-                local_entry['levels'] = actual_levels
+                hierarchy = build_multiscale_hierarchy(
+                    edge_idx, num_nodes, level_ref_pos,
+                    L, self.coarsening_types, self.voronoi_clusters,
+                    bipartite_unpool=self.bipartite_unpool,
+                )
+                actual_levels = len(hierarchy)
 
                 # Collect coarse edge stats per level — 10 timesteps is sufficient
                 max_t = min(10, self.num_timesteps)
@@ -901,14 +881,12 @@ class MeshGraphDataset(Dataset):
                     ref_pos = pos_data[:3, :].T         # [N, 3]
                     deformed_pos = (pos_data[:3, :] + pos_data[3:6, :]).T  # [N, 3]
 
-                    # Chain centroid computation through levels
                     cur_ref, cur_def = ref_pos, deformed_pos
-                    for level in range(actual_levels):
-                        ftc_l = local_entry[f'fine_to_coarse_{level}']
-                        c_ei_l = local_entry[f'coarse_edge_index_{level}']
-                        n_c_l = local_entry[f'num_coarse_{level}']
+                    for level, entry in enumerate(hierarchy):
+                        ftc_l = entry['ftc']
+                        c_ei_l = entry['c_ei']
+                        n_c_l = entry['n_c']
 
-                        # Compute centroids at this level
                         coarse_ref = compute_coarse_centroids(cur_ref, ftc_l, n_c_l)
                         coarse_def = compute_coarse_centroids(cur_def, ftc_l, n_c_l)
 
@@ -972,95 +950,6 @@ class MeshGraphDataset(Dataset):
         self.world_edge_radius = self.world_radius_multiplier * self.min_edge_length
         print(f'  min_edge_length: {self.min_edge_length:.6f}')
         print(f'  world_edge_radius: {self.world_edge_radius:.6f}')
-
-    def _compute_world_edges(self, reference_pos, deformed_pos, mesh_edges):
-        """
-        Compute world edges using either torch_cluster (GPU) or scipy.KDTree (CPU).
-
-        Supports two backends:
-        - 'torch_cluster': GPU-accelerated (5-10x faster for 68k nodes)
-        - 'scipy_kdtree': CPU-based fallback (original implementation)
-
-        Args:
-            reference_pos: (N, 3) array of reference node positions
-            deformed_pos: (N, 3) array of current node positions
-            mesh_edges: (2, E_mesh) array of existing mesh edge indices
-
-        Returns:
-            world_edge_index: (2, E_world) array of world edge indices
-            world_edge_attr: (E_world, 8) array with deformed + reference edge features
-        """
-        if not self.world_edge_radius:
-            return np.zeros((2, 0), dtype=np.int64), np.zeros((0, self.edge_dim), dtype=np.float32)
-
-        if self.world_edge_backend == 'torch_cluster':
-            return self._compute_world_edges_torch_cluster(reference_pos, deformed_pos, mesh_edges)
-        else:
-            return self._compute_world_edges_scipy_kdtree(reference_pos, deformed_pos, mesh_edges)
-
-    def _compute_world_edges_torch_cluster(self, reference_pos, deformed_pos, mesh_edges):
-        """
-        Compute world edges using GPU-accelerated torch_cluster.radius_graph().
-        Expected 5-10x speedup for 68k-node meshes compared to scipy.KDTree.
-        """
-        # Convert positions to GPU tensor
-        pos_tensor = torch.from_numpy(deformed_pos).float().cuda()
-
-        # GPU-accelerated radius query (torch_cluster)
-        world_edges = radius_graph(
-            x=pos_tensor,
-            r=self.world_edge_radius,
-            batch=None,                           # Single sample (no batch tensor)
-            loop=False,                           # No self-loops
-            max_num_neighbors=self.world_max_num_neighbors
-        )
-
-        # Convert back to numpy for edge filtering
-        world_edges_np = world_edges.cpu().numpy()
-
-        if world_edges_np.shape[1] == 0:
-            return np.zeros((2, 0), dtype=np.int64), np.zeros((0, self.edge_dim), dtype=np.float32)
-
-        # Efficient filtering: remove edges that already exist in mesh topology
-        mesh_set = {(int(mesh_edges[0, i]), int(mesh_edges[1, i])) for i in range(mesh_edges.shape[1])}
-
-        valid_mask = np.array([
-            (world_edges_np[0, i], world_edges_np[1, i]) not in mesh_set
-            for i in range(world_edges_np.shape[1])
-        ])
-
-        we = world_edges_np[:, valid_mask]
-
-        if we.shape[1] == 0:
-            return np.zeros((2, 0), dtype=np.int64), np.zeros((0, self.edge_dim), dtype=np.float32)
-
-        return we, compute_edge_attr(reference_pos, deformed_pos, we)
-
-    def _compute_world_edges_scipy_kdtree(self, reference_pos, deformed_pos, mesh_edges):
-        """
-        Compute world edges using scipy.spatial.KDTree (CPU fallback).
-        Original implementation, slower but always available.
-        """
-        tree = KDTree(deformed_pos)
-        pairs = tree.query_pairs(r=self.world_edge_radius, output_type='ndarray')
-
-        if len(pairs) == 0:
-            return np.zeros((2, 0), dtype=np.int64), np.zeros((0, self.edge_dim), dtype=np.float32)
-
-        # Filter out existing mesh edges
-        mesh_set = {(int(mesh_edges[0, i]), int(mesh_edges[1, i])) for i in range(mesh_edges.shape[1])}
-        we = []
-        for s, r in pairs:
-            if (s, r) not in mesh_set:
-                we.append([s, r])
-            if (r, s) not in mesh_set:
-                we.append([r, s])
-
-        if not we:
-            return np.zeros((2, 0), dtype=np.int64), np.zeros((0, self.edge_dim), dtype=np.float32)
-
-        wei = np.array(we, dtype=np.int64).T
-        return wei, compute_edge_attr(reference_pos, deformed_pos, wei)
 
     def __len__(self) -> int:
         """
@@ -1276,17 +1165,14 @@ class MeshGraphDataset(Dataset):
         # Compute world edges if enabled
         # IMPORTANT: Use deformed_pos (reference + displacement) for collision detection
         if self.use_world_edges:
-            world_edge_index, world_edge_attr_raw = self._compute_world_edges(
-                pos,
-                deformed_pos,
-                edge_index.numpy() if isinstance(edge_index, torch.Tensor) else edge_index
+            mesh_ei_np = edge_index.numpy() if isinstance(edge_index, torch.Tensor) else edge_index
+            world_edge_index, world_edge_attr_norm = compute_world_edges(
+                pos, deformed_pos, mesh_ei_np,
+                radius=self.world_edge_radius,
+                max_num_neighbors=self.world_max_num_neighbors,
+                backend=self.world_edge_backend,
+                edge_mean=self.edge_mean, edge_std=self.edge_std,
             )
-            # Normalize world edge features using the same statistics as mesh edges
-            # This fixes the scale mismatch between normalized mesh edges and raw world edges
-            if world_edge_attr_raw.shape[0] > 0:
-                world_edge_attr_norm = (world_edge_attr_raw - self.edge_mean) / self.edge_std
-            else:
-                world_edge_attr_norm = world_edge_attr_raw
             graph_data.world_edge_index = torch.from_numpy(world_edge_index).long()
             graph_data.world_edge_attr = torch.from_numpy(world_edge_attr_norm.astype(np.float32))
         else:
@@ -1298,81 +1184,23 @@ class MeshGraphDataset(Dataset):
             # Retrieve from cache (or compute on-demand for split subsets)
             if sample_id not in self._coarse_cache:
                 raw_edge_idx = edge_index.numpy()  # already bidirectional [2, 2M]
-                num_nodes_n = pos.shape[0]
-                level_ref_pos = pos.numpy()  # [N, 3] for Euclidean FPS
-                cache_entry = {}
-                current_ei, current_n = raw_edge_idx, num_nodes_n
-                actual_levels = 0
-                for level in range(self.multiscale_levels):
-                    method = self.coarsening_types[level] if level < len(self.coarsening_types) else 'bfs'
-                    n_clusters = self.voronoi_clusters[level] if level < len(self.voronoi_clusters) else 0
-                    ftc, c_ei, n_c = coarsen_graph(
-                        current_ei, current_n, method=method,
-                        num_clusters=n_clusters, ref_pos=level_ref_pos,
-                    )
-                    cache_entry[f'fine_to_coarse_{level}'] = ftc
-                    cache_entry[f'coarse_edge_index_{level}'] = c_ei
-                    cache_entry[f'num_coarse_{level}'] = n_c
-                    if self.bipartite_unpool:
-                        from model.coarsening import build_unpool_edges
-                        cache_entry[f'unpool_edge_index_{level}'] = build_unpool_edges(ftc, c_ei, n_c)
-                    actual_levels += 1
-                    if n_c <= 1 or c_ei.shape[1] == 0:
-                        break
-                    level_ref_pos = compute_coarse_centroids(level_ref_pos, ftc, n_c).astype(np.float32)
-                    current_ei, current_n = c_ei, n_c
-                cache_entry['levels'] = actual_levels
+                level_ref_pos = pos.numpy()         # [N, 3] for Euclidean FPS
+                hierarchy = build_multiscale_hierarchy(
+                    raw_edge_idx, pos.shape[0], level_ref_pos,
+                    self.multiscale_levels, self.coarsening_types, self.voronoi_clusters,
+                    bipartite_unpool=self.bipartite_unpool,
+                )
                 # LRU-style eviction: evict oldest entry if over capacity
                 if len(self._coarse_cache) >= self._coarse_cache_max:
                     self._coarse_cache.pop(next(iter(self._coarse_cache)))
-                self._coarse_cache[sample_id] = cache_entry
+                self._coarse_cache[sample_id] = hierarchy
 
-            cache = self._coarse_cache[sample_id]
-            actual_levels = cache['levels']
-
-            # Chain centroid computation through levels for edge attr
-            ref_np = pos.numpy()
-            deformed_np = deformed_pos.astype(np.float32)
-            cur_ref, cur_def = ref_np, deformed_np
-
-            for level in range(actual_levels):
-                ftc_np = cache[f'fine_to_coarse_{level}']
-                c_ei_np = cache[f'coarse_edge_index_{level}']
-                n_coarse = cache[f'num_coarse_{level}']
-
-                # Compute centroids at this level
-                coarse_ref = compute_coarse_centroids(cur_ref, ftc_np, n_coarse)
-                coarse_def = compute_coarse_centroids(cur_def, ftc_np, n_coarse)
-
-                # Compute and normalize edge features
-                if c_ei_np.shape[1] > 0:
-                    c_edge_attr_raw = compute_edge_attr(
-                        coarse_ref.astype(np.float32),
-                        coarse_def.astype(np.float32),
-                        c_ei_np
-                    )
-                else:
-                    c_edge_attr_raw = np.zeros((0, self.edge_dim), dtype=np.float32)
-
-                if c_edge_attr_raw.shape[0] > 0 and level < len(self.coarse_edge_means):
-                    c_edge_attr_norm = (c_edge_attr_raw - self.coarse_edge_means[level]) / self.coarse_edge_stds[level]
-                else:
-                    c_edge_attr_norm = c_edge_attr_raw
-
-                graph_data[f'fine_to_coarse_{level}'] = torch.from_numpy(ftc_np.astype(np.int64))
-                graph_data[f'coarse_edge_index_{level}'] = torch.from_numpy(c_ei_np)
-                graph_data[f'coarse_edge_attr_{level}'] = torch.from_numpy(c_edge_attr_norm.astype(np.float32))
-                graph_data[f'num_coarse_{level}'] = torch.tensor([n_coarse], dtype=torch.long)
-
-                # Store coarse centroids for rel_pos computation at runtime
-                graph_data[f'coarse_centroid_{level}'] = torch.from_numpy(coarse_ref.astype(np.float32))
-
-                # Store bipartite unpool edges (topology from cache — augmentation-invariant)
-                if self.bipartite_unpool:
-                    up_ei = cache[f'unpool_edge_index_{level}']
-                    graph_data[f'unpool_edge_index_{level}'] = torch.from_numpy(up_ei)
-
-                cur_ref, cur_def = coarse_ref, coarse_def
+            hierarchy = self._coarse_cache[sample_id]
+            attach_coarse_levels_to_graph(
+                graph_data, hierarchy,
+                pos.numpy(), deformed_pos.astype(np.float32),
+                self.coarse_edge_means, self.coarse_edge_stds,
+            )
 
         return graph_data
 

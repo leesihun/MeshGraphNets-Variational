@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code when working with code in this repository.
 
 ## Running the Code
 
@@ -15,77 +15,144 @@ python MeshGraphNets_main.py --config _warpage_input/config_train5.txt
 python MeshGraphNets_main.py --config _warpage_input/config_infer1.txt
 ```
 
-The `--config` flag is optional; it defaults to `config.txt` in the working directory. Mode is controlled by the `mode` key in the config file (`train` or `inference`). Single vs. multi-GPU is auto-detected based on how many IDs are listed in `gpu_ids`. `gpu_ids -1` forces CPU.
+The `--config` flag is optional; defaults to `config.txt` in the working directory. Mode is controlled by the `mode` key (`train` or `inference`). Single vs. multi-GPU is auto-detected from `gpu_ids`. `gpu_ids -1` forces CPU.
 
 There are no tests or linters configured in this project.
 
 ## Config File Format
 
-Key-value pairs, one per line. `%` for full-line comments, `#` for inline comments. Keys are lowercased. CSV values become lists, space-separated become arrays, booleans are `true`/`false`. Example configs live in `_warpage_input/`.
+Key-value pairs, one per line. `%` for full-line comments, `#` for inline comments. Keys are lowercased. CSV values become lists, space-separated become arrays, booleans are `true`/`false`. Config files live in `_warpage_input/`.
 
-**Key config parameters:**
-- `mode` — `train` or `inference`
-- `gpu_ids` — GPU IDs (comma-separated for DDP, `-1` for CPU)
-- `input_var`, `output_var` — number of physical node/output features
-- `edge_var` — must be `8` for the full deformed+reference edge feature set
-- `message_passing_num` — total GNN layers (or sum of `mp_per_level` for multiscale)
-- `Latent_dim` — hidden dimension throughout
-- `feature_loss_weights` — per-output-feature loss weighting (auto-normalized)
-- `use_amp True` — enable bfloat16 AMP (use bfloat16, not float16; scatter_add overflows with float16)
-- `use_multiscale True`, `multiscale_levels L`, `mp_per_level` — BFS V-cycle (requires 2L+1 entries in `mp_per_level`)
-- `positional_features N` — appends N rotation-invariant features; `positional_encoding rwpe|lpe|rwpe+lpe`
+### Complete Config Key Reference
 
-**Inference-specific keys:** `modelpath`, `infer_dataset`, `infer_timesteps`
+| Key | Type | Description |
+|-----|------|-------------|
+| `model` | str | Model name identifier (e.g. `MeshGraphNets-V`) |
+| `mode` | str | `train` or `inference` |
+| `gpu_ids` | int/list | GPU device IDs; comma-separated for DDP; `-1` for CPU |
+| `log_file_dir` | str | Log output path |
+| `modelpath` | str | Checkpoint save/load path |
+| `dataset_dir` | str | Training HDF5 dataset path |
+| `infer_dataset` | str | Inference HDF5 dataset path |
+| `infer_timesteps` | int | Number of autoregressive rollout steps |
+| `input_var` | int | Input node feature dimension (physical vars) |
+| `output_var` | int | Output feature dimension (predicted delta vars) |
+| `edge_var` | int | Edge feature dim — must be `8` for full deformed+reference set |
+| `feature_loss_weights` | list | Per-output-feature Huber loss weights (auto-normalized) |
+| `positional_features` | int | Rotation-invariant positional features appended to nodes |
+| `positional_encoding` | str | `rwpe`, `lpe`, or `rwpe+lpe` |
+| `message_passing_num` | int | Total GnBlocks (flat) or ignored when using `mp_per_level` (multiscale) |
+| `latent_dim` | int | Hidden dimension throughout model |
+| `training_epochs` | int | Total training epochs |
+| `batch_size` | int | Batch size per GPU |
+| `learningr` | float | Peak learning rate |
+| `warmup_epochs` | int | Linear LR warmup epochs (default 3) |
+| `num_workers` | int | DataLoader workers |
+| `split_seed` | int | Deterministic train/val/test split seed (default 42) |
+| `std_noise` | float | Gaussian noise std on nodes+edges during training |
+| `residual_scale` | float | Residual connection scale factor |
+| `augment_geometry` | bool | Z-rotation + X/Y reflection augmentation (train only) |
+| `grad_accum_steps` | int | Gradient accumulation steps |
+| `use_checkpointing` | bool | Activation checkpointing to save GPU memory |
+| `use_amp` | bool | bfloat16 AMP — use bfloat16, **not** float16; float16 overflows scatter_add |
+| `use_ema` | bool | Exponential moving average shadow model |
+| `ema_decay` | float | EMA decay factor (default 0.99) |
+| `use_compile` | bool | `torch.compile` optimization |
+| `test_interval` | int | Epoch interval for validation evaluation |
+| `use_node_types` | bool | Concatenate one-hot node type features after normalization |
+| `use_world_edges` | bool | Radius-based non-mesh collision/contact edges |
+| `world_radius_multiplier` | float | World edge radius = mean_edge_len × this |
+| `world_max_num_neighbors` | int | Max world edge degree per node |
+| `world_edge_backend` | str | `torch_cluster` or `scipy_kdtree` |
+| `use_multiscale` | bool | BFS Bi-Stride V-cycle multiscale architecture |
+| `multiscale_levels` | int | Number of coarsening levels L; `mp_per_level` needs 2L+1 entries |
+| `coarsening_type` | str | `bfs` or `voronoi` |
+| `voronoi_clusters` | int/list | Target cluster counts per Voronoi level |
+| `mp_per_level` | list | MP blocks per level: `[pre, coarse_1, ..., coarse_L, post]` |
+| `bipartite_unpool` | bool | Learned bipartite message-passing unpool (vs. broadcast) |
+| `use_vae` | bool | Conditional VAE latent conditioning |
+| `vae_latent_dim` | int | VAE latent code dimension |
+| `vae_mp_layers` | int | GnBlocks in VAE encoder |
+| `beta_kl` | float | KL divergence loss weight |
+| `alpha_recon` | float | Reconstruction loss weight |
+| `beta_aux` | float | Auxiliary prediction loss weight |
+| `kl_anneal_schedule` | str | `linear` or `three_phase` |
+| `kl_phase1_ratio` | float | Fraction of training in constant-low-β phase |
+| `kl_phase2_ratio` | float | Fraction of training in β ramp phase |
+| `kl_min_beta_ratio` | float | Phase 1 β = `beta_kl × kl_min_beta_ratio` |
+| `train_latent_flow` | bool | Train RealNVP normalizing flow on VAE latents post-training |
+| `flow_hidden_dim` | int | RealNVP MLP hidden dimension |
+| `flow_num_layers` | int | RealNVP coupling layers |
+| `flow_lr` | float | Flow training learning rate |
+| `flow_weight_decay` | float | Flow L2 regularization weight |
+| `use_parallel_stats` | bool | Parallel preprocessing stats computation |
 
 ## Architecture Overview
 
-**Encode–Process–Decode GNN** operating on FEA mesh graphs.
+**Encode–Process–Decode GNN** on FEA mesh graphs, with optional VAE conditioning, multiscale V-cycle, and normalizing flow.
 
-- **Input representation:** Nodes carry physical state (displacements, stress) + optional positional features + optional one-hot node types. Edges carry 8D features: `[deformed_dx/dy/dz/dist, ref_dx/dy/dz/dist]`. Edges are always bidirectional.
-- **Prediction target:** Normalized state *deltas* (`Δstate = state_{t+1} − state_t`). The model never predicts absolute values. During rollout, `state_{t+1} = state_t + denormalize(delta_pred)`.
+- **Input:** Nodes carry physical state (displacements, stress) + optional positional features + optional one-hot node types. Edges are 8D: `[deformed_dx/dy/dz/dist, ref_dx/dy/dz/dist]`. Always bidirectional.
+- **Prediction target:** Normalized state deltas (`Δstate = state_{t+1} − state_t`). Rollout: `state_{t+1} = state_t + denormalize(delta_pred)`.
 - **Encoder:** MLP per node, MLP per edge → latent embeddings.
-- **Processor:** Stack of `message_passing_num` GnBlocks. Each block: EdgeBlock (MLP on concatenated sender/receiver/edge) then NodeBlock (sum-aggregate edge msgs, MLP update). Residual connections on both nodes and edges. Gated skip from encoder output to post-processor (learnable sigmoid gate).
-- **Decoder:** Single MLP, **no LayerNorm on output layer**. Last-layer weights scaled ×0.01 for T>1 (predict-no-change prior).
-- **Activation:** SiLU (Swish) hardcoded everywhere — not configurable.
+- **Processor (flat):** Stack of `message_passing_num` GnBlocks. Each block: EdgeBlock (MLP on `[sender‖receiver‖edge]`) then NodeBlock (sum-aggregate msgs, MLP update). Residual on both nodes and edges.
+- **Processor (multiscale):** BFS Bi-Stride V-cycle. Pool = mean, Unpool = broadcast or learned bipartite. Skip connections via `Linear(2·D, D)`. World edges only at finest level.
+- **VAE conditioning (`use_vae True`):** `GNNVariationalEncoder` encodes target `y` → `(μ, log σ²)` → `z` via reparameterization. `z` fused into each GnBlock. At inference, `z` sampled from trained RealNVP flow prior.
+- **Decoder:** Single MLP, **no LayerNorm on output**. Last-layer weights ×0.01 when T>1.
+- **Activation:** SiLU (Swish) hardcoded — not configurable.
 - **Aggregation:** Sum (not mean) in NodeBlock.
-
-**Optional multiscale (BFS Bi-Stride V-cycle, `use_multiscale True`):** Coarsens graph topology using BFS; even-depth nodes form coarse graph. Pool = mean, Unpool = broadcast. Skip connections via `Linear(2·D, D)`. World edges only at finest level.
-
-**Normalization:** Z-score, computed from training split only, saved in checkpoint under `checkpoint['normalization']`. Node types one-hot encoded and concatenated *after* normalization.
+- **Normalization:** Z-score from training split only, stored in checkpoint under `checkpoint['normalization']`. Node types concatenated *after* normalization.
 
 ## Training Details
 
 | Aspect | Value |
-|---|---|
-| Loss | Huber (delta=0.1) with optional per-feature weights |
+|--------|-------|
+| Loss | Huber (δ=0.1) with optional per-feature weights |
 | Optimizer | Fused Adam, no weight decay |
-| LR schedule | LinearLR warmup (3 epochs) → CosineAnnealingWarmRestarts; steps per optimizer step |
+| LR schedule | LinearLR warmup → CosineAnnealingWarmRestarts |
 | Grad clip | max_norm=3.0 |
 | AMP | bfloat16 via `torch.amp.autocast` |
-| EMA | Optional (`use_ema True`), inference prefers EMA weights if present |
+| EMA | Optional (`use_ema True`), inference prefers EMA weights |
 | Dataset split | 80/10/10 train/val/test, deterministic via `split_seed` (default 42) |
-| Augmentation | Geometry (Z-rotation + X/Y reflection, train only); noise on nodes+edges with target correction |
+| Augmentation | Z-rotation + X/Y reflection (train only); Gaussian noise on nodes+edges |
+
+## HDF5 Data Format
+
+**Input dataset** — `nodal_data` shape `[features, time, nodes]`:
+- Features: `[x, y, z, x_disp, y_disp, z_disp, stress, (part_number)]`
+
+**Preprocessing writes to HDF5:** normalization stats, train/val/test splits, and multiscale coarse edge stats.
+
+**Rollout output:** `rollout_sample{id}_steps{N}.h5`, `nodal_data` shape `[8, timesteps, nodes]`.
+
+**Checkpoints:** model weights, optimizer state, `checkpoint['normalization']`, optionally `ema_state_dict`, `coarse_edge_means`/`coarse_edge_stds`, `flow_state_dict`.
 
 ## Key Files
 
 | File | Role |
-|---|---|
+|------|------|
 | `MeshGraphNets_main.py` | Entry point; routes to training or inference |
 | `model/MeshGraphNets.py` | Full Encode-Process-Decode model class |
-| `model/blocks.py` | EdgeBlock, NodeBlock, HybridNodeBlock (world edges) |
-| `model/coarsening.py` | BFS Bi-Stride coarsening, pool/unpool |
-| `training_profiles/training_loop.py` | Loss, optimizer, epoch loop |
+| `model/encoder_decoder.py` | Encoder, GnBlock, Decoder |
+| `model/blocks.py` | EdgeBlock, NodeBlock, HybridNodeBlock, UnpoolBlock |
+| `model/mlp.py` | `build_mlp` utility and weight initialization |
+| `model/vae.py` | GNNVariationalEncoder (conditional VAE) |
+| `model/coarsening.py` | BFS Bi-Stride and Voronoi FPS coarsening, pool/unpool |
+| `model/latent_flow.py` | RealNVP normalizing flow for VAE latent space |
+| `model/checkpointing.py` | Activation checkpointing wrapper |
+| `training_profiles/setup.py` | Dataset/model/optimizer builders |
+| `training_profiles/training_loop.py` | Loss, optimizer, epoch loop, EMA, VAE losses |
 | `training_profiles/single_training.py` | Single-GPU launcher; saves normalization to checkpoint |
-| `training_profiles/distributed_training.py` | DDP launcher with NCCL, signal handling |
+| `training_profiles/distributed_training.py` | DDP launcher with NCCL and signal handling |
 | `inference_profiles/rollout.py` | Autoregressive rollout; outputs HDF5 |
-| `general_modules/mesh_dataset.py` | Dataset class, normalization, positional encoding, augmentation |
+| `general_modules/mesh_dataset.py` | Dataset class: normalization, positional encoding, augmentation |
 | `general_modules/edge_features.py` | 8D edge feature computation (deformed + reference) |
-| `general_modules/load_config.py` | Config parser |
-
-## HDF5 Data Format
-
-Input datasets: nodal_data shape `[features, time, nodes]` where features = `[x, y, z, x_disp, y_disp, z_disp, stress, (part_number)]`.
-
-Rollout output: `rollout_sample{id}_steps{N}.h5` with nodal_data shape `[8, timesteps, nodes]`.
-
-Checkpoints store model weights, optimizer state, normalization stats (`checkpoint['normalization']`), and optionally `ema_state_dict` and `coarse_edge_means`/`coarse_edge_stds` for multiscale.
+| `general_modules/world_edges.py` | Radius-based collision edges (torch_cluster or scipy KDTree) |
+| `general_modules/multiscale_helpers.py` | Multiscale hierarchy building and attachment |
+| `general_modules/mesh_utils_fast.py` | GPU-accelerated mesh utilities, PyVista rendering |
+| `general_modules/load_config.py` | Config file parser |
+| `build_dataset.py` | HDF5 dataset builder from ANSYS/FEA export data |
+| `dataset/generate_inference_dataset.py` | Extract initial conditions for inference |
+| `dataset/reduce_dataset.py` | Dataset subsampling utility |
+| `animate_h5.py` | Animated GIF generation from HDF5 rollout output |
+| `misc/plot_loss.py` | Loss curve plotting |
+| `misc/plot_loss_realtime.py` | Real-time loss monitoring via FastAPI |

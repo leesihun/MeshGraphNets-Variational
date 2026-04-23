@@ -6,7 +6,6 @@ import pandas as pd
 import h5py
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
-import multiprocessing
 
 # === Configuration ===
 device_code = "sm-f766u_m"

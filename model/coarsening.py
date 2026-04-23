@@ -36,8 +36,6 @@ from scipy.sparse.csgraph import connected_components, breadth_first_order
 from torch_geometric.data import Data
 from torch_geometric.utils import scatter
 
-from general_modules.edge_features import compute_edge_attr
-
 
 # ---------------------------------------------------------------------------
 # Shared Helpers
@@ -348,49 +346,8 @@ def coarsen_graph(
 
 
 # ---------------------------------------------------------------------------
-# Coarse Edge Features
+# Coarse Centroids
 # ---------------------------------------------------------------------------
-
-def compute_coarse_edge_attr(
-    reference_pos: np.ndarray,
-    deformed_pos: np.ndarray,
-    fine_to_coarse: np.ndarray,
-    coarse_edge_index: np.ndarray,
-    num_coarse: int,
-) -> np.ndarray:
-    """
-    Compute 8-D coarse edge features between coarse node centroids.
-
-    Coarse reference position = mean reference position of all fine nodes in the cluster.
-    Coarse deformed position = mean deformed position of all fine nodes in the cluster.
-    Edge features use the same 8-D format as fine mesh edges.
-
-    Args:
-        reference_pos:     [N, 3] float array — reference positions of fine nodes.
-        deformed_pos:      [N, 3] float array — deformed positions of fine nodes
-                           (reference pos + displacement, same as used for fine edges).
-        fine_to_coarse:    [N] int32 array — coarse cluster index for each fine node.
-        coarse_edge_index: [2, E_c] int64 array — coarse edge indices.
-        num_coarse:        int M — number of coarse nodes.
-
-    Returns:
-        coarse_edge_attr: [E_c, 8] float32 array.
-    """
-    if coarse_edge_index.shape[1] == 0:
-        return np.zeros((0, 8), dtype=np.float32)
-
-    # Compute coarse centroid positions (mean of fine nodes per cluster)
-    # Vectorized: use np.add.at for O(N) scatter-add without a Python loop
-    coarse_ref_pos = np.zeros((num_coarse, 3), dtype=np.float64)
-    coarse_def_pos = np.zeros((num_coarse, 3), dtype=np.float64)
-    np.add.at(coarse_ref_pos, fine_to_coarse, reference_pos.astype(np.float64))
-    np.add.at(coarse_def_pos, fine_to_coarse, deformed_pos.astype(np.float64))
-    counts = np.bincount(fine_to_coarse, minlength=num_coarse).reshape(-1, 1)
-    coarse_ref_pos /= np.maximum(counts, 1)
-    coarse_def_pos /= np.maximum(counts, 1)
-
-    return compute_edge_attr(coarse_ref_pos, coarse_def_pos, coarse_edge_index)
-
 
 def compute_coarse_centroids(
     positions: np.ndarray,

@@ -1,0 +1,25 @@
+# Core deep learning
+torch>=2.1.0
+torch-geometric>=2.4.0
+torch-cluster>=1.6.3        # optional: GPU-accelerated radius_graph for world edges
+torch-scatter>=2.1.2        # required by torch-geometric
+
+# Scientific computing
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Data I/O
+h5py>=3.8.0
+pandas>=1.5.0
+
+# Utilities
+tqdm>=4.65.0
+
+# Visualization & animation
+matplotlib>=3.7.0
+Pillow>=9.5.0               # animate_h5.py GIF generation
+pyvista>=0.43.0             # 3D mesh rendering (mesh_utils_fast.py)
+
+# Optional: real-time plotting server (misc/plot_loss_realtime.py)
+# fastapi>=0.109.0
+# uvicorn[standard]>=0.27.0

@@ -17,7 +17,7 @@ positional_features  4   # Rotation-invariant node features: [centroid_dist, mea
 %   Network parameters
 message_passing_num 15
 Training_epochs	5000
-Batch_size	4
+Batch_size	16
 LearningR	0.0001  # Scaled by sqrt(8/1) from 0.0001 for larger batch size
 Latent_dim	128	# MeshGraphNets latent dimension
 num_workers 8
@@ -56,7 +56,7 @@ bipartite_unpool    True    # Learned bipartite MP unpool (False = broadcast)
 '
 % Variational Autoencoder (cVAE) Parameters
 use_vae             True   # Enable conditional VAE (encodes target delta during training)
-vae_latent_dim      32      # Global latent z dimension
+vae_latent_dim      64      # Global latent z dimension
 beta_kl             1   # KL divergence weight (full value after ramp)
 alpha_recon         100     # Reconstruction loss weight
 kl_anneal_schedule  three_phase  # 'linear' or 'three_phase'
