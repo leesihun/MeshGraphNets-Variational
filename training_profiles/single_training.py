@@ -116,10 +116,17 @@ def single_worker(config, config_filename='config.txt'):
     val_interval = int(config.get('val_interval', 1))
 
     try:
+        # Pre-create first iterator so workers begin filling the buffer immediately.
+        train_iter = iter(train_loader)
         for epoch in range(total_epochs):
+            current_iter = train_iter
             train_metrics = train_epoch(
-                model, train_loader, optimizer, device, config, epoch, ema_model=ema_model
+                model, train_loader, optimizer, device, config, epoch, ema_model=ema_model,
+                _iter=current_iter,
             )
+            # Start loading next epoch's data NOW — workers prefetch in the background
+            # while val eval (or just logging) occupies the CPU/GPU.
+            train_iter = iter(train_loader)
 
             train_loss = train_metrics['mean']
             scheduler.step()

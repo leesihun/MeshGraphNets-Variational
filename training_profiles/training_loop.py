@@ -127,7 +127,7 @@ def log_training_config(config):
         print(f"Multi-Scale: disabled (flat GNN, message_passing_num={config.get('message_passing_num')})")
 
 
-def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=None, ema_model=None):
+def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=None, ema_model=None, *, _iter=None):
     model.train()
     total_loss_sum = 0.0
     total_loss_count = 0
@@ -160,7 +160,8 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
     optimizer.zero_grad(set_to_none=True)
     grad_norm = torch.tensor(0.0)
 
-    pbar = tqdm.tqdm(dataloader)
+    iterable = _iter if _iter is not None else dataloader
+    pbar = tqdm.tqdm(iterable, total=total_batches)
     for batch_idx, graph in enumerate(pbar):
         # DEBUG: disabled when use_compile=True (.item() causes graph breaks)
         debug_internal = (not use_compile) and (batch_idx == 0 and (epoch < 5 or epoch % 10 == 0))
