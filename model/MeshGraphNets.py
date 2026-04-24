@@ -193,7 +193,7 @@ class EncoderProcessorDecoder(nn.Module):
 
     def _build_vae_components(self, config):
         self.vae_latent_dim = int(config.get('vae_latent_dim', 32))
-        vae_mp_layers = int(config.get('vae_mp_layers', 2))
+        vae_mp_layers = int(config.get('vae_mp_layers', 5))
         self.vae_encoder = GNNVariationalEncoder(
             self.node_output_size, self.edge_input_size,
             self.latent_dim, self.vae_latent_dim, num_mp_layers=vae_mp_layers

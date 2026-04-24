@@ -122,9 +122,6 @@ def single_worker(config, config_filename='config.txt'):
 
             eval_model = ema_model.module if ema_model is not None else model
             if use_vae:
-                train_eval_metrics = evaluate_vae_posterior_epoch(
-                    eval_model, train_loader, device, config, epoch, progress_name='TrainEvalQ'
-                )
                 valid_metrics = evaluate_vae_posterior_epoch(
                     eval_model, val_loader, device, config, epoch, progress_name='ValidQ'
                 )
@@ -134,13 +131,11 @@ def single_worker(config, config_filename='config.txt'):
                     progress_name=f'ValidPrior@{vae_valid_prior_samples}'
                 )
             else:
-                train_eval_metrics = validate_epoch(model, train_loader, device, config, epoch)
                 valid_metrics      = validate_epoch(eval_model, val_loader, device, config, epoch)
                 valid_prior_metrics = None
 
-            train_loss       = train_metrics['mean']
-            train_eval_loss  = train_eval_metrics['mean']
-            valid_loss       = valid_metrics['mean']
+            train_loss = train_metrics['mean']
+            valid_loss = valid_metrics['mean']
             scheduler.step()
 
             current_lr = optimizer.param_groups[0]['lr']
@@ -148,8 +143,6 @@ def single_worker(config, config_filename='config.txt'):
                 train_mmd   = train_metrics.get('mmd_mean', 0.0)
                 train_aux   = train_metrics.get('aux_mean', 0.0)
                 train_total = train_metrics.get('total_mean', train_loss)
-                train_eval_mmd   = train_eval_metrics.get('mmd_mean', 0.0)
-                train_eval_total = train_eval_metrics.get('total_mean', train_eval_loss)
                 valid_mmd   = valid_metrics.get('mmd_mean', 0.0)
                 valid_total = valid_metrics.get('total_mean', valid_loss)
                 valid_prior_loss = valid_prior_metrics['mean']
@@ -157,7 +150,6 @@ def single_worker(config, config_filename='config.txt'):
                 print(
                     f"Epoch {epoch}/{total_epochs} LR: {current_lr:.2e} | "
                     f"TrainOpt  recon={train_loss:.2e} mmd={train_mmd:.2e} aux={train_aux:.2e} total={train_total:.2e} | "
-                    f"TrainEvalQ recon={train_eval_loss:.2e} mmd={train_eval_mmd:.2e} total={train_eval_total:.2e} | "
                     f"ValidQ    recon={valid_loss:.2e} mmd={valid_mmd:.2e} total={valid_total:.2e} | "
                     f"ValidPrior@{vae_valid_prior_samples} recon={valid_prior_loss:.2e} gap={prior_gap:.2e}"
                 )
@@ -165,7 +157,7 @@ def single_worker(config, config_filename='config.txt'):
                 valid_prior_loss = None
                 print(
                     f"Epoch {epoch}/{total_epochs} "
-                    f"TrainOpt: {train_loss:.2e} TrainEval: {train_eval_loss:.2e} "
+                    f"TrainOpt: {train_loss:.2e} "
                     f"Valid: {valid_loss:.2e} LR: {current_lr:.2e}"
                 )
 
@@ -189,8 +181,6 @@ def single_worker(config, config_filename='config.txt'):
                             f"Elapsed: {elapsed:.2f}s Epoch {epoch} LR: {current_lr:.4e} | "
                             f"TrainOpt recon={train_loss:.4e} mmd={train_metrics.get('mmd_mean',0):.4e} "
                             f"total={train_metrics.get('total_mean',train_loss):.4e} | "
-                            f"TrainEvalQ recon={train_eval_loss:.4e} mmd={train_eval_metrics.get('mmd_mean',0):.4e} "
-                            f"total={train_eval_metrics.get('total_mean',train_eval_loss):.4e} | "
                             f"ValidQ recon={valid_loss:.4e} mmd={valid_metrics.get('mmd_mean',0):.4e} "
                             f"total={valid_metrics.get('total_mean',valid_loss):.4e} | "
                             f"ValidPrior@{vae_valid_prior_samples} recon={valid_prior_loss:.4e} "
@@ -200,7 +190,6 @@ def single_worker(config, config_filename='config.txt'):
                         f.write(
                             f"Elapsed: {elapsed:.2f}s "
                             f"Epoch {epoch} TrainOpt {train_loss:.4e} "
-                            f"TrainEval {train_eval_loss:.4e} "
                             f"Valid {valid_loss:.4e} LR: {current_lr:.4e}\n"
                         )
 
