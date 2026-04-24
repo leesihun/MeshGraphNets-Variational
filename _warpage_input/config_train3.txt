@@ -34,6 +34,7 @@ use_amp             True    # Mixed precision training with bfloat16 (1.5-2x spe
 use_ema             True    # EMA shadow model for validation/inference (smooths SGD noise, ~free precision)
 ema_decay           0.99   # EMA decay factor (0.999 = ~1000-step averaging window)
 test_interval       100      # Run test/visualization every N epochs (1 = every epoch, 10 = every 10th)
+val_interval        10        # Run val eval every N epochs (1 = every epoch); reduces GPU idle at epoch boundary
 '
 % Node Type Parameters
 use_node_types  False    # Add one-hot encoded node types to node features

@@ -113,6 +113,7 @@ def single_worker(config, config_filename='config.txt'):
 
     best_valid_loss = float('inf')
     best_epoch = -1
+    val_interval = int(config.get('val_interval', 1))
 
     try:
         for epoch in range(total_epochs):
@@ -120,48 +121,68 @@ def single_worker(config, config_filename='config.txt'):
                 model, train_loader, optimizer, device, config, epoch, ema_model=ema_model
             )
 
+            train_loss = train_metrics['mean']
+            scheduler.step()
+            current_lr = optimizer.param_groups[0]['lr']
+
+            do_val = (epoch % val_interval == 0) or (epoch == total_epochs - 1)
+
             eval_model = ema_model.module if ema_model is not None else model
-            if use_vae:
-                valid_metrics = evaluate_vae_posterior_epoch(
-                    eval_model, val_loader, device, config, epoch, progress_name='ValidQ'
-                )
-                valid_prior_metrics = evaluate_vae_prior_epoch(
-                    eval_model, val_loader, device, config, epoch,
-                    num_prior_samples=vae_valid_prior_samples,
-                    progress_name=f'ValidPrior@{vae_valid_prior_samples}'
-                )
+            if do_val:
+                if use_vae:
+                    valid_metrics = evaluate_vae_posterior_epoch(
+                        eval_model, val_loader, device, config, epoch, progress_name='ValidQ'
+                    )
+                    valid_prior_metrics = evaluate_vae_prior_epoch(
+                        eval_model, val_loader, device, config, epoch,
+                        num_prior_samples=vae_valid_prior_samples,
+                        progress_name=f'ValidPrior@{vae_valid_prior_samples}'
+                    )
+                else:
+                    valid_metrics      = validate_epoch(eval_model, val_loader, device, config, epoch)
+                    valid_prior_metrics = None
+                valid_loss = valid_metrics['mean']
             else:
-                valid_metrics      = validate_epoch(eval_model, val_loader, device, config, epoch)
+                valid_loss = best_valid_loss  # reuse last known for checkpoint gating
+                valid_metrics = {}
                 valid_prior_metrics = None
 
-            train_loss = train_metrics['mean']
-            valid_loss = valid_metrics['mean']
-            scheduler.step()
-
-            current_lr = optimizer.param_groups[0]['lr']
             if use_vae:
                 train_mmd   = train_metrics.get('mmd_mean', 0.0)
                 train_aux   = train_metrics.get('aux_mean', 0.0)
                 train_total = train_metrics.get('total_mean', train_loss)
-                valid_mmd   = valid_metrics.get('mmd_mean', 0.0)
-                valid_total = valid_metrics.get('total_mean', valid_loss)
-                valid_prior_loss = valid_prior_metrics['mean']
-                prior_gap = valid_prior_loss - valid_loss
-                print(
-                    f"Epoch {epoch}/{total_epochs} LR: {current_lr:.2e} | "
-                    f"TrainOpt  recon={train_loss:.2e} mmd={train_mmd:.2e} aux={train_aux:.2e} total={train_total:.2e} | "
-                    f"ValidQ    recon={valid_loss:.2e} mmd={valid_mmd:.2e} total={valid_total:.2e} | "
-                    f"ValidPrior@{vae_valid_prior_samples} recon={valid_prior_loss:.2e} gap={prior_gap:.2e}"
-                )
+                if do_val:
+                    valid_mmd   = valid_metrics.get('mmd_mean', 0.0)
+                    valid_total = valid_metrics.get('total_mean', valid_loss)
+                    valid_prior_loss = valid_prior_metrics['mean']
+                    prior_gap = valid_prior_loss - valid_loss
+                    print(
+                        f"Epoch {epoch}/{total_epochs} LR: {current_lr:.2e} | "
+                        f"TrainOpt  recon={train_loss:.2e} mmd={train_mmd:.2e} aux={train_aux:.2e} total={train_total:.2e} | "
+                        f"ValidQ    recon={valid_loss:.2e} mmd={valid_mmd:.2e} total={valid_total:.2e} | "
+                        f"ValidPrior@{vae_valid_prior_samples} recon={valid_prior_loss:.2e} gap={prior_gap:.2e}"
+                    )
+                else:
+                    valid_prior_loss = None
+                    print(
+                        f"Epoch {epoch}/{total_epochs} LR: {current_lr:.2e} | "
+                        f"TrainOpt  recon={train_loss:.2e} mmd={train_mmd:.2e} aux={train_aux:.2e} total={train_total:.2e}"
+                    )
             else:
                 valid_prior_loss = None
-                print(
-                    f"Epoch {epoch}/{total_epochs} "
-                    f"TrainOpt: {train_loss:.2e} "
-                    f"Valid: {valid_loss:.2e} LR: {current_lr:.2e}"
-                )
+                if do_val:
+                    print(
+                        f"Epoch {epoch}/{total_epochs} "
+                        f"TrainOpt: {train_loss:.2e} "
+                        f"Valid: {valid_loss:.2e} LR: {current_lr:.2e}"
+                    )
+                else:
+                    print(
+                        f"Epoch {epoch}/{total_epochs} "
+                        f"TrainOpt: {train_loss:.2e} LR: {current_lr:.2e}"
+                    )
 
-            if valid_loss < best_valid_loss:
+            if do_val and valid_loss < best_valid_loss:
                 best_valid_loss = valid_loss
                 best_epoch = epoch
                 save_checkpoint(
@@ -177,20 +198,24 @@ def single_worker(config, config_filename='config.txt'):
                 with open(log_file, 'a') as f:
                     elapsed = time.time() - start_time
                     if use_vae:
+                        val_str = (
+                            f"ValidQ recon={valid_loss:.4e} mmd={valid_metrics.get('mmd_mean',0):.4e} "
+                            f"total={valid_metrics.get('total_mean',valid_loss):.4e} | "
+                            f"ValidPrior@{vae_valid_prior_samples} recon={valid_prior_loss:.4e} "
+                            f"gap={prior_gap:.4e}"
+                        ) if do_val else "ValidQ skipped"
                         f.write(
                             f"Elapsed: {elapsed:.2f}s Epoch {epoch} LR: {current_lr:.4e} | "
                             f"TrainOpt recon={train_loss:.4e} mmd={train_metrics.get('mmd_mean',0):.4e} "
                             f"total={train_metrics.get('total_mean',train_loss):.4e} | "
-                            f"ValidQ recon={valid_loss:.4e} mmd={valid_metrics.get('mmd_mean',0):.4e} "
-                            f"total={valid_metrics.get('total_mean',valid_loss):.4e} | "
-                            f"ValidPrior@{vae_valid_prior_samples} recon={valid_prior_loss:.4e} "
-                            f"gap={prior_gap:.4e}\n"
+                            f"{val_str}\n"
                         )
                     else:
+                        val_str = f"Valid {valid_loss:.4e}" if do_val else "Valid skipped"
                         f.write(
                             f"Elapsed: {elapsed:.2f}s "
                             f"Epoch {epoch} TrainOpt {train_loss:.4e} "
-                            f"Valid {valid_loss:.4e} LR: {current_lr:.4e}\n"
+                            f"{val_str} LR: {current_lr:.4e}\n"
                         )
 
             test_interval = int(config.get('test_interval', 10))
