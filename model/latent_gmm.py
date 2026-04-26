@@ -21,13 +21,16 @@ def collect_posterior_means(model, train_dataset, config, device):
     loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False,
                         num_workers=0, pin_memory=False)
 
+    # MeshGraphNets wraps EncoderProcessorDecoder as .model; vae_encoder lives there
+    inner = getattr(model, 'model', model)
+
     model.eval()
     mus = []
     with torch.no_grad():
         for data in loader:
             data = data.to(device)
             y = data.y[:, :output_var]
-            _, mu, _ = model.vae_encoder(y, data.edge_index, data.edge_attr, data.batch)
+            _, mu, _ = inner.vae_encoder(y, data.edge_index, data.edge_attr, data.batch)
             mus.append(mu.float().cpu().numpy())
 
     return np.concatenate(mus, axis=0)  # [N_train, D]
