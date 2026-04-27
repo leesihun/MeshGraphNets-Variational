@@ -123,7 +123,9 @@ def sample_from_gmm(gmm_params, n_samples, device):
     cov_type = gmm_params['covariance_type']
     K, D = means.shape
 
-    k_indices = np.random.choice(K, size=n_samples, p=weights.astype(np.float64))
+    w = weights.astype(np.float64)
+    w /= w.sum()  # renormalize to fix float32->float64 precision drift
+    k_indices = np.random.choice(K, size=n_samples, p=w)
 
     samples = np.empty((n_samples, D), dtype=np.float32)
     if cov_type == 'full':
