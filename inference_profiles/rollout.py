@@ -154,13 +154,12 @@ def run_rollout(config, config_filename='config.txt'):
 
     # Prefer EMA weights (better generalization), fall back to training weights
     if 'ema_state_dict' in checkpoint:
-        from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
-        ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(decay=0.999))
-        ema_model.load_state_dict(checkpoint['ema_state_dict'])
-        # Copy averaged weights into the base model for inference
-        model.load_state_dict(
-            {k: v for k, v in ema_model.module.state_dict().items()}
-        )
+        # AveragedModel saves keys as "module.<key>" + "n_averaged" buffer.
+        # Strip the "module." prefix to get the raw model state dict directly,
+        # avoiding a fragile AveragedModel reconstruction at inference.
+        ema_sd = checkpoint['ema_state_dict']
+        model_sd = {k[len('module.'):]: v for k, v in ema_sd.items() if k.startswith('module.')}
+        model.load_state_dict(model_sd)
         print("  Loaded EMA weights from checkpoint")
     else:
         model.load_state_dict(checkpoint['model_state_dict'])
