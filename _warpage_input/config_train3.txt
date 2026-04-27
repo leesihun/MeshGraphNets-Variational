@@ -7,6 +7,7 @@ modelpath   ./outputs/warpage0.pth
 dataset_dir ./dataset/b8_train_copy.h5
 infer_dataset   ./dataset/infer_dataset_b8_test.h5
 infer_timesteps 1
+num_vae_samples 177
 %   Common params
 input_var   3   # number of input variables: x_disp, y_disp, z_disp, stress (excluding node types)
 output_var  3   # number of output variables: x_disp, y_disp, z_disp, stress (excluding node types)

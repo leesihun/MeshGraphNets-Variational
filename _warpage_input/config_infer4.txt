@@ -17,14 +17,14 @@ positional_features  4   # Rotation-invariant node features: [centroid_dist, mea
 '
 %   Network parameters
 message_passing_num 15
-Training_epochs	500
-Batch_size	4
+Training_epochs	3000
+Batch_size	16
 LearningR	0.0001  # Scaled by sqrt(8/1) from 0.0001 for larger batch size
 Latent_dim	128	# MeshGraphNets latent dimension
 num_workers 8
-std_noise   0.01
+std_noise   0.02
 residual_scale  1  # Scale factor for residual connections (1.0 = full residual, matches NVIDIA/DeepMind)
-augment_geometry False   # Random Z-rotation + reflection augmentation (training only)
+augment_geometry True   # Random Z-rotation + reflection augmentation (training only)
 grad_accum_steps    1
 '
 % Memory Optimization
@@ -34,7 +34,8 @@ use_checkpointing   True
 use_amp             True    # Mixed precision training with bfloat16 (1.5-2x speedup on Ampere+ GPUs)
 use_ema             True    # EMA shadow model for validation/inference (smooths SGD noise, ~free precision)
 ema_decay           0.99   # EMA decay factor (0.999 = ~1000-step averaging window)
-test_interval       10      # Run test/visualization every N epochs (1 = every epoch, 10 = every 10th)
+test_interval       100      # Run test/visualization every N epochs (1 = every epoch, 10 = every 10th)
+val_interval        1        # Run val eval every N epochs (1 = every epoch); reduces GPU idle at epoch boundary
 '
 % Node Type Parameters
 use_node_types  False    # Add one-hot encoded node types to node features
@@ -57,7 +58,11 @@ bipartite_unpool    True    # Learned bipartite MP unpool (False = broadcast)
 '
 % Variational Autoencoder (MMD-VAE / InfoVAE) Parameters
 use_vae             True   # Enable conditional VAE (encodes target delta during training)
-vae_latent_dim      2      # Global latent z dimension (must match training config)
-vae_mp_layers       5      # GnBlocks in VAE encoder
-alpha_recon         100    # Reconstruction loss weight
-lambda_mmd          100    # MMD(q(z), N(0,I)) weight; matches aggregate posterior to prior
+vae_latent_dim      8     # Global latent z dimension
+alpha_recon         1    # Reconstruction loss weight
+lambda_mmd          1    # MMD(q(z), N(0,I)) weight; matches aggregate posterior to prior
+'
+% Post-hoc GMM latent prior (fit after training; used at inference if present in checkpoint)
+fit_latent_gmm      True   # Fit GMM on posterior means after training
+gmm_components      10     # Number of Gaussian mixture components
+gmm_covariance_type full   # 'full' | 'diag' | 'tied' | 'spherical'
