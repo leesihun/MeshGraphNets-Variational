@@ -58,5 +58,6 @@ bipartite_unpool    True    # Learned bipartite MP unpool (False = broadcast)
 % Variational Autoencoder (MMD-VAE / InfoVAE) Parameters
 use_vae             True   # Enable conditional VAE (encodes target delta during training)
 vae_latent_dim      4      # Global latent z dimension
+vae_mp_layers       5      # GnBlocks in VAE encoder
 alpha_recon         100    # Reconstruction loss weight
 lambda_mmd          100    # MMD(q(z), N(0,I)) weight; matches aggregate posterior to prior

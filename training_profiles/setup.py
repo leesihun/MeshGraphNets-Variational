@@ -171,7 +171,7 @@ def build_model_config(config) -> dict:
         'voronoi_clusters':  config.get('voronoi_clusters', None),
         'use_vae':           config.get('use_vae', False),
         'vae_latent_dim':    config.get('vae_latent_dim', 32),
-        'vae_mp_layers':     config.get('vae_mp_layers', 2),
+        'vae_mp_layers':     config.get('vae_mp_layers', 5),
         'beta_aux':          config.get('beta_aux', 1.0),
     }
 
