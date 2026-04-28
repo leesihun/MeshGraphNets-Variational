@@ -7,7 +7,7 @@ modelpath   ./outputs/warpage1.pth
 dataset_dir ./dataset/b8_train.h5
 infer_dataset   ./dataset/infer_dataset_b8_test.h5
 infer_timesteps 1
-num_vae_samples 177
+num_vae_samples 1000
 %   Common params
 input_var   3   # number of input variables: x_disp, y_disp, z_disp, stress (excluding node types)
 output_var  3   # number of output variables: x_disp, y_disp, z_disp, stress (excluding node types)
@@ -17,12 +17,12 @@ positional_features  4   # Rotation-invariant node features: [centroid_dist, mea
 '
 %   Network parameters
 message_passing_num 15
-Training_epochs	3000
+Training_epochs	10000
 Batch_size	16
 LearningR	0.0001  # Scaled by sqrt(8/1) from 0.0001 for larger batch size
 Latent_dim	128	# MeshGraphNets latent dimension
 num_workers 8
-std_noise   0.02
+std_noise   0.01
 residual_scale  1  # Scale factor for residual connections (1.0 = full residual, matches NVIDIA/DeepMind)
 augment_geometry True   # Random Z-rotation + reflection augmentation (training only)
 grad_accum_steps    1
@@ -58,9 +58,9 @@ bipartite_unpool    True    # Learned bipartite MP unpool (False = broadcast)
 '
 % Variational Autoencoder (MMD-VAE / InfoVAE) Parameters
 use_vae             True   # Enable conditional VAE (encodes target delta during training)
-vae_latent_dim      8     # Global latent z dimension
+vae_latent_dim      32      # Global latent z dimension
 alpha_recon         1    # Reconstruction loss weight
-lambda_mmd          1    # MMD(q(z), N(0,I)) weight; matches aggregate posterior to prior
+lambda_mmd          0.1    # MMD(q(z), N(0,I)) weight; matches aggregate posterior to prior
 '
 % Post-hoc GMM latent prior (fit after training; used at inference if present in checkpoint)
 fit_latent_gmm      True   # Fit GMM on posterior means after training
