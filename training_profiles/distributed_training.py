@@ -355,7 +355,7 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
             )
             print(f"  -> New best model saved at epoch {epoch} with valid loss {valid_loss:.2e}")
 
-        if log_file_dir and rank == 0:
+        if log_file and rank == 0:
             with open(log_file, 'a') as f:
                 if use_vae:
                     f.write(
