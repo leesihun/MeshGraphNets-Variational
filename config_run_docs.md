@@ -1,257 +1,273 @@
-# Configuration Reference
+# Config File Reference
 
-Complete reference for all keys accepted in MeshGraphNets config files.
+Complete reference for all config keys used by MeshGraphNets-V.
 
-**Format rules:**
-- One `key value` pair per line (space or tab separated)
-- `%` begins a full-line comment
-- `#` begins an inline comment (rest of line ignored)
-- Keys are case-insensitive (lowercased internally)
-- CSV values (`a, b, c`) are parsed as Python lists
-- Booleans: `True` / `False`
-- Numeric types are auto-detected (int vs float)
-- A line containing only `'` is treated as a blank separator (ignored)
+**Format:** `key   value   # inline comment`  
+Full-line comments use `%`. Lists use comma-separated values. Booleans: `true`/`false`. Keys are case-insensitive. Config files live in `_warpage_input/`.
 
 ---
 
-## Mode & Execution
-
-| Key | Type | Example | Description |
-|---|---|---|---|
-| `model` | str | `MeshGraphNets` | Model class name. Currently only `MeshGraphNets` is supported. |
-| `mode` | str | `train` | Execution mode: `train` or `inference`. |
-| `gpu_ids` | int or list | `0` / `0,1` / `-1` | GPU device IDs. Single int = single GPU. Comma-separated list = multi-GPU DDP. `-1` = CPU. |
-
-**Multi-GPU:** `gpu_ids 0,1` auto-enables DDP via `torch.multiprocessing.spawn` with NCCL backend. `world_size` and `use_distributed` are computed automatically — do not set them manually.
-
----
-
-## Paths & Logging
-
-| Key | Type | Example | Description |
-|---|---|---|---|
-| `modelpath` | str | `./outputs/warpage5.pth` | Path to save/load the checkpoint `.pth` file. |
-| `log_file_dir` | str | `train5.log` | Path for the training loss log file. |
-| `dataset_dir` | str | `./dataset/warpage.h5` | HDF5 dataset for training/validation/test. |
-| `infer_dataset` | str | `./dataset/warpage_infer.h5` | HDF5 dataset used as initial conditions for inference rollout. |
-
----
-
-## Feature Dimensions
-
-These must match the actual layout of your HDF5 `nodal_data` array.
+## Core: Mode & I/O
 
 | Key | Type | Default | Description |
-|---|---|---|---|
-| `input_var` | int | — | Number of physical node input features (e.g., `3` for x/y/z displacement). Excludes node types and positional features — those are added automatically. |
-| `output_var` | int | — | Number of output features the model predicts (must match `input_var` unless a different subset is predicted). |
-| `edge_var` | int | `8` | Edge feature dimensionality. Must be `8` when using both deformed and reference edge features `[deformed_dx/dy/dz/dist, ref_dx/dy/dz/dist]`. |
-| `positional_features` | int | `0` | Number of rotation-invariant node features to append. Feature 0 = centroid distance, Feature 1 = mean neighbor edge length, Feature 2+ = positional encoding (see `positional_encoding`). Set `0` to disable. |
-| `positional_encoding` | str | `rwpe` | Encoding type for `positional_features > 2`: `rwpe` (random-walk PE at k=2,4,8,16,32), `lpe` (Laplacian eigenvectors), `rwpe+lpe` (both concatenated). |
+|-----|------|---------|-------------|
+| `model` | str | — | Display name for the model (e.g. `MeshGraphNets-V`). Not functional. |
+| `mode` | str | — | **Required.** `train` or `inference`. |
+| `gpu_ids` | int or list[int] | 0 | GPU device ID(s). Comma-separated list enables DDP (e.g. `0,1`). `-1` forces CPU. |
+| `modelpath` | str | — | **Required.** Path to checkpoint `.pth` for saving (train) or loading (inference). |
+| `log_file_dir` | str | None | Log file path. Omit to disable file logging. |
+| `dataset_dir` | str | — | Training HDF5 dataset path. Required for `mode train`. |
+| `infer_dataset` | str | — | Inference HDF5 dataset path. Required for `mode inference`. |
 
 ---
 
-## Network Architecture
-
-| Key | Type | Example | Description |
-|---|---|---|---|
-| `Latent_dim` | int | `256` | Hidden dimension for all MLPs and latent node/edge embeddings throughout the network. |
-| `message_passing_num` | int | `15` | Total number of GnBlock message-passing iterations. When multiscale is enabled, this is overridden by the sum of `mp_per_level` entries. |
-| `residual_scale` | float | `1` | Scale factor on residual connections. `1.0` = full residual (matches DeepMind/NVIDIA). |
-| `use_pairnorm` | bool | `False` | Apply PairNorm on aggregated messages to counteract over-smoothing in deep GNNs. |
-
-**Activation:** SiLU (Swish) is hardcoded throughout all MLPs and is not configurable.
-
----
-
-## Training Hyperparameters
-
-| Key | Type | Example | Description |
-|---|---|---|---|
-| `Training_epochs` | int | `500` | Total number of training epochs. |
-| `Batch_size` | int | `2` | Mini-batch size per GPU (for DDP, effective batch = Batch_size × world_size). |
-| `LearningR` | float | `0.0001` | Peak learning rate after warmup. Scale by `sqrt(effective_batch / base_batch)` when changing batch size. |
-| `num_workers` | int | `8` | DataLoader worker processes per GPU. |
-| `grad_accum_steps` | int | `0` | Gradient accumulation. `0` = accumulate full epoch then step, `1` = step every batch, `N` = step every N batches. |
-
-**Loss function:** Huber loss (delta=0.1, per-element, not reduced). The reduction is a weighted mean controlled by `feature_loss_weights`.
-
-**LR schedule:** LinearLR warmup over 3 epochs (0.01× → 1.0×), then CosineAnnealingWarmRestarts with T_0 = (total_epochs − 3) // 3, T_mult = 2, eta_min = 1e-8. Scheduler steps after each optimizer step.
-
-**Optimizer:** Fused Adam with no weight decay (matches DeepMind original).
-
-**Gradient clipping:** max_norm = 3.0 (not configurable).
-
----
-
-## Loss Weighting
-
-| Key | Type | Example | Description |
-|---|---|---|---|
-| `feature_loss_weights` | list | `0.1, 0.1, 1.0` | Per-output-feature loss weights. Length must equal `output_var`. Auto-normalized to sum to 1 (so this controls relative importance, not absolute scale). Applied during train, val, and test. |
-
-Example: `0.1, 0.1, 1.0` for `[x_disp, y_disp, z_disp]` de-emphasizes planar displacement and focuses on z-axis.
-
----
-
-## Data Augmentation & Noise
+## Data & Features
 
 | Key | Type | Default | Description |
-|---|---|---|---|
-| `augment_geometry` | bool | `False` | Random Z-rotation + X/Y reflection applied to the mesh during training only. Makes the model rotation/reflection invariant. |
-| `std_noise` | float | `0.0` | Standard deviation of Gaussian noise added to both node features and edge features during training. Set `0.0` to disable. |
-
-When `std_noise > 0`, the training target is corrected: `y -= gamma * noise * ratio` to account for the injected perturbation.
-
----
-
-## Performance & Memory
-
-| Key | Type | Default | Description |
-|---|---|---|---|
-| `use_amp` | bool | `False` | Mixed-precision training with **bfloat16** (not float16 — float16 causes scatter_add overflow in GNNs). ~1.5–2× speedup on Ampere+ GPUs. |
-| `use_compile` | bool | `False` | Wrap model in `torch.compile(dynamic=True)` for kernel fusion. Adds compilation overhead on first run. |
-| `use_checkpointing` | bool | `False` | Gradient checkpointing (recompute activations on backward pass). Reduces VRAM at the cost of ~30% more compute. Useful for large meshes or deep networks. |
-| `use_ema` | bool | `False` | Maintain an Exponential Moving Average shadow model. EMA weights are used for validation and inference. Effectively free improved generalization. |
-| `ema_decay` | float | `0.999` | EMA decay factor. `0.999` ≈ 1000-step averaging window. Only used when `use_ema True`. |
+|-----|------|---------|-------------|
+| `input_var` | int | — | **Required.** Number of physical node features used as model input. Typically `3` (x/y/z disp) or `4` (+ stress). Does **not** include reference x/y/z positions (extracted separately). |
+| `output_var` | int | — | **Required.** Number of predicted delta features. Usually equals `input_var`. |
+| `edge_var` | int | 8 | Edge feature dimension. Must be `8` (deformed dx/dy/dz/dist + reference dx/dy/dz/dist). |
+| `feature_loss_weights` | list[float] or float | None | Per-output-feature Huber loss weights. Auto-normalized to sum=1. E.g. `1, 1, 1.0`. If omitted, uniform weights. |
+| `positional_features` | int | 0 | Number of rotation-invariant positional features appended to node features. Uses `positional_encoding` type. |
+| `positional_encoding` | str | `rwpe` | Type of positional encoding: `rwpe` (random walk return probabilities), `lpe` (Laplacian eigenvectors), or `rwpe+lpe` (both, split evenly). |
 
 ---
 
-## Evaluation & Visualization
+## Model Architecture — Core
 
 | Key | Type | Default | Description |
-|---|---|---|---|
-| `test_interval` | int | `10` | Run test evaluation and save plots every N epochs. `1` = every epoch. |
-| `test_batch_idx` | list | `0, 1, 2` | Indices of test-set samples to visualize. |
-| `plot_feature_idx` | int | `-1` | Which output feature to visualize in mesh plots. `-1` = last feature (e.g., stress if `output_var` includes it). |
+|-----|------|---------|-------------|
+| `latent_dim` | int | — | **Required.** Hidden dimension for all MLPs (encoder, processor, decoder). Typical: `128`. |
+| `message_passing_num` | int | — | Number of GnBlocks in flat (non-multiscale) mode. Ignored when `use_multiscale True`. |
+| `residual_scale` | float | `1.0` | Residual connection scale factor: `h_out = h_in + residual_scale × MLP_out`. `1.0` = full residual (DeepMind/NVIDIA default). |
 
 ---
 
-## Dataset Splitting
+## Model Architecture — Multiscale V-Cycle
 
 | Key | Type | Default | Description |
-|---|---|---|---|
-| `split_seed` | int | `42` | Random seed for deterministic 80/10/10 train/val/test split. Change to get a different split. |
+|-----|------|---------|-------------|
+| `use_multiscale` | bool | `false` | Enable BFS Bi-Stride or FPS-Voronoi V-cycle multiscale processor. |
+| `multiscale_levels` | int | 1 | Number of coarsening levels L. `mp_per_level` must have `2L+1` entries. |
+| `coarsening_type` | str or list[str] | `bfs` | Coarsening algorithm per level: `bfs` (BFS Bi-Stride, ~4× reduction) or `voronoi` (FPS-Voronoi, configurable). Scalar applies to all levels; list sets per level. |
+| `voronoi_clusters` | int or list[int] | 0 | Target cluster count for Voronoi coarsening per level. List sets per level. `0` = disabled. |
+| `mp_per_level` | list[int] | — | Message-passing blocks per V-cycle level: `[pre_0, pre_1, ..., coarsest, post_{L-1}, ..., post_0]`. Length must be `2L+1`. E.g. for `multiscale_levels 1`: `4, 12, 4`. |
+| `bipartite_unpool` | bool | `false` | `true` = learned bipartite message-passing unpool (fine ← coarse with skip connection). `false` = simple broadcast (gather). |
 
 ---
 
 ## Node Types
 
 | Key | Type | Default | Description |
-|---|---|---|---|
-| `use_node_types` | bool | `False` | Append one-hot encoded node type categories to node features. Types are read from the dataset and concatenated after Z-score normalization. |
+|-----|------|---------|-------------|
+| `use_node_types` | bool | `false` | Append one-hot encoded node type features to node embeddings. Features added **after** normalization. |
 
 ---
 
-## World Edges (Long-Range Connections)
+## World Edges (Collision / Radius Edges)
 
 | Key | Type | Default | Description |
-|---|---|---|---|
-| `use_world_edges` | bool | `False` | Add long-range "world" edges between nodes within a radius threshold. Uses `torch_cluster.radius_graph`. Only applied at the finest scale in multiscale mode. |
-| `world_edge_radius` | float | — | Spatial radius for world edge construction. Required when `use_world_edges True`. |
-
-See `docs/WORLD_EDGES_DOCUMENTATION.md` for details.
+|-----|------|---------|-------------|
+| `use_world_edges` | bool | `false` | Enable radius-based collision edges beyond mesh topology. Only at finest level in multiscale. |
+| `world_radius_multiplier` | float | — | World edge radius = `mean_edge_len × world_radius_multiplier`. Used to compute `world_edge_radius` at dataset build time. |
+| `world_max_num_neighbors` | int | 64 | Maximum collision edge neighbors per node. Applies to `torch_cluster` backend only. |
+| `world_edge_backend` | str | `scipy_kdtree` | `torch_cluster` (GPU-accelerated, requires `torch-cluster`) or `scipy_kdtree` (CPU fallback). |
 
 ---
 
-## Multiscale (BFS Bi-Stride V-Cycle)
-
-Based on the ICML 2023 hierarchical GNN coarsening scheme.
+## Variational Autoencoder (MMD-InfoVAE)
 
 | Key | Type | Default | Description |
-|---|---|---|---|
-| `use_multiscale` | bool | `False` | Enable V-cycle hierarchical message passing. |
-| `multiscale_levels` | int | `1` | Number of coarsening levels L. Adds L coarser graph representations. |
-| `mp_per_level` | list | `2, 10, 2` | Message-passing steps at each stage of the V-cycle. Must have exactly `2*L + 1` entries for L levels: `[pre_0, pre_1, ..., coarsest, post_{L-1}, ..., post_0]`. For `L=1`: `[pre_fine, coarsest, post_fine]`. |
+|-----|------|---------|-------------|
+| `use_vae` | bool | `false` | Enable conditional VAE. Encodes target `y` during training to produce latent `z`. |
+| `vae_latent_dim` | int | 32 | Dimension of the VAE latent code `z`. |
+| `vae_mp_layers` | int | 5 | Number of GnBlocks in `GNNVariationalEncoder`. |
+| `alpha_recon` | float | `1.0` | Reconstruction loss weight: `α × Huber(ŷ, y)`. |
+| `lambda_mmd` | float | `100.0` | MMD loss weight: `λ × MMD²(z, N(0,I))`. Controls aggregate posterior–prior matching. Typical range: `0.01–1.0`. |
+| `beta_aux` | float | `1.0` | Auxiliary prediction loss weight: `β × MSE(aux(z), [y_mean, y_std])`. |
+| `num_vae_samples` | int | 1 | Number of independent `z` samples drawn per inference rollout (stochastic trajectories). |
+| `vae_valid_prior_samples` | int | 8 | Number of prior samples averaged during validation with `use_posterior False`. |
 
-**Coarsening method:** BFS Bi-Stride. Even-depth BFS nodes → coarse graph; odd-depth nodes → mapped to their BFS parent. Handles disconnected components (multi-part meshes).
+### Post-hoc GMM Prior
 
-**Pool:** Mean aggregation. **Unpool:** Broadcast (no learned weights). Skip connections merge skip state with unpooled features via `Linear(2 × Latent_dim, Latent_dim)`.
-
----
-
-## Inference Only
-
-| Key | Type | Example | Description |
-|---|---|---|---|
-| `infer_timesteps` | int | `34` | Number of autoregressive rollout steps to predict. |
-
-**Checkpoint loading:** Normalization stats are read from `checkpoint['normalization']`. If `ema_state_dict` is present, it is preferred over the base model weights. Model architecture config in the checkpoint overrides the config file (a warning is printed).
-
-**Output file:** `rollout_sample{id}_steps{N}.h5` with `nodal_data` of shape `[8, timesteps, nodes]`.
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `fit_latent_gmm` | bool | `false` | After training, fit a GMM on posterior means from the full training set and save to checkpoint. At inference, samples `z` from GMM instead of `N(0,I)`. |
+| `gmm_components` | int | 10 | Number of GMM components (Gaussians). Capped to number of training samples if smaller. |
+| `gmm_covariance_type` | str | `full` | GMM covariance structure: `full`, `diag`, `tied`, or `spherical`. |
+| `gmm_reg_covar` | float | `1e-4` | Diagonal regularizer added to each covariance for numerical stability. On `LinAlgError` (singular covariance), the fitter auto-retries with `10×`, `100×`, `1000×` this value, then falls back to `diag`. |
 
 ---
 
-## Full Example Config (Training)
+## Training Hyperparameters
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `training_epochs` | int | — | **Required.** Total number of training epochs. |
+| `batch_size` | int | — | **Required.** Batch size per GPU. |
+| `learningr` | float | — | **Required.** Peak learning rate for Adam. |
+| `warmup_epochs` | int | 3 | Linear LR warmup from 0% to 100% of `learningr` over N epochs. |
+| `num_workers` | int | — | **Required.** DataLoader worker processes. `0` = main thread only. |
+| `split_seed` | int | 42 | RNG seed for 80/10/10 train/val/test split. Change to produce different splits. |
+| `grad_accum_steps` | int | 1 | Gradient accumulation. `1` = update each batch. `0` = accumulate full epoch (one update per epoch). `N` = update every N batches. |
+
+---
+
+## Data Augmentation & Noise
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `augment_geometry` | bool | `false` | Apply random Z-rotation + X/Y reflection during training. Disabled at validation/inference. |
+| `std_noise` | float | 0.0 | Standard deviation of Gaussian noise added to node features and edge features during training. Trains robustness to observation noise. |
+
+---
+
+## Memory & Performance Optimization
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `use_checkpointing` | bool | `false` | Activation/gradient checkpointing: recomputes forward activations during backward instead of storing them. Reduces memory ~60–70% at cost of ~20–30% compute. |
+| `use_amp` | bool | `true` | Mixed precision with **bfloat16** (not float16). Requires Ampere+ GPU (A100, H100, RTX 30xx+). ~1.5–2× speedup. |
+| `use_compile` | bool | `false` | `torch.compile(model, dynamic=True)` optimization. PyTorch 2.1+. Adds cold-start overhead but speeds up steady-state training. |
+| `use_ema` | bool | `false` | Exponential Moving Average shadow model. Validation and inference always prefer EMA weights when available. |
+| `ema_decay` | float | 0.999 | EMA decay factor. `0.999` ≈ 1000-step averaging window. `0.99` ≈ 100-step (responds faster). |
+| `use_parallel_stats` | bool | `false` | Parallel preprocessing stats computation across dataset samples. |
+
+---
+
+## Validation, Testing & Logging
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `val_interval` | int | 1 | Run validation every N epochs. |
+| `test_interval` | int | 10 | Run full test evaluation + visualizations every N epochs. |
+| `test_batch_idx` | list[int] | `[0,1,2,3]` | Indices of test samples to visualize (create plots/HDF5). |
+| `test_max_batches` | int | 200 | Max test batches evaluated in DDP mode (prevents NCCL timeout). |
+| `display_testset` | bool | `true` | Create 3D PyVista mesh plots for test samples. |
+| `display_trainset` | bool | `true` | Visualize training set reconstruction during test runs. |
+| `plot_feature_idx` | int | -1 | Feature channel index to colorize in 3D plots. `-1` = last feature (typically stress). |
+| `verbose` | bool | `false` | Print per-feature losses, gradient norms, memory usage. |
+| `monitor_gradients` | bool | `false` | Log gradient statistics per layer to the log file. |
+
+---
+
+## Inference
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `infer_timesteps` | int | — | Number of autoregressive rollout steps. If omitted, uses the dataset's timestep count. |
+| `inference_output_dir` | str | `outputs/rollout` | Directory for rollout HDF5 output files. |
+| `num_vae_samples` | int | 1 | Number of independent latent codes (`z`) to sample per rollout sample. Each produces a distinct trajectory. |
+
+---
+
+## Example Configs
+
+### Minimal Training (Flat GNN, No VAE)
 
 ```
-model               MeshGraphNets
-mode                train
-gpu_ids             0,1              # DDP on 2 GPUs
+model       MeshGraphNets-V
+mode        train
+gpu_ids     0
+modelpath   ./outputs/model.pth
+dataset_dir ./dataset/data.h5
 
-log_file_dir        my_run.log
-modelpath           ./outputs/my_model.pth
+input_var               3
+output_var              3
+message_passing_num     10
+latent_dim              128
 
-% Datasets
-dataset_dir         ./dataset/train_data.h5
-infer_dataset       ./dataset/infer_data.h5
-infer_timesteps     34
+training_epochs         1000
+batch_size              16
+learningr               0.0001
+num_workers             4
 
-% Features
-input_var           3                # x_disp, y_disp, z_disp
-output_var          3
-edge_var            8
-positional_features 4
-positional_encoding rwpe
-
-% Network
-Latent_dim          256
-message_passing_num 15
-
-% Training
-Training_epochs     500
-Batch_size          2
-LearningR           0.0001
-num_workers         8
-std_noise           0.003
-augment_geometry    True
-grad_accum_steps    1
-feature_loss_weights  0.1, 0.1, 1.0
-
-% Performance
-use_amp             True
-use_ema             True
-ema_decay           0.999
-use_checkpointing   False
-use_compile         False
-
-% Evaluation
-test_interval       5
-test_batch_idx      0, 1, 2, 3
-plot_feature_idx    -1
-
-% Multiscale
-use_multiscale      True
-multiscale_levels   1
-mp_per_level        2, 10, 2
+use_amp                 true
+use_ema                 true
+ema_decay               0.99
 ```
 
-## Full Example Config (Inference)
+### Full Training (Multiscale + VAE + DDP)
 
 ```
-model               MeshGraphNets
-mode                inference
-gpu_ids             0
+model       MeshGraphNets-V
+mode        train
+gpu_ids     0,1
+modelpath   ./outputs/warpage1.pth
+dataset_dir ./dataset/b8_train.h5
 
-modelpath           ./outputs/my_model.pth
-infer_dataset       ./dataset/infer_data.h5
-infer_timesteps     34
+input_var               3
+output_var              3
+feature_loss_weights    1, 1, 1.0
+positional_features     4
 
-% These must match the checkpoint's saved config
-input_var           3
-output_var          3
-edge_var            8
-positional_features 4
+latent_dim              128
+std_noise               0.01
+residual_scale          1
+augment_geometry        true
+grad_accum_steps        1
+
+use_checkpointing       true
+use_amp                 true
+use_ema                 true
+ema_decay               0.99
+
+training_epochs         2000
+batch_size              16
+learningr               0.0001
+num_workers             8
+test_interval           100
+val_interval            1
+
+use_multiscale          true
+coarsening_type         voronoi
+voronoi_clusters        200
+multiscale_levels       1
+mp_per_level            4, 12, 4
+bipartite_unpool        true
+
+use_vae                 true
+vae_latent_dim          4
+alpha_recon             1
+lambda_mmd              0.1
+
+fit_latent_gmm          true
+gmm_components          10
+gmm_covariance_type     full
 ```
 
-> **Note:** For inference, the model architecture (Latent_dim, message_passing_num, multiscale settings, etc.) is loaded from the checkpoint and overrides the config file. You only need to specify paths and `infer_timesteps`.
+### Inference (Stochastic Rollout)
+
+```
+model           MeshGraphNets-V
+mode            inference
+gpu_ids         0
+modelpath       ./outputs/warpage1.pth
+infer_dataset   ./dataset/infer_dataset_b8_test.h5
+infer_timesteps 1
+num_vae_samples 1000
+
+input_var       3
+output_var      3
+```
+
+---
+
+## Config Keys Quick Lookup
+
+| Category | Key(s) |
+|----------|--------|
+| **Mode/IO** | `mode`, `gpu_ids`, `modelpath`, `dataset_dir`, `infer_dataset`, `log_file_dir` |
+| **Features** | `input_var`, `output_var`, `edge_var`, `feature_loss_weights`, `positional_features`, `positional_encoding` |
+| **Architecture** | `latent_dim`, `message_passing_num`, `residual_scale` |
+| **Multiscale** | `use_multiscale`, `multiscale_levels`, `coarsening_type`, `voronoi_clusters`, `mp_per_level`, `bipartite_unpool` |
+| **Node types** | `use_node_types` |
+| **World edges** | `use_world_edges`, `world_radius_multiplier`, `world_max_num_neighbors`, `world_edge_backend` |
+| **VAE** | `use_vae`, `vae_latent_dim`, `vae_mp_layers`, `alpha_recon`, `lambda_mmd`, `beta_aux`, `num_vae_samples`, `vae_valid_prior_samples` |
+| **GMM** | `fit_latent_gmm`, `gmm_components`, `gmm_covariance_type` |
+| **Training** | `training_epochs`, `batch_size`, `learningr`, `warmup_epochs`, `num_workers`, `split_seed`, `grad_accum_steps` |
+| **Augmentation** | `augment_geometry`, `std_noise` |
+| **Optimization** | `use_checkpointing`, `use_amp`, `use_compile`, `use_ema`, `ema_decay`, `use_parallel_stats` |
+| **Eval/Logging** | `val_interval`, `test_interval`, `test_batch_idx`, `test_max_batches`, `plot_feature_idx`, `verbose`, `monitor_gradients` |
+| **Inference** | `infer_timesteps`, `inference_output_dir`, `num_vae_samples` |

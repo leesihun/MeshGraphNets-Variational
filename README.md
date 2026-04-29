@@ -1,302 +1,318 @@
 # MeshGraphNets — Variational
 
-A Graph Neural Network surrogate for FEA (Finite Element Analysis) simulations implementing an **Encode–Process–Decode** architecture with optional **Conditional MMD-VAE (InfoVAE)** and **Multiscale V-cycle coarsening**.
-
-Designed for learning and autoregressively rolling out time-transient structural mechanics simulations (warpage, displacement, stress) on unstructured FEA meshes.
-
-*Developed by SiHun Lee, Ph.D. — MX, Samsung Electronics.*
+Graph Neural Network surrogate for FEA mesh simulation. Predicts time-transient deformation and stress fields on arbitrary mesh topologies using an Encode–Process–Decode GNN with optional multiscale V-cycle, conditional MMD-VAE, and world (collision) edges.
 
 ---
 
-## Features
+## Table of Contents
 
-- **GNN surrogate for FEA** — predicts normalized state deltas autoregressively on mesh graphs
-- **Conditional MMD-VAE (InfoVAE)** — encodes target trajectory into a global latent `z`; aggregate posterior matched to `N(0, I)` via multi-scale RBF MMD so `z ∼ N(0, I)` sampling works directly at inference
-- **Multiscale V-cycle** — BFS Bi-Stride or Voronoi FPS coarsening with pool/unpool and skip connections
-- **World edges** — radius-based collision/contact edges alongside mesh connectivity
-- **Rotation-invariant positional features** — RWPE, LPE, or both
-- **Multi-GPU DDP** training via PyTorch NCCL; auto-detected from `gpu_ids`
-- **bfloat16 AMP**, **EMA**, **activation checkpointing**, **fused Adam**, **gradient accumulation**
-- Single entry point (`MeshGraphNets_main.py`) for training and inference via plain-text config files
+1. [Overview](#overview)
+2. [Architecture](#architecture)
+3. [Quick Start](#quick-start)
+4. [Installation](#installation)
+5. [Data Format](#data-format)
+6. [Training](#training)
+7. [Inference & Rollout](#inference--rollout)
+8. [Config File Reference](#config-file-reference)
+9. [Helper Scripts](#helper-scripts)
+10. [Outputs](#outputs)
+
+---
+
+## Overview
+
+**Task:** Given the current mesh state at time *t* (node positions + physical fields), predict the state at time *t+1* by learning normalized state deltas `Δstate = state_{t+1} − state_t`. Repeated autoregressive application enables long-horizon rollout.
+
+**Key capabilities:**
+
+| Feature | Description |
+|---------|-------------|
+| Flat GNN | Stack of message-passing GnBlocks (NVIDIA/DeepMind MeshGraphNets) |
+| Multiscale V-cycle | BFS Bi-Stride or FPS-Voronoi coarsening with learned unpooling |
+| Conditional VAE | MMD-InfoVAE latent conditioning for stochastic output distributions |
+| World edges | Radius-based collision/contact edges beyond mesh topology |
+| EMA | Exponential Moving Average shadow model for stable inference |
+| AMP | bfloat16 mixed precision (Ampere+ GPUs) |
+| DDP | Multi-GPU distributed training via PyTorch DistributedDataParallel |
+| GMM prior | Post-hoc GMM fitted to VAE posterior means; used at inference for realistic sampling |
+
+---
+
+## Architecture
+
+### Encode–Process–Decode
+
+```
+Input mesh graph
+  ├─ Node features: [x_disp, y_disp, z_disp, (stress), pos_features, node_type_onehot]
+  └─ Edge features: [deformed_dx/dy/dz/dist, ref_dx/dy/dz/dist]  (8-D)
+
+      │
+      ▼
+  ┌─────────┐
+  │ Encoder │  MLP per node, MLP per edge → latent embeddings (dim = latent_dim)
+  └─────────┘
+      │
+      ▼
+  ┌───────────────────────────────────────────┐
+  │ Processor                                 │
+  │  Flat:  GnBlock × message_passing_num     │
+  │  ─ OR ─                                   │
+  │  Multiscale V-cycle:                      │
+  │    Pre-descent: GnBlocks → Pool           │
+  │    Coarsest level: GnBlocks               │
+  │    Post-ascent:  Unpool → skip → GnBlocks │
+  └───────────────────────────────────────────┘
+      │
+      ▼
+  ┌─────────┐
+  │ Decoder │  MLP → predicted Δstate (normalized)
+  └─────────┘
+      │
+      ▼
+  Denormalize → state_{t+1} = state_t + Δstate
+```
+
+### GnBlock (one message-passing iteration)
+
+```
+EdgeBlock:  MLP([sender ‖ receiver ‖ edge]) → updated edge features
+NodeBlock:  scatter-sum(updated edges) → MLP([node ‖ aggregated]) → updated node
+Residual:   h_out = h_in + residual_scale × MLP_out
+```
+
+All MLPs: `Linear → SiLU → Linear → SiLU → Linear → LayerNorm` (no LayerNorm on Decoder output).
+
+### Conditional VAE (MMD-InfoVAE)
+
+When `use_vae True`, a graph encoder processes the **target** `y` during training:
+
+```
+GNNVariationalEncoder(y) → (μ, log σ²) → z = μ + σ·ε
+z is fused into every processor GnBlock via a Linear projection.
+
+Loss = α·Huber(ŷ, y) + λ·MMD(z, N(0,I)) + β·MSE(aux(z), [y_mean, y_std])
+```
+
+MMD uses multi-scale RBF kernels (σ ∈ {0.5, 1, 2, 4, 8}) — the InfoVAE/MMD-VAE objective.  
+At inference, `z ~ GMM` (if `fit_latent_gmm True`) or `z ~ N(0, I)`.
+
+### Multiscale Coarsening
+
+**BFS Bi-Stride** (default): Even-depth BFS nodes form the coarse graph; ~4× reduction per level.  
+**FPS-Voronoi**: Farthest Point Sampling seeds + Voronoi assignment; configurable cluster count.
+
+Upsampling: broadcast (simple gather) or learned bipartite message passing (`bipartite_unpool True`).
+
+---
+
+## Quick Start
+
+```bash
+# Train (single GPU)
+python MeshGraphNets_main.py --config _warpage_input/config_train5.txt
+
+# Train (multi-GPU DDP — gpu_ids 0,1 in config)
+python MeshGraphNets_main.py --config _warpage_input/config_train5.txt
+
+# Inference / autoregressive rollout
+python MeshGraphNets_main.py --config _warpage_input/config_infer3.txt
+```
+
+The `--config` flag defaults to `config.txt` in the working directory. Single vs. multi-GPU is auto-detected from `gpu_ids`. Mode (`train`/`inference`) is set inside the config file.
 
 ---
 
 ## Installation
 
 ```bash
+pip install torch>=2.1.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+pip install torch-geometric torch-scatter torch-cluster
 pip install -r requirements.txt
 ```
 
-PyTorch and torch-geometric must match your CUDA version. Example for CUDA 12.1:
+**requirements.txt:**
+
+```
+torch>=2.1.0
+torch-geometric>=2.4.0
+torch-cluster>=1.6.3        # optional: GPU radius_graph for world edges
+torch-scatter>=2.1.2
+numpy>=1.24.0
+scipy>=1.10.0
+h5py>=3.8.0
+pandas>=1.5.0
+tqdm>=4.65.0
+matplotlib>=3.7.0
+Pillow>=9.5.0
+pyvista>=0.43.0
+```
+
+Optional (real-time loss server):
+```bash
+pip install fastapi uvicorn
+```
+
+---
+
+## Data Format
+
+### Training HDF5
+
+```
+data/
+└── {sample_id}/
+    ├── nodal_data   [num_features, num_timesteps, num_nodes]
+    │   └── layout: [x, y, z, x_disp, y_disp, z_disp, stress, part_number]
+    ├── mesh_edge    [2, num_edges]   (unidirectional; code makes bidirectional)
+    └── metadata/   (num_nodes, num_edges, num_timesteps, feature_min/max/mean/std)
+metadata/
+└── feature_names   [num_features]
+```
+
+`input_var` counts the physical state features used as model input (e.g., 3 for x/y/z displacement; 4 to add stress). `x, y, z` reference positions are always the first 3 features in the HDF5 but are **not** counted in `input_var` — they are extracted separately as `ref_pos`.
+
+### Rollout Output HDF5
+
+```
+data/{sample_id}/
+├── nodal_data   [3 + output_var + 1, timesteps, nodes]
+│   └── layout: [x, y, z, <output_var channels>, part_number]
+└── mesh_edge    [2, E]
+metadata/
+└── normalization_params/ (node_mean, node_std, delta_mean, delta_std, ...)
+```
+
+### Dataset Builder
 
 ```bash
-pip install torch==2.2.0 --index-url https://download.pytorch.org/whl/cu121
-pip install torch-geometric torch-cluster torch-scatter \
-    -f https://data.pyg.org/whl/torch-2.2.0+cu121.html
-```
-
-If training from shared storage, set `HDF5_USE_FILE_LOCKING=FALSE`.
-
----
-
-## Quick Start
-
-### 1. Build dataset
-
-```bash
-python build_dataset.py
-```
-
-Input nodal data shape: `[features, time, nodes]` — features are `[x, y, z, x_disp, y_disp, z_disp, stress, (part_number)]`.
-
-### 2. Write a config
-
-Create a `.txt` config in `_warpage_input/`. Minimal example:
-
-```
-mode                train
-gpu_ids             0
-dataset_dir         ./dataset/train.h5
-modelpath           ./outputs/model.pth
-input_var           3
-output_var          3
-edge_var            8
-latent_dim          128
-message_passing_num 15
-training_epochs     5000
-batch_size          4
-learningr           0.0001
-use_amp             true
-use_ema             true
-```
-
-### 3. Train
-
-```bash
-# Single GPU
-python MeshGraphNets_main.py --config _warpage_input/config_train.txt
-
-# Multi-GPU DDP (set gpu_ids 0,1,2,3 in config — DDP is auto-detected)
-python MeshGraphNets_main.py --config _warpage_input/config_train.txt
-```
-
-### 4. Inference / rollout
-
-```bash
-python MeshGraphNets_main.py --config _warpage_input/config_infer.txt
-```
-
-Rollout outputs are saved as `rollout_sample{id}_steps{N}.h5`.
-
-### 5. Animate
-
-```bash
-python animate_h5.py
+python build_dataset.py          # Build HDF5 from raw ANSYS .inp + .csv export
+python dataset/reduce_dataset.py # Subsample an existing HDF5
+python dataset/generate_inference_dataset.py  # Extract initial conditions for rollout
 ```
 
 ---
 
-## Architecture
+## Training
+
+### Single GPU
+
+Set `gpu_ids 0` in config:
 
 ```
-Input Graph
-  nodes: [state | positional_features | node_type_onehot]
-  edges: [deformed_dx/dy/dz/dist | ref_dx/dy/dz/dist]  (8D, bidirectional)
-        │
-   ┌────▼──────┐
-   │  Encoder  │   node MLP + edge MLP → latent embeddings (dim = latent_dim)
-   └────┬──────┘
-        │
-   ┌────▼──────────────────────────────────────────────────┐
-   │  Processor                                             │
-   │                                                        │
-   │  FLAT: N × GnBlock                                    │
-   │                                                        │
-   │  MULTISCALE V-cycle:                                  │
-   │    pre-blocks (fine) → coarsen → coarse-level blocks  │
-   │    → unpool → post-blocks (fine)                      │
-   │    skip connections via Linear(2D, D)                 │
-   │    world edges at finest level only                   │
-   │                                                        │
-   │  Each GnBlock:                                        │
-   │    EdgeBlock: [src ‖ dst ‖ edge] → MLP + residual    │
-   │    NodeBlock: [node ‖ Σ edge_msgs] → MLP + residual  │
-   └────┬──────────────────────────────────────────────────┘
-        │
-   ┌────▼──────┐
-   │  Decoder  │   MLP → predicted Δstate (normalized, no output LayerNorm)
-   └────┬──────┘
-        │
-   state_{t+1} = state_t + denormalize(Δstate)
+mode        train
+gpu_ids     0
+dataset_dir ./dataset/b8_train.h5
+modelpath   ./outputs/warpage.pth
 ```
 
-### MMD-VAE Conditioning (`use_vae true`)
+### Multi-GPU DDP
 
-- `GNNVariationalEncoder` runs GnBlocks on the **target** delta graph → GlobalAttention pool → `(μ, log σ²)` → reparameterized `z`
-- `z` is fused into every GnBlock during training
-- Regularizer is a multi-scale RBF **MMD²** between the batch of reparameterized `z` samples and `N(0, I)` (InfoVAE, Zhao et al. 2019) — **not** per-sample KL
-- At inference, `z ∼ N(0, I)` directly; aggregate-posterior matching ensures this lands in the decoder's training support
+Set `gpu_ids 0,1` (or more) in config. `mp.spawn` is used automatically — no `torchrun` needed:
 
-### Key design choices
+```
+gpu_ids     0,1
+batch_size  16    # per GPU
+```
 
-| Choice | Value |
-|--------|-------|
-| Activation | SiLU (Swish) — hardcoded |
-| Aggregation | Sum (not mean) in NodeBlock |
-| Normalization | Z-score from training split only |
-| AMP dtype | bfloat16 (**not** float16 — float16 overflows `scatter_add`) |
-| Node types | One-hot concatenated **after** normalization |
-| Decoder init | Last-layer weights ×0.01 when T>1 (predict-no-change prior) |
+### Training Loop
+
+1. Build 80/10/10 train/val/test splits (deterministic by `split_seed`).
+2. Compute and store Z-score normalization stats on training split.
+3. For each epoch: forward → Huber loss (+ MMD + aux if VAE) → backward → grad clip (max_norm=3) → optimizer step → EMA update.
+4. Validate every `val_interval` epochs; save checkpoint on best validation loss.
+5. Test/visualize every `test_interval` epochs.
+6. After training: optionally fit GMM on posterior means (`fit_latent_gmm True`).
+
+### Optimizer & Schedule
+
+```
+Adam (fused on CUDA)
+  └── LinearLR (warmup_epochs) → CosineAnnealingWarmRestarts
+```
+
+### Gradient Accumulation
+
+`grad_accum_steps 1` = per-batch update. `grad_accum_steps 0` = full-epoch accumulation (gradient averaged over all batches).
 
 ---
 
-## Config Reference
+## Inference & Rollout
 
-Config files are plain text: one `key    value` pair per line. `%` = full-line comment, `#` = inline comment.
-
-### Mode / IO
-
-| Key | Description |
-|-----|-------------|
-| `mode` | `train` or `inference` |
-| `gpu_ids` | GPU IDs; comma-separated for DDP; `-1` for CPU |
-| `modelpath` | Checkpoint save/load path |
-| `log_file_dir` | Log output path |
-| `dataset_dir` | Training HDF5 path |
-| `infer_dataset` | Inference HDF5 path |
-| `infer_timesteps` | Autoregressive rollout steps |
-
-### Base Model
-
-| Key | Description |
-|-----|-------------|
-| `input_var` | Input node feature count |
-| `output_var` | Output feature count (predicted delta) |
-| `edge_var` | Edge feature dim — must be `8` |
-| `latent_dim` | Hidden dimension throughout |
-| `message_passing_num` | GnBlocks in flat mode |
-| `feature_loss_weights` | Per-feature Huber loss weights (auto-normalized) |
-| `positional_features` | Rotation-invariant node features to append |
-| `positional_encoding` | `rwpe`, `lpe`, or `rwpe+lpe` |
-| `use_node_types` | Append one-hot node type features |
-
-### Training
-
-| Key | Description |
-|-----|-------------|
-| `training_epochs` | Total epochs |
-| `batch_size` | Batch size per GPU |
-| `learningr` | Peak learning rate |
-| `warmup_epochs` | Linear LR warmup epochs (default 3) |
-| `split_seed` | Train/val/test split seed (default 42) |
-| `std_noise` | Gaussian noise std on nodes+edges |
-| `augment_geometry` | Z-rotation + X/Y reflection augmentation |
-| `grad_accum_steps` | Gradient accumulation steps |
-| `use_amp` | bfloat16 mixed precision |
-| `use_ema` | EMA shadow model |
-| `ema_decay` | EMA decay (default 0.99) |
-| `use_checkpointing` | Activation checkpointing (saves GPU memory) |
-| `test_interval` | Epoch interval for validation |
-
-### Multiscale
-
-| Key | Description |
-|-----|-------------|
-| `use_multiscale` | Enable V-cycle |
-| `multiscale_levels` | Levels L — `mp_per_level` needs 2L+1 entries |
-| `coarsening_type` | `bfs` or `voronoi` |
-| `mp_per_level` | MP blocks per level: `[pre, coarse_1…coarse_L, post]` |
-| `voronoi_clusters` | Target cluster counts per Voronoi level |
-| `bipartite_unpool` | Learned bipartite unpool (vs. broadcast) |
-
-### MMD-VAE (InfoVAE)
-
-| Key | Description |
-|-----|-------------|
-| `use_vae` | Conditional MMD-VAE latent conditioning |
-| `vae_latent_dim` | Latent code dimension |
-| `vae_mp_layers` | GnBlocks in VAE encoder |
-| `lambda_mmd` | Weight on MMD(q(z), N(0,I)) |
-| `alpha_recon` | Reconstruction loss weight |
-| `beta_aux` | Auxiliary prediction loss weight |
-
-### World Edges
-
-| Key | Description |
-|-----|-------------|
-| `use_world_edges` | Radius-based collision/contact edges |
-| `world_radius_multiplier` | Radius = mean_edge_len × this |
-| `world_max_num_neighbors` | Max degree per node |
-| `world_edge_backend` | `torch_cluster` (fast) or `scipy_kdtree` (fallback) |
-
----
-
-## HDF5 Data Format
-
-**Input dataset** — `data/{id}/nodal_data` shape `[F, T, N]`:
-
-| Index | Feature |
-|-------|---------|
-| 0–2 | x, y, z (reference coordinates) |
-| 3–5 | x_disp, y_disp, z_disp |
-| 6 | stress (von Mises or equivalent) |
-| 7 | part_number (optional) |
-
-**Mesh connectivity** — `data/{id}/mesh_edge` shape `[2, E]` (bidirectional node index pairs)
-
-**Preprocessing** writes normalization stats and train/val/test splits back into `metadata/`.
-
-**Rollout output** — `rollout_sample{id}_steps{N}.h5`, same layout, shape `[8, T, N]`
-
-**Checkpoints** contain: model weights, optimizer/scheduler state, `checkpoint['normalization']`, optionally `ema_state_dict`, `coarse_edge_means`/`coarse_edge_stds`, `model_config`.
-
----
-
-## Project Structure
+Set `mode inference` in config. Rollout is **fully autoregressive**:
 
 ```
-MeshGraphNets_main.py              Entry point — routes train/inference
-model/
-  MeshGraphNets.py                 Top-level Encode-Process-Decode model
-  encoder_decoder.py               Encoder, GnBlock, Decoder
-  blocks.py                        EdgeBlock, NodeBlock, HybridNodeBlock, UnpoolBlock
-  mlp.py                           build_mlp and weight initialization
-  vae.py                           GNNVariationalEncoder
-  coarsening.py                    BFS Bi-Stride + Voronoi FPS coarsening
-  checkpointing.py                 Gradient checkpointing wrapper
-training_profiles/
-  setup.py                         Dataset / model / optimizer builders
-  training_loop.py                 Epoch loop, loss, EMA, VAE losses
-  single_training.py               Single-GPU entry; saves normalization
-  distributed_training.py          DDP multi-GPU entry with NCCL
-inference_profiles/
-  rollout.py                       Autoregressive rollout → HDF5
-general_modules/
-  mesh_dataset.py                  MeshGraphDataset (normalization, augmentation, positional encoding)
-  edge_features.py                 8D edge feature computation
-  world_edges.py                   Collision/contact edge builder
-  multiscale_helpers.py            Multiscale hierarchy builder
-  mesh_utils_fast.py               GPU mesh utilities + PyVista rendering
-  load_config.py                   Plain-text config parser
-build_dataset.py                   HDF5 dataset builder from FEA exports
-dataset/
-  generate_inference_dataset.py    Extract initial conditions for inference
-  reduce_dataset.py                Dataset subsampling utility
-animate_h5.py                      GIF animation from rollout HDF5
-misc/
-  plot_loss.py                     Loss curve plotting
-  plot_loss_realtime.py            FastAPI real-time loss monitor
-  analyze_mesh_topology.py         Mesh topology analysis
-  debug_model_output.py            Model output debugging
-_warpage_input/                    Example config files
-docs/                              Architecture and feature documentation
+state_0 → model → Δstate_0 → state_1 → model → Δstate_1 → ... → state_T
+```
+
+Each step:
+1. Normalize current state.
+2. Compute 8-D deformed + reference edge features.
+3. (Optional) compute world edges.
+4. Attach multiscale coarsening data (topology is static and pre-built once).
+5. Forward pass with fixed `z` sampled from GMM or N(0, I).
+6. Denormalize predicted delta; update state.
+
+Results saved to `inference_output_dir` as `rollout_sample{id}_steps{N}.h5`.
+
+For stochastic rollout set `num_vae_samples N` — runs N independent latent codes and saves all trajectories.
+
+---
+
+## Config File Reference
+
+See [config_run_docs.md](config_run_docs.md) for the complete, detailed reference.
+
+**Format:** one `key  value  # comment` per line. `%` for full-line comments. Lists: comma-separated values. Booleans: `true`/`false`. Keys are case-insensitive.
+
+**Minimal training config:**
+
+```
+model       MeshGraphNets-V
+mode        train
+gpu_ids     0
+modelpath   ./outputs/model.pth
+dataset_dir ./dataset/data.h5
+input_var   3
+output_var  3
+message_passing_num 10
+latent_dim  128
+training_epochs 1000
+batch_size  16
+learningr   0.0001
+num_workers 4
+```
+
+**Minimal inference config:**
+
+```
+mode            inference
+gpu_ids         0
+modelpath       ./outputs/model.pth
+infer_dataset   ./dataset/infer_data.h5
+infer_timesteps 10
 ```
 
 ---
 
-## Additional Docs
+## Helper Scripts
 
-- [docs/multiscale_coarsening.md](docs/multiscale_coarsening.md) — multiscale coarsening details
-- [docs/WORLD_EDGES_DOCUMENTATION.md](docs/WORLD_EDGES_DOCUMENTATION.md) — world-edge construction
-- [VAE_IMPLEMENTATION_GUIDE.md](VAE_IMPLEMENTATION_GUIDE.md) — variational architecture notes
-- [config_run_docs.md](config_run_docs.md) — extended config key reference
+| Script | Purpose |
+|--------|---------|
+| `animate_h5.py` | Generate animated GIFs from rollout HDF5 output |
+| `build_dataset.py` | Build HDF5 training dataset from raw FEA export |
+| `dataset/generate_inference_dataset.py` | Extract initial conditions for inference |
+| `dataset/reduce_dataset.py` | Subsample / split existing HDF5 dataset |
+| `misc/plot_loss.py` | Plot training loss from log file |
+| `misc/plot_loss_realtime.py` | Real-time loss monitoring via FastAPI server |
+
+---
+
+## Outputs
+
+| Path | Description |
+|------|-------------|
+| `outputs/*.pth` | Model checkpoints (weights + normalization + GMM params) |
+| `outputs/rollout/rollout_sample*_steps*.h5` | Autoregressive rollout results |
+| `outputs/test/` | Per-epoch test visualizations (.png / .h5) |
+| `*.log` | Training log (loss per epoch, validation, test) |

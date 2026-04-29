@@ -36,16 +36,21 @@ def collect_posterior_means(model, train_dataset, config, device):
     return np.concatenate(mus, axis=0)  # [N_train, D]
 
 
-def fit_gmm(mu_data, n_components=10, covariance_type='full', random_state=0):
+def fit_gmm(mu_data, n_components=10, covariance_type='full', random_state=0,
+            reg_covar=1e-4):
     """Fit GMM on posterior means via sklearn; return storable param dict.
 
     Caps n_components to n_samples so sklearn never errors on small datasets.
+    On LinAlgError (singular covariance — common when VAE posterior has
+    collapsed dims), retries with progressively larger reg_covar, then falls
+    back to 'diag' covariance as a last resort.
 
     Args:
         mu_data: [N, D] float32 array.
         n_components: Number of mixture components.
         covariance_type: 'full' | 'diag' | 'tied' | 'spherical'.
         random_state: RNG seed.
+        reg_covar: Initial diagonal regularization added to each covariance.
 
     Returns:
         dict with keys: weights [K], means [K, D], covariances [*],
@@ -54,22 +59,38 @@ def fit_gmm(mu_data, n_components=10, covariance_type='full', random_state=0):
     from sklearn.mixture import GaussianMixture
 
     n_components = min(n_components, len(mu_data))
-    gmm = GaussianMixture(
-        n_components=n_components,
-        covariance_type=covariance_type,
-        random_state=random_state,
-        max_iter=300,
-        n_init=5,
-    )
-    gmm.fit(mu_data)
 
-    return {
-        'weights': gmm.weights_.astype(np.float32),
-        'means': gmm.means_.astype(np.float32),
-        'covariances': gmm.covariances_.astype(np.float32),
-        'covariance_type': covariance_type,
-        'n_components': n_components,
-    }
+    reg_schedule = [reg_covar, reg_covar * 10, reg_covar * 100, reg_covar * 1000]
+    attempts = [(covariance_type, r) for r in reg_schedule]
+    if covariance_type != 'diag':
+        attempts.append(('diag', reg_schedule[-1]))
+
+    last_err = None
+    for cov_type, r in attempts:
+        try:
+            gmm = GaussianMixture(
+                n_components=n_components,
+                covariance_type=cov_type,
+                random_state=random_state,
+                max_iter=300,
+                n_init=5,
+                reg_covar=r,
+            )
+            gmm.fit(mu_data)
+            if (cov_type, r) != (covariance_type, reg_covar):
+                print(f"[GMM] fit succeeded after fallback: covariance_type={cov_type}, reg_covar={r:g}")
+            return {
+                'weights': gmm.weights_.astype(np.float32),
+                'means': gmm.means_.astype(np.float32),
+                'covariances': gmm.covariances_.astype(np.float32),
+                'covariance_type': cov_type,
+                'n_components': n_components,
+            }
+        except (np.linalg.LinAlgError, ValueError) as e:
+            last_err = e
+            print(f"[GMM] fit failed (covariance_type={cov_type}, reg_covar={r:g}): {e}; retrying...")
+
+    raise RuntimeError(f"GMM fitting failed after all fallbacks; last error: {last_err}")
 
 
 def run_posthoc_gmm_fitting(model, train_dataset, config, device, checkpoint_path):
@@ -84,6 +105,7 @@ def run_posthoc_gmm_fitting(model, train_dataset, config, device, checkpoint_pat
     """
     n_components = int(config.get('gmm_components', 10))
     covariance_type = str(config.get('gmm_covariance_type', 'full'))
+    reg_covar = float(config.get('gmm_reg_covar', 1e-4))
     n_train = len(train_dataset)
 
     print(f"\n[GMM] Collecting posterior means from {n_train} training samples...")
@@ -92,8 +114,9 @@ def run_posthoc_gmm_fitting(model, train_dataset, config, device, checkpoint_pat
     print(f"[GMM] mu shape: {mu_data.shape}  per-dim std: {np.round(per_dim_std, 3)}")
 
     n_fit = min(n_components, n_train)
-    print(f"[GMM] Fitting GMM (n_components={n_fit}, covariance_type={covariance_type})...")
-    gmm_params = fit_gmm(mu_data, n_components=n_fit, covariance_type=covariance_type)
+    print(f"[GMM] Fitting GMM (n_components={n_fit}, covariance_type={covariance_type}, reg_covar={reg_covar:g})...")
+    gmm_params = fit_gmm(mu_data, n_components=n_fit, covariance_type=covariance_type,
+                         reg_covar=reg_covar)
 
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     checkpoint['gmm_params'] = gmm_params
