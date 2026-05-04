@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ---
 
@@ -127,6 +127,36 @@ Init: Kaiming uniform (ReLU nonlinearity) + zero bias. Decoder final layer × 0.
 - **bfloat16 required over float16**: `scatter_add` overflows with float16 on typical FEA mesh sizes.
 - **`use_compile True`**: uses `torch.compile(model, dynamic=True)` to handle variable batch sizes and graph sizes.
 - **Multiscale topology is static**: coarsening is computed once per sample during dataset construction and stored in the HDF5; rollout rebuilds it from stored data, not re-computed each step.
+
+---
+
+## Common Gotchas
+
+### Data & Feature Layout
+- **Displacement order is hardcoded**: The first 3 physical features in `nodal_data` (indices 3–5, i.e., `input_var[0:3]`) **must** be `x_disp, y_disp, z_disp`. Deformed position is computed as `ref_pos + state[:3]` in `edge_features.py`; wrong ordering silently produces bad edge geometry.
+- **Edges are bidirectionalized at load time**: HDF5 stores mesh edges unidirectionally; `mesh_dataset.py` adds reverse edges automatically. Don't add reverse edges in `build_dataset.py`.
+- **`x, y, z` are never in `input_var`**: `nodal_data[0:3]` are reference positions, extracted as `ref_pos` before normalization. Feature count mismatch here is the most common config error.
+
+### Checkpoint vs. Config Priority
+- **Checkpoint overrides model architecture config**: When resuming from a checkpoint, model params (`latent_dim`, `message_passing_num`, `hidden_dim`, etc.) are read from `checkpoint['model_config']`, not the current config file. A warning is printed but training continues. Only non-architecture config keys (LR, epochs, paths) take effect from the config file on resume.
+- **GMM is fit post-training and not refitted on resume**: If `fit_latent_gmm True`, the GMM is computed after training ends and saved to checkpoint. Resuming training does **not** refit the GMM; the stored params remain stale until training completes again.
+- **Normalization stats come only from checkpoint at inference**: Missing `checkpoint['normalization']` raises an immediate error. Mismatched stats between train and inference checkpoints cause NaNs, not a clear error.
+
+### Multiscale Config
+- **`mp_per_level` must have exactly `2·L+1` entries**: V-cycle order is `[pre_L0, ..., pre_L(L-1), coarsest, post_L(L-1), ..., post_L0]`. Mismatches cause silent dimension errors, not an obvious config error.
+- **Per-level coarse edge normalization**: If `coarse_edge_means/stds` are absent from the checkpoint (legacy runs), the code falls back to fine-level stats for all coarse levels — silent degradation, not an error.
+
+### VAE / MMD Specifics
+- **Uses MMD loss, not KL divergence**: `lambda_mmd` is an aggregate posterior-matching penalty (InfoVAE). Typical useful range is 0.01–0.1; config examples showing 100 are usually too high and will over-regularize.
+- **VAE encodes the target at training, samples prior at inference**: During training `z ~ q(z|y)` (posterior). At inference `z ~ N(0,I)` or GMM (prior). Significant distribution shift is expected and intentional.
+
+### Config Parsing
+- **Booleans must be lowercase**: The parser recognizes `true`/`false` only. `True`/`False` (Python style) are treated as strings and will likely cause runtime errors.
+- **CSV lists are whitespace-sensitive**: `0,1` is parsed as `['0','1']`; `0, 1` may produce `['0', ' 1']` with a leading space. Avoid spaces after commas in list values.
+
+### World Edges
+- **`scipy_kdtree` and `torch_cluster` produce different edge sets**: `torch_cluster` returns directed edges only; `scipy_kdtree` expands to both directions. Switching backends mid-project changes topology and thus normalization stats.
+- **Silent empty world edges**: If `world_edge_radius` is too small, no collision edges are added and no error is raised.
 
 ---
 

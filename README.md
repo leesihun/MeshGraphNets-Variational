@@ -108,18 +108,145 @@ Upsampling: broadcast (simple gather) or learned bipartite message passing (`bip
 
 ## Quick Start
 
+### 1. Train
+
 ```bash
-# Train (single GPU)
 python MeshGraphNets_main.py --config _warpage_input/config_train5.txt
+```
 
-# Train (multi-GPU DDP — gpu_ids 0,1 in config)
-python MeshGraphNets_main.py --config _warpage_input/config_train5.txt
+Trains on `./dataset/b8_train.h5` using DDP on GPUs 0 and 1. Saves checkpoint to `./outputs/warpage1.pth`. After training, fits a GMM on VAE posterior means and embeds it in the checkpoint.
 
-# Inference / autoregressive rollout
+### 2. Infer (rollout)
+
+```bash
+# Against warpage1.pth  (matches config_train5)
+python MeshGraphNets_main.py --config _warpage_input/config_infer4.txt
+
+# Against warpage0.pth  (older checkpoint)
 python MeshGraphNets_main.py --config _warpage_input/config_infer3.txt
 ```
 
-The `--config` flag defaults to `config.txt` in the working directory. Single vs. multi-GPU is auto-detected from `gpu_ids`. Mode (`train`/`inference`) is set inside the config file.
+Both configs run 1000 stochastic rollouts (`num_vae_samples 1000`) starting from `./dataset/infer_dataset_b8_test.h5`. Results are written to `outputs/rollout/` as `rollout_sample{id}_steps{N}.h5`.
+
+The `--config` flag defaults to `config.txt`. Mode (`train`/`inference`) is set **inside** the config. Single vs. multi-GPU is auto-detected from `gpu_ids`. `gpu_ids -1` forces CPU.
+
+---
+
+### Current config_train5.txt — [`_warpage_input/config_train5.txt`](_warpage_input/config_train5.txt)
+
+```
+model               MeshGraphNets-V
+mode                train
+gpu_ids             0,1             # DDP on both GPUs
+log_file_dir        train5.log
+modelpath           ./outputs/warpage1.pth
+
+% Datasets
+dataset_dir         ./dataset/b8_train.h5
+infer_dataset       ./dataset/infer_dataset_b8_test.h5
+infer_timesteps     1
+num_vae_samples     177
+
+% Features
+input_var           3               # x_disp, y_disp, z_disp
+output_var          3
+edge_var            8               # deformed+ref dx/dy/dz/dist
+positional_features 4
+feature_loss_weights 1, 1, 1.0
+
+% Network
+message_passing_num 15
+latent_dim          128
+training_epochs     2000
+batch_size          16              # per GPU
+learningr           0.0001
+std_noise           0.01
+residual_scale      1
+num_workers         8
+augment_geometry    True
+grad_accum_steps    1
+
+% Memory / Speed
+use_checkpointing   True
+use_amp             True            # bfloat16
+use_ema             True
+ema_decay           0.99
+test_interval       100
+val_interval        1
+
+% Multiscale (Voronoi V-cycle)
+use_multiscale      True
+coarsening_type     voronoi
+voronoi_clusters    200
+multiscale_levels   1
+mp_per_level        4, 12, 4        # [pre, coarsest, post]
+bipartite_unpool    True
+
+% VAE (MMD-InfoVAE)
+use_vae             True
+vae_latent_dim      4
+alpha_recon         1
+lambda_mmd          0.1
+
+% Post-hoc GMM prior
+fit_latent_gmm      True
+gmm_components      10
+gmm_covariance_type full
+```
+
+---
+
+### Current config_infer4.txt — [`_warpage_input/config_infer4.txt`](_warpage_input/config_infer4.txt)
+
+```
+model               MeshGraphNets-V
+mode                inference
+gpu_ids             1               # single GPU
+log_file_dir        train4.log
+modelpath           ./outputs/warpage1.pth
+
+% Datasets
+dataset_dir         ./dataset/b8_train.h5
+infer_dataset       ./dataset/infer_dataset_b8_test.h5
+infer_timesteps     1
+num_vae_samples     1000
+
+% Features  (must match training checkpoint)
+input_var           3
+output_var          3
+edge_var            8
+positional_features 4
+feature_loss_weights 1, 1, 1.0
+
+% Network  (must match training checkpoint)
+message_passing_num 15
+latent_dim          128
+use_checkpointing   True
+use_amp             True
+use_ema             True
+ema_decay           0.99
+
+% Multiscale
+use_multiscale      True
+coarsening_type     voronoi
+voronoi_clusters    200
+multiscale_levels   1
+mp_per_level        4, 12, 4
+bipartite_unpool    True
+
+% VAE
+use_vae             True
+vae_latent_dim      256             # expanded latent for sampling diversity
+alpha_recon         1
+lambda_mmd          0.1
+
+% GMM prior
+fit_latent_gmm      True
+gmm_components      10
+gmm_covariance_type full
+```
+
+> **Note:** `vae_latent_dim` in an inference config does NOT need to match training — the checkpoint carries the trained VAE weights. The inference `vae_latent_dim` controls how many GMM components are sampled from when `fit_latent_gmm True` is set and the GMM is present in the checkpoint.
 
 ---
 
@@ -157,39 +284,172 @@ pip install fastapi uvicorn
 
 ## Data Format
 
-### Training HDF5
+### Overview
+
+All data is stored as HDF5 (`.h5`). There are three HDF5 types in this project:
+
+| File | Purpose | Created by |
+|------|---------|------------|
+| Training dataset (`b8_train.h5`) | Full multi-step trajectories for training and test | `build_dataset.py` |
+| Inference dataset (`infer_dataset_b8_test.h5`) | Initial conditions only (t=0) for rollout | `dataset/generate_inference_dataset.py` |
+| Rollout output (`rollout_sample*_steps*.h5`) | Autoregressive predictions produced by the model | `inference_profiles/rollout.py` |
+
+---
+
+### Training HDF5 (`b8_train.h5`)
 
 ```
-data/
-└── {sample_id}/
-    ├── nodal_data   [num_features, num_timesteps, num_nodes]
-    │   └── layout: [x, y, z, x_disp, y_disp, z_disp, stress, part_number]
-    ├── mesh_edge    [2, num_edges]   (unidirectional; code makes bidirectional)
-    └── metadata/   (num_nodes, num_edges, num_timesteps, feature_min/max/mean/std)
-metadata/
-└── feature_names   [num_features]
+/
+├── data/
+│   ├── {sample_id}/                    # integer key, e.g. "0", "1", "42"
+│   │   ├── nodal_data   float32  [num_features, num_timesteps, num_nodes]
+│   │   ├── mesh_edge    int64    [2, num_edges]          (unidirectional; code mirrors to bidirectional)
+│   │   └── metadata/
+│   │       └── attrs:  num_nodes, num_edges, num_timesteps,
+│   │                   feature_min, feature_max, feature_mean, feature_std
+│   ├── {sample_id}/
+│   │   └── ...
+│   └── ...
+└── metadata/
+    └── feature_names   bytes[num_features]
 ```
 
-`input_var` counts the physical state features used as model input (e.g., 3 for x/y/z displacement; 4 to add stress). `x, y, z` reference positions are always the first 3 features in the HDF5 but are **not** counted in `input_var` — they are extracted separately as `ref_pos`.
+#### nodal_data feature layout
 
-### Rollout Output HDF5
+Index | Name | Unit | Notes
+------|------|------|------
+0 | `x_coord` | mm | Reference (undeformed) X position
+1 | `y_coord` | mm | Reference Y position
+2 | `z_coord` | mm | Reference Z position
+3 | `x_disp`  | mm | X displacement at each timestep
+4 | `y_disp`  | mm | Y displacement
+5 | `z_disp`  | mm | Z displacement
+6 | `stress`  | MPa | von Mises equivalent stress
+7 | `part_no` | — | Integer part/component ID
+
+- Indices 0–2 (`x/y/z_coord`) are **reference positions** — static across timesteps, never counted in `input_var`.
+- `input_var 3` → model reads features 3–5 (x/y/z displacement).
+- `input_var 4` → model reads features 3–6 (displacement + stress).
+- `part_no` (index 7) is used only when `use_node_types True`; otherwise ignored.
+
+#### mesh_edge
+
+Shape `[2, num_edges]` — unidirectional connectivity (row 0 = source, row 1 = target). The dataloader mirrors each edge to produce bidirectional pairs.
+
+#### Normalization and split metadata written back to HDF5
+
+After the first training run, the following are written back into the HDF5 by the dataset class:
 
 ```
-data/{sample_id}/
-├── nodal_data   [3 + output_var + 1, timesteps, nodes]
-│   └── layout: [x, y, z, <output_var channels>, part_number]
-└── mesh_edge    [2, E]
-metadata/
-└── normalization_params/ (node_mean, node_std, delta_mean, delta_std, ...)
+/metadata/
+    train_indices        int[]     sample IDs in training split
+    val_indices          int[]     sample IDs in validation split
+    test_indices         int[]     sample IDs in test split
+    node_mean            float32[input_var]
+    node_std             float32[input_var]
+    edge_mean            float32[8]
+    edge_std             float32[8]
+    delta_mean           float32[output_var]
+    delta_std            float32[output_var]
+    coarse_edge_means    float32[levels, 8]
+    coarse_edge_stds     float32[levels, 8]
 ```
 
-### Dataset Builder
+---
+
+### Inference Input HDF5 (`infer_dataset_b8_test.h5`)
+
+Same schema as the training HDF5, but each sample has **only one timestep** (`num_timesteps = 1`) — the initial condition.
+
+```
+/
+├── data/
+│   └── {sample_id}/
+│       ├── nodal_data   float32  [num_features, 1, num_nodes]   ← t=0 only
+│       ├── mesh_edge    int64    [2, num_edges]
+│       └── metadata/  (attrs)
+└── metadata/
+    └── feature_names   bytes[num_features]
+```
+
+Generated by:
+```bash
+python dataset/generate_inference_dataset.py
+```
+
+This script randomly selects `num_samples` (default 10) from the training HDF5 and copies only `nodal_data[:, 0:1, :]` (time index 0) plus `mesh_edge`.
+
+---
+
+### Rollout Output HDF5 (`rollout_sample{id}_steps{N}.h5`)
+
+Produced by `inference_profiles/rollout.py`. One file per input sample per VAE sample draw.
+
+```
+/
+├── data/
+│   └── {sample_id}/
+│       ├── nodal_data   float32  [3 + output_var + 1, num_timesteps, num_nodes]
+│       │   └── layout: [x_coord, y_coord, z_coord, <output_var channels>, part_no]
+│       └── mesh_edge    int64    [2, num_edges]
+└── metadata/
+    └── normalization_params/
+        ├── node_mean, node_std
+        ├── delta_mean, delta_std
+        └── ...
+```
+
+For `output_var 3` the nodal_data channels are: `[x, y, z, x_disp_pred, y_disp_pred, z_disp_pred, part_no]` → shape `[7, T, N]`.
+
+Visualize with:
+```bash
+python animate_h5.py
+```
+
+---
+
+### Building a Dataset from Scratch
+
+#### Step 1 — Build training HDF5 from ANSYS export
 
 ```bash
-python build_dataset.py          # Build HDF5 from raw ANSYS .inp + .csv export
-python dataset/reduce_dataset.py # Subsample an existing HDF5
-python dataset/generate_inference_dataset.py  # Extract initial conditions for rollout
+python build_dataset.py
 ```
+
+Expects the following raw input structure (configure paths at top of `build_dataset.py`):
+
+```
+{device_code}/picked_inp/
+├── nonfem/
+│   └── sub{1..10}/
+│       └── id{N}_*_mesh.inp          # ANSYS mesh file
+└── Ansys_inp_path/
+    └── sub{1..10}/
+        └── Sim_data/
+            └── {N}/
+                ├── node_coordinates.csv
+                ├── z_disp_step_1.csv   # one CSV per timestep
+                ├── z_disp_step_2.csv
+                └── ...
+```
+
+Each CSV has columns: node_id, x_disp, y_disp, z_disp, and one of `[SEQV, S_EQV, Stress, stress, VM_Stress, von_mises]` for von Mises stress.
+
+#### Step 2 — Generate inference initial conditions
+
+```bash
+python dataset/generate_inference_dataset.py
+```
+
+Editable parameters at the bottom of the script: `source_dataset`, `output_path`, `num_samples`, `random_seed`.
+
+#### Step 3 (optional) — Reduce dataset size
+
+```bash
+python dataset/reduce_dataset.py
+```
+
+Subsamples an existing HDF5 to a smaller set of samples.
 
 ---
 
@@ -217,7 +477,7 @@ batch_size  16    # per GPU
 
 ### Training Loop
 
-1. Build 80/10/10 train/val/test splits (deterministic by `split_seed`).
+1. Build 80/10/10 train/val/test splits (deterministic by `split_seed`, default 42).
 2. Compute and store Z-score normalization stats on training split.
 3. For each epoch: forward → Huber loss (+ MMD + aux if VAE) → backward → grad clip (max_norm=3) → optimizer step → EMA update.
 4. Validate every `val_interval` epochs; save checkpoint on best validation loss.
@@ -268,29 +528,34 @@ See [config_run_docs.md](config_run_docs.md) for the complete, detailed referenc
 **Minimal training config:**
 
 ```
-model       MeshGraphNets-V
-mode        train
-gpu_ids     0
-modelpath   ./outputs/model.pth
-dataset_dir ./dataset/data.h5
-input_var   3
-output_var  3
-message_passing_num 10
-latent_dim  128
-training_epochs 1000
-batch_size  16
-learningr   0.0001
-num_workers 4
+model               MeshGraphNets-V
+mode                train
+gpu_ids             0
+modelpath           ./outputs/model.pth
+dataset_dir         ./dataset/data.h5
+input_var           3
+output_var          3
+message_passing_num 15
+latent_dim          128
+training_epochs     2000
+batch_size          16
+learningr           0.0001
+num_workers         8
 ```
 
 **Minimal inference config:**
 
 ```
+model           MeshGraphNets-V
 mode            inference
 gpu_ids         0
 modelpath       ./outputs/model.pth
+dataset_dir     ./dataset/data.h5
 infer_dataset   ./dataset/infer_data.h5
-infer_timesteps 10
+infer_timesteps 1
+num_vae_samples 1000
+input_var       3
+output_var      3
 ```
 
 ---
@@ -300,9 +565,9 @@ infer_timesteps 10
 | Script | Purpose |
 |--------|---------|
 | `animate_h5.py` | Generate animated GIFs from rollout HDF5 output |
-| `build_dataset.py` | Build HDF5 training dataset from raw FEA export |
-| `dataset/generate_inference_dataset.py` | Extract initial conditions for inference |
-| `dataset/reduce_dataset.py` | Subsample / split existing HDF5 dataset |
+| `build_dataset.py` | Build HDF5 training dataset from raw ANSYS FEA export |
+| `dataset/generate_inference_dataset.py` | Extract t=0 initial conditions for inference |
+| `dataset/reduce_dataset.py` | Subsample / split an existing HDF5 dataset |
 | `misc/plot_loss.py` | Plot training loss from log file |
 | `misc/plot_loss_realtime.py` | Real-time loss monitoring via FastAPI server |
 
