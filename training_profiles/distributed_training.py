@@ -118,14 +118,17 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
 
     # Create dataloaders
     num_workers = config['num_workers']
+    pin_memory = torch.cuda.is_available()
+    mp_context = 'spawn' if num_workers > 0 else None
     train_loader = DataLoader(
         train_dataset,
         batch_size=config['batch_size'],
         sampler=train_sampler,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         persistent_workers=num_workers > 0,
         prefetch_factor=2 if num_workers > 0 else None,
+        multiprocessing_context=mp_context,
     )
 
     if rank == 0:
@@ -134,9 +137,10 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
             batch_size=config['batch_size'],
             shuffle=True,
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=pin_memory,
             persistent_workers=num_workers > 0,
             prefetch_factor=2 if num_workers > 0 else None,
+            multiprocessing_context=mp_context,
         )
     else:
         val_loader = None
@@ -146,7 +150,7 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
         test_dataset,
         batch_size=1,
         shuffle=True,
-        pin_memory=True
+        pin_memory=pin_memory
     )
     if rank == 0:
         train_eval_subset_size = min(len(train_dataset), int(config.get('train_eval_subset_size', 128)))
@@ -275,7 +279,8 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
                 batch_size=config['batch_size'],
                 shuffle=False,
                 num_workers=num_workers,
-                pin_memory=True,
+                pin_memory=pin_memory,
+                multiprocessing_context=mp_context,
             )
             if use_vae:
                 train_eval_metrics = evaluate_vae_posterior_epoch(
@@ -393,7 +398,7 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
                     if train_viz_indices:
                         train_viz_loader = DataLoader(
                             Subset(train_dataset, train_viz_indices),
-                            batch_size=1, shuffle=False, pin_memory=True
+                            batch_size=1, shuffle=False, pin_memory=pin_memory
                         )
                         viz_config = dict(config)
                         viz_config['test_batch_idx'] = list(range(len(train_viz_indices)))
