@@ -57,19 +57,20 @@ def single_worker(config, config_filename='config.txt'):
     print("\nCreating dataloaders...")
     num_workers = config['num_workers']
     pin_memory = torch.cuda.is_available()
+    config['_pin_memory'] = pin_memory
     mp_context = 'spawn' if num_workers > 0 else None
     train_loader = DataLoader(
         train_dataset, batch_size=config['batch_size'], shuffle=True,
         num_workers=num_workers, pin_memory=pin_memory,
         persistent_workers=num_workers > 0,
-        prefetch_factor=2 if num_workers > 0 else None,
+        prefetch_factor=1 if num_workers > 0 else None,
         multiprocessing_context=mp_context,
     )
     val_loader = DataLoader(
         val_dataset, batch_size=config['batch_size'], shuffle=True,
         num_workers=num_workers, pin_memory=pin_memory,
         persistent_workers=num_workers > 0,
-        prefetch_factor=2 if num_workers > 0 else None,
+        prefetch_factor=1 if num_workers > 0 else None,
         multiprocessing_context=mp_context,
     )
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=True, pin_memory=pin_memory)
@@ -120,17 +121,10 @@ def single_worker(config, config_filename='config.txt'):
     val_interval = int(config.get('val_interval', 1))
 
     try:
-        # Pre-create first iterator so workers begin filling the buffer immediately.
-        train_iter = iter(train_loader)
         for epoch in range(total_epochs):
-            current_iter = train_iter
             train_metrics = train_epoch(
                 model, train_loader, optimizer, device, config, epoch, ema_model=ema_model,
-                _iter=current_iter,
             )
-            # Start loading next epoch's data NOW — workers prefetch in the background
-            # while val eval (or just logging) occupies the CPU/GPU.
-            train_iter = iter(train_loader)
 
             train_loss = train_metrics['mean']
             scheduler.step()

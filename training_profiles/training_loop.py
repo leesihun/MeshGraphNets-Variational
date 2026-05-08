@@ -78,6 +78,11 @@ def _loss_from_errors(errors, loss_weights):
     return loss_sum / loss_count, loss_sum.item(), loss_count
 
 
+def _move_graph_to_device(graph, device, config):
+    non_blocking = bool(config.get('_pin_memory', False)) and getattr(device, 'type', None) == 'cuda'
+    return graph.to(device, non_blocking=non_blocking)
+
+
 def _accum_window_size(batch_idx, total_batches, actual_accum):
     """Return the number of batches in the current accumulation window."""
     window_start = (batch_idx // actual_accum) * actual_accum
@@ -166,7 +171,7 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
         # DEBUG: disabled when use_compile=True (.item() causes graph breaks)
         debug_internal = (not use_compile) and (batch_idx == 0 and (epoch < 5 or epoch % 10 == 0))
 
-        graph = graph.to(device)
+        graph = _move_graph_to_device(graph, device, config)
 
         with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
             predicted_acc, target_acc, mmd_loss_val, aux_loss_val = model(graph, debug=debug_internal)
@@ -332,7 +337,7 @@ def _evaluate_epoch(model, dataloader, device, config, epoch=0, *,
                 tqdm.tqdm.write(f"\n=== {progress_name} Batch {batch_idx} ===")
                 tqdm.tqdm.write(f"Before: {mem_before:.2f}GB")
 
-            graph = graph.to(device)
+            graph = _move_graph_to_device(graph, device, config)
 
             if use_vae and use_posterior is False and num_prior_samples > 1:
                 errors_sum = None
@@ -500,7 +505,7 @@ def test_model(model, dataloader, device, config, epoch, dataset=None, output_pr
             if batch_idx >= max_test_batches:
                 break
 
-            graph = graph.to(device)
+            graph = _move_graph_to_device(graph, device, config)
             with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
                 predicted, target, _, _ = model(graph, use_posterior=True)
                 errors = torch.nn.functional.huber_loss(predicted, target, reduction='none', delta=1.0)

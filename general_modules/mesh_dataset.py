@@ -353,6 +353,7 @@ class MeshGraphDataset(Dataset):
         self.coarse_edge_stds: List = []    # per-level: [std_level_0, std_level_1, ...]
         self._coarse_cache_max = int(config.get('coarse_cache_per_worker', 500))
         self._coarse_cache: Dict = {}  # {sample_id: list[dict]} — list from build_multiscale_hierarchy
+        self._static_cache: Dict = {}  # per-worker topology and positional features
 
         # Per-level coarsening method ('bfs' or 'voronoi')
         raw_ct = config.get('coarsening_type', 'bfs')
@@ -411,6 +412,7 @@ class MeshGraphDataset(Dataset):
             self.edge_mean = None
             self.edge_std = None
             self._h5_handle = None
+            self._static_cache = {}
             self.is_training = False
             self.augment_geometry = False
 
@@ -646,6 +648,7 @@ class MeshGraphDataset(Dataset):
         subset.coarse_edge_means = []
         subset.coarse_edge_stds = []
         subset._coarse_cache = {}
+        subset._static_cache = {}
         subset._coarse_cache_max = self._coarse_cache_max
         subset._h5_handle = None
         subset.is_training = is_training
@@ -978,11 +981,44 @@ class MeshGraphDataset(Dataset):
             self._h5_handle = h5py.File(self.h5_file, 'r', swmr=True)
         return self._h5_handle
 
+    def _get_static_sample_data(self, sample_id: int, h5_handle, data: np.ndarray):
+        """Cache sample topology and positional features inside each worker."""
+        cache = getattr(self, '_static_cache', None)
+        if cache is None:
+            cache = {}
+            self._static_cache = cache
+
+        cached = cache.get(sample_id)
+        if cached is not None:
+            cache.pop(sample_id)
+            cache[sample_id] = cached
+            return cached
+
+        mesh_edge = h5_handle[f'data/{sample_id}/mesh_edge'][:]  # [2, M]
+        edge_index = np.concatenate([mesh_edge, mesh_edge[[1, 0], :]], axis=1)  # [2, 2M]
+
+        node_types = data[-1, 0, :].astype(np.int32) if self.use_node_types else None
+
+        x_pos = None
+        if self.num_pos_features > 0:
+            ref_pos_0 = data[:3, 0, :].T
+            x_pos = _compute_positional_features(
+                ref_pos_0, edge_index, self.num_pos_features, self.positional_encoding
+            )
+
+        cached = (edge_index, x_pos, node_types)
+        if self._coarse_cache_max > 0:
+            if len(cache) >= self._coarse_cache_max:
+                cache.pop(next(iter(cache)))
+            cache[sample_id] = cached
+        return cached
+
     def __getstate__(self):
         """Exclude unpicklable HDF5 handle when pickling (for DataLoader workers)."""
         state = self.__dict__.copy()
         state['_h5_handle'] = None
         state['_coarse_cache'] = {}    # workers start with empty cache; they build lazily
+        state['_static_cache'] = {}
         return state
 
     def __setstate__(self, state):
@@ -1055,13 +1091,8 @@ class MeshGraphDataset(Dataset):
         # Load data from HDF5 (persistent handle for performance — avoids open/close per sample)
         f = self._get_h5_handle()
         data = f[f'data/{sample_id}/nodal_data'][:]  # [7 or 8, time, nodes]
-        edge_index = f[f'data/{sample_id}/mesh_edge'][:]  # [2, M]
-
-        node_types = data[-1, 0, :].astype(np.int32) if self.use_node_types else None  # [nodes]
+        edge_index, x_pos, node_types = self._get_static_sample_data(sample_id, f, data)
         part_ids = node_types  # same raw IDs, stored separately in graph for visualization
-
-        # Make edges bidirectional (like DeepMind's MeshGraphNets implementation)
-        edge_index = np.concatenate([edge_index, edge_index[[1, 0], :]], axis=1)  # [2, 2M]
 
         # Transpose to [nodes, time, 7]
         data = np.transpose(data, (2, 1, 0))
@@ -1083,12 +1114,7 @@ class MeshGraphDataset(Dataset):
             y_raw = data_t1[:, 3:3+self.output_dim]  # [N, output_var]
             target_delta = y_raw - x_phys  # [N, output_var]
 
-        # Append rotation-invariant positional features (geometry + topology)
-        # Computed on-the-fly per __getitem__ call; workers parallelize this naturally.
         if self.num_pos_features > 0:
-            x_pos = _compute_positional_features(
-                pos, edge_index, self.num_pos_features, self.positional_encoding
-            )
             x_raw = np.concatenate([x_phys, x_pos], axis=1)  # [N, input_var + pos_features]
         else:
             x_raw = x_phys
