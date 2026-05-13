@@ -1,5 +1,5 @@
 model   MeshGraphNets-V
-mode    train  # Train / Inference
+mode    train_with_prior  # Train VAE-MGN, then train post-hoc conditional prior
 gpu_ids 1    # -1 for CPU, GPU ids for multi-GPU training (DDP with both H200s)
 log_file_dir    b8_all/train2.log
 modelpath   ./outputs/b8_all/warpage2.pth
@@ -62,7 +62,12 @@ vae_latent_dim      128      # Global latent z dimension
 alpha_recon         1    # Reconstruction loss weight
 lambda_mmd          0.1    # MMD(q(z), N(0,I)) weight; matches aggregate posterior to prior
 '
-% Post-hoc GMM latent prior (fit after training; used at inference if present in checkpoint)
-fit_latent_gmm      True   # Fit GMM on posterior means after training
-gmm_components      10     # Number of Gaussian mixture components
-gmm_covariance_type full   # 'full' | 'diag' | 'tied' | 'spherical'
+% Post-hoc mesh-conditioned latent prior
+use_conditional_prior       True
+prior_mixture_components    10
+prior_mp_layers             3
+prior_epochs                200
+prior_learningr             0.0001
+prior_batch_size            8
+prior_mc_samples            4
+prior_temperature           1.0

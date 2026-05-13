@@ -68,9 +68,36 @@ def main():
     # Display the current absolute path
     print(f"Current absolute path: {os.path.abspath('.')}")
 
-    if run_mode == 'inference':
+    if run_mode == 'train_prior':
+        from training_profiles.posthoc_prior import train_posthoc_prior
+        train_posthoc_prior(config, args.config)
+
+    elif run_mode == 'inference':
         # Inference mode: autoregressive rollout
         run_rollout(config, args.config)
+
+    elif run_mode == 'train_with_prior':
+        config['mode'] = 'train'
+        config['train_conditional_prior'] = True
+        if use_distributed == False:
+            single_worker(config, args.config)
+        else:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('', 0))
+                config['_ddp_port'] = str(s.getsockname()[1])
+            print(f"Starting distributed training with {world_size} processes on GPUs {gpu_ids} (port {config['_ddp_port']})...")
+            try:
+                mp.spawn(
+                    train_worker,
+                    args=(world_size, config, gpu_ids, args.config),
+                    nprocs=world_size,
+                    join=True
+                )
+                print("Distributed training completed.")
+            except (KeyboardInterrupt, ProcessExitedException):
+                print("\nTraining interrupted by user. All worker processes terminated.")
+            except Exception as e:
+                print(f"\nDistributed training failed: {e}")
 
     elif use_distributed==False:
         single_worker(config, args.config)

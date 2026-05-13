@@ -62,7 +62,6 @@ vae_latent_dim      32      # Global latent z dimension
 alpha_recon         1    # Reconstruction loss weight
 lambda_mmd          0.1    # MMD(q(z), N(0,I)) weight; matches aggregate posterior to prior
 '
-% Post-hoc GMM latent prior (fit after training; used at inference if present in checkpoint)
-fit_latent_gmm      True   # Fit GMM on posterior means after training
-gmm_components      10     # Number of Gaussian mixture components
-gmm_covariance_type full   # 'full' | 'diag' | 'tied' | 'spherical'
+% Mesh-conditioned latent prior
+use_conditional_prior       True
+prior_temperature           1.0

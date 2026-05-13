@@ -159,6 +159,8 @@ def build_model_config(config) -> dict:
         'message_passing_num': config.get('message_passing_num'),
         'use_node_types':    config.get('use_node_types', False),
         'num_node_types':    config.get('num_node_types', 0),
+        'positional_features': config.get('positional_features', 0),
+        'positional_encoding': config.get('positional_encoding', 'rwpe'),
         'use_world_edges':   config.get('use_world_edges', False),
         'use_checkpointing': config.get('use_checkpointing', False),
         'use_multiscale':    config.get('use_multiscale', False),
@@ -173,6 +175,11 @@ def build_model_config(config) -> dict:
         'vae_latent_dim':    config.get('vae_latent_dim', 32),
         'vae_mp_layers':     config.get('vae_mp_layers', 5),
         'beta_aux':          config.get('beta_aux', 1.0),
+        'use_conditional_prior': config.get('use_conditional_prior', False),
+        'prior_mixture_components': config.get('prior_mixture_components', 10),
+        'prior_hidden_dim':   config.get('prior_hidden_dim', config.get('latent_dim')),
+        'prior_mp_layers':    config.get('prior_mp_layers', 3),
+        'prior_min_std':      config.get('prior_min_std', 1e-3),
     }
 
 

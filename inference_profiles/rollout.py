@@ -182,12 +182,23 @@ def run_rollout(config, config_filename='config.txt'):
     positional_encoding = str(config.get('positional_encoding', 'rwpe')).lower().strip()
     use_vae = config.get('use_vae', False)
     vae_latent_dim = int(config.get('vae_latent_dim', 8))
+    use_conditional_prior = bool(config.get('use_conditional_prior', False))
+    prior_temperature = float(config.get('prior_temperature', 1.0))
 
     num_vae_samples = int(config.get('num_vae_samples', 1)) if use_vae else 1
 
-    # Load GMM prior if present in checkpoint (falls back to N(0,I) if absent)
+    conditional_prior = None
+    if use_vae and use_conditional_prior and 'conditional_prior_state_dict' in checkpoint:
+        from model.conditional_prior import ConditionalMixturePrior
+        prior_config = dict(config)
+        prior_config.update(checkpoint.get('conditional_prior_config', {}))
+        conditional_prior = ConditionalMixturePrior(prior_config).to(device)
+        conditional_prior.load_state_dict(checkpoint['conditional_prior_state_dict'])
+        conditional_prior.eval()
+
+    # Load legacy GMM prior if present in checkpoint (falls back to N(0,I) if absent)
     gmm_params = None
-    if use_vae:
+    if use_vae and conditional_prior is None:
         from model.latent_gmm import load_latent_gmm
         gmm_params = load_latent_gmm(checkpoint)
 
@@ -195,9 +206,15 @@ def run_rollout(config, config_filename='config.txt'):
     print(f"  Dataset: {dataset_dir}")
     print(f"  Rollout steps: {num_rollout_steps}")
     if use_vae:
-        sampler_desc = (f"GMM ({gmm_params['n_components']} components, "
-                        f"{gmm_params['covariance_type']} cov)"
-                        if gmm_params is not None else "N(0, I)")
+        if conditional_prior is not None:
+            sampler_desc = (
+                f"conditional mixture prior "
+                f"({conditional_prior.num_components} components, temp={prior_temperature:g})"
+            )
+        else:
+            sampler_desc = (f"legacy GMM ({gmm_params['n_components']} components, "
+                            f"{gmm_params['covariance_type']} cov)"
+                            if gmm_params is not None else "N(0, I)")
         print(f"  VAE sampling: {num_vae_samples} sample(s) per scene "
               f"(z_dim={vae_latent_dim}, prior={sampler_desc})")
 
@@ -315,7 +332,10 @@ def run_rollout(config, config_filename='config.txt'):
             # Sample a fixed z for this entire trajectory
             fixed_z = None
             if use_vae:
-                if gmm_params is not None:
+                if conditional_prior is not None:
+                    # Sample after the first graph is built so z is conditioned on this mesh.
+                    fixed_z = None
+                elif gmm_params is not None:
                     from model.latent_gmm import sample_from_gmm
                     fixed_z = sample_from_gmm(gmm_params, 1, device)
                 else:
@@ -395,6 +415,11 @@ def run_rollout(config, config_filename='config.txt'):
                             coarse_edge_means, coarse_edge_stds,
                             device=device,
                         )
+
+                    if use_vae and conditional_prior is not None and fixed_z is None:
+                        fixed_z = conditional_prior.sample(
+                            graph, temperature=prior_temperature
+                        ).to(device)
 
                     # --- i. Forward pass ---
                     predicted_delta_norm, _, _, _ = model(graph, fixed_z=fixed_z)  # [N, output_var]

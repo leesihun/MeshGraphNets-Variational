@@ -249,7 +249,11 @@ def single_worker(config, config_filename='config.txt'):
     except KeyboardInterrupt:
         print(f"\nTraining interrupted by user. Best model at epoch {best_epoch} with validation loss {best_valid_loss:.2e}")
 
-    # Post-hoc GMM fitting on VAE latent codes
+    if use_vae and config.get('train_conditional_prior', False):
+        from training_profiles.posthoc_prior import train_posthoc_prior
+        train_posthoc_prior(config, config_filename)
+
+    # Legacy post-hoc GMM fitting on VAE latent codes
     if use_vae and config.get('fit_latent_gmm', False):
         from model.latent_gmm import run_posthoc_gmm_fitting
         gmm_model = ema_model.module if ema_model is not None else model
