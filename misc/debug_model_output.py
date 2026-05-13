@@ -59,7 +59,7 @@ def debug_model():
 
     # Forward pass
     with torch.no_grad():
-        predicted, target = model(batch)
+        predicted, target, _, _ = model(batch)
 
     print(f"\nModel output statistics:")
     print(f"  pred mean: {predicted.mean().item():.6f}")
@@ -101,7 +101,7 @@ def debug_model():
 
     model.train()
     batch = next(iter(loader)).to(device)
-    predicted, target = model(batch)
+    predicted, target, _, _ = model(batch)
     loss = ((predicted - target) ** 2).mean()
     loss.backward()
 

@@ -140,6 +140,8 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
     total_grad_norm = 0.0
     total_mmd_sum = 0.0
     total_aux_sum = 0.0
+    total_kl_sum = 0.0
+    total_kl_raw_sum = 0.0
     mmd_count = 0
     num_batches = 0
     num_steps = 0  # number of optimizer steps taken
@@ -156,6 +158,8 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
     alpha_recon = float(config.get('alpha_recon', 1.0))
     lambda_mmd = float(config.get('lambda_mmd', 100.0))
     beta_aux = float(config.get('beta_aux', 1.0))
+    # Free-bits floor: when > 0, adds a per-dim KL collapse safeguard (coefficient implicit = 1.0)
+    free_bits = float(config.get('free_bits', 0.0))
 
     # Gradient accumulation: 0 = full epoch (1 step/epoch), 1 = per-batch (default), N = every N batches
     grad_accum_steps = config.get('grad_accum_steps', 1)
@@ -174,7 +178,10 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
         graph = _move_graph_to_device(graph, device, config)
 
         with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
-            predicted_acc, target_acc, mmd_loss_val, aux_loss_val = model(graph, debug=debug_internal)
+            predicted_acc, target_acc, vae_losses, aux_loss_val = model(graph, debug=debug_internal)
+            mmd_loss_val = vae_losses['mmd']
+            kl_loss_val = vae_losses['kl']
+            kl_raw_val = vae_losses['kl_raw']
 
             if batch_idx == 0 and verbose:
                 tqdm.tqdm.write(f"\n=== DEBUG Epoch {epoch} Batch 0 ===")
@@ -190,6 +197,8 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
             recon_loss, batch_loss_sum, batch_loss_count = _loss_from_errors(errors, loss_weights)
             if use_vae:
                 loss = alpha_recon * recon_loss + lambda_mmd * mmd_loss_val + beta_aux * aux_loss_val
+                if free_bits > 0.0:
+                    loss = loss + kl_loss_val
             else:
                 loss = recon_loss
             # Scale loss so accumulated gradients equal the mean within each accumulation window.
@@ -216,8 +225,12 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
         if use_vae:
             mmd_scalar = mmd_loss_val.item() if hasattr(mmd_loss_val, 'item') else float(mmd_loss_val)
             aux_scalar = aux_loss_val.item() if hasattr(aux_loss_val, 'item') else float(aux_loss_val)
+            kl_scalar = kl_loss_val.item() if hasattr(kl_loss_val, 'item') else float(kl_loss_val)
+            kl_raw_scalar = kl_raw_val.item() if hasattr(kl_raw_val, 'item') else float(kl_raw_val)
             total_mmd_sum += mmd_scalar
             total_aux_sum += aux_scalar
+            total_kl_sum += kl_scalar
+            total_kl_raw_sum += kl_raw_scalar
             mmd_count += 1
 
         # Step optimizer at end of accumulation window or final batch
@@ -261,6 +274,11 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
                 postfix['mmd'] = f'{mmd_val:.2e}'
                 postfix['aux'] = f'{aux_val:.2e}'
                 postfix['λ']   = f'{lambda_mmd:.1e}'
+                if free_bits > 0.0:
+                    kl_val = kl_loss_val.item() if hasattr(kl_loss_val, 'item') else float(kl_loss_val)
+                    kl_raw_v = kl_raw_val.item() if hasattr(kl_raw_val, 'item') else float(kl_raw_val)
+                    postfix['kl'] = f'{kl_val:.2e}'
+                    postfix['kl_raw'] = f'{kl_raw_v:.2e}'
                 postfix['total'] = f'{loss.item():.2e}'
             if monitor_gradients:
                 postfix['grad'] = f'{grad_norm.item():.2e}'
@@ -285,11 +303,14 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
     if use_vae and mmd_count > 0:
         result['mmd_mean'] = total_mmd_sum / mmd_count
         result['aux_mean'] = total_aux_sum / mmd_count
+        if free_bits > 0.0:
+            result['kl_mean'] = total_kl_sum / mmd_count
+            result['kl_raw_mean'] = total_kl_raw_sum / mmd_count
     return result
 
 def _eval_forward_errors(model, graph, use_amp, amp_dtype, use_posterior):
     with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
-        predicted, target, mmd_loss_val, _ = model(
+        predicted, target, vae_losses, _ = model(
             graph,
             add_noise=False,
             use_posterior=use_posterior,
@@ -297,6 +318,7 @@ def _eval_forward_errors(model, graph, use_amp, amp_dtype, use_posterior):
         errors = torch.nn.functional.huber_loss(
             predicted, target, reduction='none', delta=1.0
         )
+    mmd_loss_val = vae_losses['mmd'] if isinstance(vae_losses, dict) else vae_losses
     return errors, mmd_loss_val
 
 

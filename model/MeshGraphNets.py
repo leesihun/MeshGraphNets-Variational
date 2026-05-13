@@ -65,10 +65,10 @@ class MeshGraphNets(nn.Module):
                     graph.y = graph.y - noise_gamma * noise * ratio
                 graph.edge_attr = graph.edge_attr + torch.randn_like(graph.edge_attr) * noise_std
 
-        predicted, mmd, aux_loss = self.model(
+        predicted, vae_losses, aux_loss = self.model(
             graph, debug=debug, use_posterior=use_posterior, fixed_z=fixed_z,
         )
-        return predicted, graph.y, mmd, aux_loss
+        return predicted, graph.y, vae_losses, aux_loss
 
 
 class EncoderProcessorDecoder(nn.Module):
@@ -194,10 +194,18 @@ class EncoderProcessorDecoder(nn.Module):
     def _build_vae_components(self, config):
         self.vae_latent_dim = int(config.get('vae_latent_dim', 32))
         vae_mp_layers = int(config.get('vae_mp_layers', 5))
+        self.vae_graph_aware = bool(config.get('vae_graph_aware', False))
+        self.vae_free_bits = float(config.get('free_bits', 0.0))
         self.vae_encoder = GNNVariationalEncoder(
             self.node_output_size, self.edge_input_size,
-            self.latent_dim, self.vae_latent_dim, num_mp_layers=vae_mp_layers
+            self.latent_dim, self.vae_latent_dim, num_mp_layers=vae_mp_layers,
+            node_input_size=self.node_input_size,
+            graph_aware=self.vae_graph_aware,
         )
+        if self.vae_graph_aware:
+            print(f"  VAE encoder: graph-aware (x [N,{self.node_input_size}] fused with y [N,{self.node_output_size}])")
+        if self.vae_free_bits > 0:
+            print(f"  VAE free-bits floor: {self.vae_free_bits} nats/dim")
 
         if not self.use_multiscale:
             self.z_fusers = nn.ModuleList([
@@ -237,20 +245,27 @@ class EncoderProcessorDecoder(nn.Module):
     def _fuse_z(self, x, z_per_node, fuse_layer):
         return fuse_layer(torch.cat([x, z_per_node], dim=-1))
 
-    def _encode_vae(self, original_y, original_edge_index, original_edge_attr,
+    def _encode_vae(self, original_y, original_x, original_edge_index, original_edge_attr,
                     original_batch, N, device, dtype, use_posterior, fixed_z=None):
+        zero = torch.zeros((), device=device, dtype=torch.float32)
+        empty_losses = {'mmd': zero, 'kl': zero, 'kl_raw': zero}
         if fixed_z is not None:
-            return fixed_z.to(device=device, dtype=dtype), torch.zeros((), device=device, dtype=torch.float32)
+            return fixed_z.to(device=device, dtype=dtype), empty_losses
         if use_posterior and original_y is not None:
             batch = (original_batch if original_batch is not None
                      else torch.zeros(N, dtype=torch.long, device=device))
-            z, _mu, _logvar = self.vae_encoder(original_y, original_edge_index, original_edge_attr, batch)
+            z, mu, logvar = self.vae_encoder(
+                original_y, original_edge_index, original_edge_attr, batch,
+                x=(original_x if self.vae_graph_aware else None),
+            )
             mmd = GNNVariationalEncoder.mmd_loss(z.float())
-        else:
-            B = int(original_batch.max().item()) + 1 if original_batch is not None else 1
-            z = torch.randn(B, self.vae_latent_dim, device=device, dtype=dtype)
-            mmd = torch.zeros((), device=device, dtype=torch.float32)
-        return z, mmd
+            kl_clamped, kl_raw = GNNVariationalEncoder.kl_loss(
+                mu.float(), logvar.float(), free_bits=self.vae_free_bits,
+            )
+            return z, {'mmd': mmd, 'kl': kl_clamped, 'kl_raw': kl_raw}
+        B = int(original_batch.max().item()) + 1 if original_batch is not None else 1
+        z = torch.randn(B, self.vae_latent_dim, device=device, dtype=dtype)
+        return z, empty_losses
 
     def _aux_loss(self, z, original_y, original_batch, N, device):
         batch = (original_batch if original_batch is not None
@@ -274,6 +289,7 @@ class EncoderProcessorDecoder(nn.Module):
 
     def _forward_flat(self, graph, debug, use_posterior, fixed_z):
         original_y = getattr(graph, 'y', None)
+        original_x = graph.x
         original_batch = getattr(graph, 'batch', None)
         original_edge_attr = graph.edge_attr
         original_edge_index = graph.edge_index
@@ -282,7 +298,11 @@ class EncoderProcessorDecoder(nn.Module):
         if debug:
             print(f"  After Encoder: x std={graph.x.std().item():.4f}, mean={graph.x.mean().item():.4f}")
 
-        mmd = torch.zeros((), device=graph.x.device, dtype=torch.float32)
+        vae_losses = {
+            'mmd': torch.zeros((), device=graph.x.device, dtype=torch.float32),
+            'kl': torch.zeros((), device=graph.x.device, dtype=torch.float32),
+            'kl_raw': torch.zeros((), device=graph.x.device, dtype=torch.float32),
+        }
         aux_loss = 0.0
         z_per_node = None
         if self.use_vae:
@@ -291,8 +311,8 @@ class EncoderProcessorDecoder(nn.Module):
             dtype = graph.x.dtype
             batch_bc = (original_batch if original_batch is not None
                         else torch.zeros(N, dtype=torch.long, device=device))
-            z, mmd = self._encode_vae(
-                original_y, original_edge_index, original_edge_attr,
+            z, vae_losses = self._encode_vae(
+                original_y, original_x, original_edge_index, original_edge_attr,
                 original_batch, N, device, dtype, use_posterior, fixed_z=fixed_z
             )
             z_per_node = z[batch_bc]
@@ -316,12 +336,13 @@ class EncoderProcessorDecoder(nn.Module):
         output = self.decoder(graph)
         if debug:
             print(f"  After Decoder: out std={output.std().item():.4f}, mean={output.mean().item():.4f}")
-        return output, mmd, aux_loss
+        return output, vae_losses, aux_loss
 
     def _forward_multiscale(self, graph, debug, use_posterior, fixed_z):
         L = self.multiscale_levels
 
         original_y = getattr(graph, 'y', None)
+        original_x = graph.x
         original_batch = getattr(graph, 'batch', None)
         original_edge_attr = graph.edge_attr
         original_edge_index = graph.edge_index
@@ -333,7 +354,11 @@ class EncoderProcessorDecoder(nn.Module):
         if debug:
             print(f"  [MS] After Encoder: x std={graph.x.std().item():.4f}")
 
-        mmd = torch.zeros((), device=graph.x.device, dtype=torch.float32)
+        vae_losses = {
+            'mmd': torch.zeros((), device=graph.x.device, dtype=torch.float32),
+            'kl': torch.zeros((), device=graph.x.device, dtype=torch.float32),
+            'kl_raw': torch.zeros((), device=graph.x.device, dtype=torch.float32),
+        }
         aux_loss = 0.0
         z = None
         current_z_per_node = None
@@ -344,8 +369,8 @@ class EncoderProcessorDecoder(nn.Module):
             dtype = graph.x.dtype
             batch_bc = (original_batch if original_batch is not None
                         else torch.zeros(N, dtype=torch.long, device=device))
-            z, mmd = self._encode_vae(
-                original_y, original_edge_index, original_edge_attr,
+            z, vae_losses = self._encode_vae(
+                original_y, original_x, original_edge_index, original_edge_attr,
                 original_batch, N, device, dtype, use_posterior, fixed_z=fixed_z
             )
             current_z_per_node = z[batch_bc]
@@ -427,7 +452,7 @@ class EncoderProcessorDecoder(nn.Module):
         output = self.decoder(current_graph)
         if debug:
             print(f"  [MS] After Decoder: out std={output.std().item():.4f}")
-        return output, mmd, aux_loss
+        return output, vae_losses, aux_loss
 
     def _extract_level_data(self, graph, L):
         """Extract per-level coarsening topology from graph before encoder drops custom attrs."""

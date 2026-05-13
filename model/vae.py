@@ -13,20 +13,37 @@ class GNNVariationalEncoder(nn.Module):
     Runs message passing on the mesh graph before pooling, so z captures spatially
     correlated patterns in the deformation field rather than just per-node averages.
 
-    Architecture:
+    Architecture (graph_aware=False, default — backward compatible):
         y [N, output_var]  → node_encoder MLP  → [N, latent_dim]
         edge_attr [E, 8]   → edge_encoder MLP  → [E, latent_dim]
         → num_mp_layers GnBlocks (message passing on mesh topology)
         → GlobalAttention pool → [B, latent_dim]
         → mu_head, logvar_head → z [B, vae_latent_dim]
 
+    Architecture (graph_aware=True):
+        y [N, output_var]  → node_encoder MLP        → h_y [N, latent_dim]
+        x [N, node_input]  → node_input_encoder MLP  → h_x [N, latent_dim]
+        cat(h_y, h_x)      → node_fuse MLP           → h   [N, latent_dim]
+        ... (same MP, pool, heads as above)
+    With graph awareness, z is incentivized to encode only the y-residual that
+    the input graph does not already explain — keeping z mesh-type-orthogonal.
+
     Note: mu/logvar heads are retained for reparameterization; the training
     regularizer is MMD between the sampled z and N(0,I), NOT per-sample KL.
+    Free-bits KL (via the kl_loss static method) is available as an opt-in
+    collapse safeguard with zero gradient on healthy posteriors.
     """
 
-    def __init__(self, node_output_size, edge_input_size, latent_dim, vae_latent_dim, num_mp_layers=2):
+    def __init__(self, node_output_size, edge_input_size, latent_dim, vae_latent_dim,
+                 num_mp_layers=2, node_input_size=None, graph_aware=False):
         super().__init__()
+        self.graph_aware = bool(graph_aware)
         self.node_encoder = build_mlp(node_output_size, latent_dim, latent_dim)
+        if self.graph_aware:
+            if node_input_size is None:
+                raise ValueError("graph_aware=True requires node_input_size")
+            self.node_input_encoder = build_mlp(node_input_size, latent_dim, latent_dim)
+            self.node_fuse = build_mlp(2 * latent_dim, latent_dim, latent_dim)
         self.edge_encoder = build_mlp(edge_input_size, latent_dim, latent_dim)
         minimal_config = {'residual_scale': 1.0, 'use_pairnorm': False}
         self.mp_layers = nn.ModuleList([
@@ -37,19 +54,28 @@ class GNNVariationalEncoder(nn.Module):
         self.mu_head = nn.Linear(latent_dim, vae_latent_dim)
         self.logvar_head = nn.Linear(latent_dim, vae_latent_dim)
 
-    def forward(self, y, edge_index, edge_attr, batch):
+    def forward(self, y, edge_index, edge_attr, batch, x=None):
         """
         Args:
             y:          [N, node_output_size] per-node target delta
             edge_index: [2, E] mesh edge connectivity
             edge_attr:  [E, 8] raw edge features
             batch:      [N] PyG batch assignment index
+            x:          [N, node_input_size] per-node input features.
+                        Required when graph_aware=True; ignored otherwise.
         Returns:
             z:      [B, vae_latent_dim] reparameterized latent
             mu:     [B, vae_latent_dim]
             logvar: [B, vae_latent_dim]
         """
-        h = self.node_encoder(y)
+        h_y = self.node_encoder(y)
+        if self.graph_aware:
+            if x is None:
+                raise ValueError("graph_aware=True but x is None")
+            h_x = self.node_input_encoder(x)
+            h = self.node_fuse(torch.cat([h_y, h_x], dim=-1))
+        else:
+            h = h_y
         e = self.edge_encoder(edge_attr)
         g = Data(x=h, edge_attr=e, edge_index=edge_index)
         for mp in self.mp_layers:
@@ -60,6 +86,40 @@ class GNNVariationalEncoder(nn.Module):
         std = torch.exp(0.5 * logvar)
         z = mu + std * torch.randn_like(std)
         return z, mu, logvar
+
+    @staticmethod
+    def kl_loss(mu, logvar, free_bits=0.0):
+        """Per-sample, per-dim KL[q(z|y) || N(0,I)] with optional free-bits floor.
+
+        kl_per_dim = 0.5 * (mu**2 + exp(logvar) - 1 - logvar)  shape [B, D]
+
+        With free_bits = 0: returns (zero, zero). No KL contribution to loss.
+        With free_bits > 0: clamps each (sample, dim) entry to a floor before
+        summing over D and averaging over B. The clamp is per-(sample, dim) —
+        NOT after batch reduction — so a single highly-active sample cannot
+        mask the collapse of other samples (e.g. minority mesh types).
+
+        Why this is safe (no KL-disaster recurrence):
+            For a healthy posterior μ≈0, σ≈1: kl_per_dim ≈ 0 → clamped to
+            free_bits (a constant) → gradient w.r.t. mu/logvar is exactly 0.
+            The floor activates only when something tries to collapse.
+
+        Args:
+            mu:        [B, D] posterior mean
+            logvar:    [B, D] posterior log-variance
+            free_bits: per-dim floor in nats. 0.0 disables.
+        Returns:
+            (kl_clamped, kl_raw): both scalar tensors.
+            kl_clamped is what gets added to loss (if free_bits > 0).
+            kl_raw is the un-clamped KL for diagnostics.
+        """
+        if free_bits <= 0.0:
+            zero = mu.new_zeros(())
+            return zero, zero
+        kl_per_dim = 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar)
+        kl_raw = kl_per_dim.sum(dim=-1).mean()
+        kl_clamped = torch.clamp(kl_per_dim, min=free_bits).sum(dim=-1).mean()
+        return kl_clamped, kl_raw
 
     @staticmethod
     def mmd_loss(z_posterior, kernel_sigmas=(0.5, 1.0, 2.0, 4.0, 8.0)):
