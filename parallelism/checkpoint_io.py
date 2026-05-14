@@ -87,34 +87,67 @@ def slice_state_dict_for_stage(
 ) -> Dict[str, torch.Tensor]:
     """Extract the subset of keys from `full_sd` that belong to stage `stage_idx`.
 
-    Stage 0 owns: encoder + VAE side-encoder (if present) + aux_decoder + its assigned blocks.
+    Stage 0 owns: encoder + vae_encoder + aux_decoder + its assigned blocks.
     Last stage owns: decoder + its assigned blocks.
-    Middle stages own: only their assigned blocks.
-    Per-level extras (skip_projs, coarse_eb_encoders, unpool_blocks) are colocated
-    with the stage that holds the corresponding pool/unpool boundary; for the
-    MVP we put them all on stage 0 since they are small.
+    All stages own: z_fusers / ms_z_fusers for their assigned blocks.
+    Multiscale pool/unpool modules (coarse_eb_encoders, skip_projs, unpool_blocks)
+    are co-located with the stage that owns the corresponding boundary block.
     """
     stage_blocks = list(assignment[stage_idx])
 
-    # Build the prefix allow-list for this stage.
     allowed_prefixes: List[str] = []
+
+    # Processor block prefixes (flat and multiscale)
     for b in stage_blocks:
         allowed_prefixes.extend(_processor_key_prefix(b, is_multiscale, multiscale_meta))
 
+    # VAE fusers — every stage owns fusers for its assigned blocks
+    for b in stage_blocks:
+        if not is_multiscale:
+            allowed_prefixes.append(f'model.z_fusers.{b}.')
+        else:
+            if multiscale_meta is None:
+                allowed_prefixes.append(f'model.z_fusers.{b}.')
+            else:
+                L = int(multiscale_meta['L'])
+                mp = [int(x) for x in multiscale_meta['mp_per_level']]
+                prefixes = _processor_key_prefix(b, True, multiscale_meta)
+                for px in prefixes:
+                    # Derive the fuser key from the block key by replacing the module name
+                    # e.g. model.pre_blocks.0.2.  → model.ms_z_fusers_pre.0.2.
+                    if 'pre_blocks' in px:
+                        allowed_prefixes.append(px.replace('model.pre_blocks.', 'model.ms_z_fusers_pre.'))
+                    elif 'coarsest_blocks' in px:
+                        allowed_prefixes.append(px.replace('model.coarsest_blocks.', 'model.ms_z_fusers_coarsest.'))
+                    elif 'post_blocks' in px:
+                        allowed_prefixes.append(px.replace('model.post_blocks.', 'model.ms_z_fusers_post.'))
+
+    # Multiscale pool/unpool modules — owned by stage that has the corresponding boundary block
+    if is_multiscale and multiscale_meta is not None:
+        L = int(multiscale_meta['L'])
+        mp = [int(x) for x in multiscale_meta['mp_per_level']]
+        # coarse_eb_encoders[level] — owned by stage that has the last pre[level] block
+        # skip_projs[level] / unpool_blocks[level] — owned by stage that has the first post[level] block
+        cumulative_pre = 0
+        for level in range(L):
+            last_pre_b = cumulative_pre + mp[level] - 1
+            if last_pre_b in stage_blocks:
+                allowed_prefixes.append(f'model.coarse_eb_encoders.{level}.')
+            cumulative_pre += mp[level]
+        # Post blocks in reverse order: post[L-1], post[L-2], ..., post[0]
+        cumulative_post = sum(mp[:L + 1])  # skip pre + coarsest
+        for rev_i, level in enumerate(range(L - 1, -1, -1)):
+            first_post_b = cumulative_post
+            if first_post_b in stage_blocks:
+                allowed_prefixes.append(f'model.skip_projs.{level}.')
+                allowed_prefixes.append(f'model.unpool_blocks.{level}.')
+            cumulative_post += mp[2 * L - level]
+
     is_first = (stage_idx == 0)
-    is_last = (stage_idx == num_stages - 1)
+    is_last  = (stage_idx == num_stages - 1)
     if is_first:
         allowed_prefixes.extend(_ENCODER_PREFIXES)
-        # VAE side-encoder, aux_decoder, z_fusers (flat), etc.
-        allowed_prefixes.extend([
-            'model.vae_encoder.',
-            'model.aux_decoder.',
-            'model.z_fusers.',
-            # Multiscale shared extras — co-located with stage 0 for the MVP.
-            'model.coarse_eb_encoders.',
-            'model.skip_projs.',
-            'model.unpool_blocks.',
-        ])
+        allowed_prefixes.extend(['model.vae_encoder.', 'model.aux_decoder.'])
     if is_last:
         allowed_prefixes.extend(_DECODER_PREFIXES)
 
