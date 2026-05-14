@@ -1,8 +1,8 @@
 model   MeshGraphNets
 mode    train  # Train / Inference
-gpu_ids 0    # -1 for CPU, GPU ids for multi-GPU training (DDP with both H200s)
-log_file_dir    ex1/train1.log
-modelpath   ./outputs/ex1/model1.pth
+gpu_ids 1    # -1 for CPU, GPU ids for multi-GPU training (DDP with both H200s)
+log_file_dir    ex1/train2.log
+modelpath   ./outputs/ex1/model2.pth
 %   Datasets
 dataset_dir ./dataset/ex1copy.h5
 infer_dataset   ./dataset/b8_main_sec_dataset_infer.h5
@@ -51,7 +51,7 @@ plot_feature_idx    -1  # Feature index to visualize in plots (-1 = last feature
 use_multiscale      True
 % Multi-BFS + Voronoi
 coarsening_type     voronoi
-voronoi_clusters    5000
+voronoi_clusters    10000
 multiscale_levels   1
 mp_per_level        2, 10, 8
 bipartite_unpool    True    # Learned bipartite MP unpool (False = broadcast)

@@ -1,8 +1,8 @@
 model   MeshGraphNets
 mode    train  # Train / Inference
-gpu_ids 0    # -1 for CPU, GPU ids for multi-GPU training (DDP with both H200s)
-log_file_dir    ex1/train1.log
-modelpath   ./outputs/ex1/model1.pth
+gpu_ids 3    # -1 for CPU, GPU ids for multi-GPU training (DDP with both H200s)
+log_file_dir    ex1/train4.log
+modelpath   ./outputs/ex1/model4.pth
 %   Datasets
 dataset_dir ./dataset/ex1copy.h5
 infer_dataset   ./dataset/b8_main_sec_dataset_infer.h5
@@ -48,10 +48,10 @@ test_batch_idx  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 33, 34
 plot_feature_idx    -1  # Feature index to visualize in plots (-1 = last feature, i.e., stress)
 '
 % Multi-Scale / Hierarchical Parameters (BFS Bi-Stride, ICML 2023)
-use_multiscale      True
+use_multiscale      False
 % Multi-BFS + Voronoi
 coarsening_type     voronoi
-voronoi_clusters    5000
+voronoi_clusters    10000
 multiscale_levels   1
 mp_per_level        2, 10, 8
 bipartite_unpool    True    # Learned bipartite MP unpool (False = broadcast)

@@ -1,8 +1,8 @@
 model   MeshGraphNets
 mode    train  # Train / Inference
-gpu_ids 0    # -1 for CPU, GPU ids for multi-GPU training (DDP with both H200s)
-log_file_dir    ex1/train1.log
-modelpath   ./outputs/ex1/model1.pth
+gpu_ids 2    # -1 for CPU, GPU ids for multi-GPU training (DDP with both H200s)
+log_file_dir    ex1/train3.log
+modelpath   ./outputs/ex1/model3.pth
 %   Datasets
 dataset_dir ./dataset/ex1copy.h5
 infer_dataset   ./dataset/b8_main_sec_dataset_infer.h5
@@ -20,7 +20,7 @@ message_passing_num 15
 Training_epochs	5000
 Batch_size	1
 LearningR	0.0001  # Scaled by sqrt(8/1) from 0.0001 for larger batch size
-Latent_dim	128	# MeshGraphNets latent dimension
+Latent_dim	256	# MeshGraphNets latent dimension
 num_workers 2
 std_noise   0.0
 residual_scale  1  # Scale factor for residual connections (1.0 = full residual, matches NVIDIA/DeepMind)

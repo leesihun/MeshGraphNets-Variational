@@ -59,10 +59,16 @@ def main():
     world_size = len(gpu_ids)
     use_distributed = world_size > 1
 
+    # parallel_mode: 'ddp' (default; existing data-parallel) or 'model_split' (new pipeline).
+    parallel_mode = str(config.get('parallel_mode', 'ddp')).lower().strip()
+    if parallel_mode not in ('ddp', 'model_split'):
+        raise ValueError(f"parallel_mode must be 'ddp' or 'model_split', got '{parallel_mode}'")
+
     print(f"GPU Configuration:")
     print(f"  gpu_ids: {gpu_ids}")
     print(f"  world_size (auto-calculated): {world_size}")
     print(f"  use_distributed (auto-calculated): {use_distributed}")
+    print(f"  parallel_mode: {parallel_mode}")
     print('\n'*2)
 
     # Display the current absolute path
@@ -98,6 +104,10 @@ def main():
                 print("\nTraining interrupted by user. All worker processes terminated.")
             except Exception as e:
                 print(f"\nDistributed training failed: {e}")
+
+    elif parallel_mode == 'model_split':
+        from parallelism.launcher import launch_model_split
+        launch_model_split(config, args.config)
 
     elif use_distributed==False:
         single_worker(config, args.config)
