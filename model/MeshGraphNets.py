@@ -84,6 +84,11 @@ class EncoderProcessorDecoder(nn.Module):
         self.use_checkpointing = config.get('use_checkpointing', False)
         self.use_world_edges = config.get('use_world_edges', False)
         self.use_multiscale = config.get('use_multiscale', False)
+        self.use_coarse_world_edges = (
+            bool(config.get('coarse_world_edges', False))
+            and self.use_world_edges
+            and self.use_multiscale
+        )
 
         # Compute actual node input size (physical + positional + optional node types)
         base_input_size = config['input_var']
@@ -162,8 +167,8 @@ class EncoderProcessorDecoder(nn.Module):
         for i in range(L):
             pre_count = mp_per_level[i]
             post_count = mp_per_level[2 * L - i]
-            use_we = self.use_world_edges if i == 0 else False
-            cfg = config if i == 0 else coarse_config
+            use_we = self.use_world_edges if (i == 0 or self.use_coarse_world_edges) else False
+            cfg = config if use_we else coarse_config
 
             self.pre_blocks.append(nn.ModuleList([
                 GnBlock(cfg, self.latent_dim, use_world_edges=use_we)
@@ -186,8 +191,9 @@ class EncoderProcessorDecoder(nn.Module):
             ])
 
         coarsest_count = mp_per_level[L]
+        coarsest_cfg = config if self.use_coarse_world_edges else coarse_config
         self.coarsest_blocks = nn.ModuleList([
-            GnBlock(coarse_config, self.latent_dim, use_world_edges=False)
+            GnBlock(coarsest_cfg, self.latent_dim, use_world_edges=self.use_coarse_world_edges)
             for _ in range(coarsest_count)
         ])
 
@@ -390,12 +396,13 @@ class EncoderProcessorDecoder(nn.Module):
             if debug:
                 print(f"  [MS] After pre[{i}] ({len(self.pre_blocks[i])} blocks): x std={current_graph.x.std().item():.4f}")
 
+            use_we_here = self.use_world_edges and (i == 0 or self.use_coarse_world_edges)
             skip_states.append({
                 'x': current_graph.x,
                 'edge_attr': current_graph.edge_attr,
                 'edge_index': current_graph.edge_index,
-                'w_attr': getattr(current_graph, 'world_edge_attr', None) if i == 0 and self.use_world_edges else None,
-                'w_idx': getattr(current_graph, 'world_edge_index', None) if i == 0 and self.use_world_edges else None,
+                'w_attr': getattr(current_graph, 'world_edge_attr', None) if use_we_here else None,
+                'w_idx': getattr(current_graph, 'world_edge_index', None) if use_we_here else None,
                 'z_per_node': current_z_per_node,
             })
 
@@ -403,6 +410,9 @@ class EncoderProcessorDecoder(nn.Module):
             h_coarse = pool_features(current_graph.x, ld['ftc'], ld['n_c'])
             e_coarse = self.coarse_eb_encoders[i](ld['c_ea'])
             current_graph = Data(x=h_coarse, edge_attr=e_coarse, edge_index=ld['c_ei'])
+            if self.use_coarse_world_edges and ld['c_we_idx'] is not None and ld['c_we_idx'].shape[1] > 0:
+                current_graph.world_edge_attr  = ld['c_we_attr']
+                current_graph.world_edge_index = ld['c_we_idx']
 
             if self.use_vae and z is not None:
                 current_batch = scatter(current_batch, ld['ftc'], dim=0, dim_size=ld['n_c'], reduce='min')
@@ -437,8 +447,9 @@ class EncoderProcessorDecoder(nn.Module):
             skip = skip_states[i]
             h_merged = self.skip_projs[i](torch.cat([skip['x'], h_up], dim=-1))
             current_graph = Data(x=h_merged, edge_attr=skip['edge_attr'], edge_index=skip['edge_index'])
-            if i == 0 and self.use_world_edges and skip['w_attr'] is not None:
-                current_graph.world_edge_attr = skip['w_attr']
+            use_we_here = self.use_world_edges and (i == 0 or self.use_coarse_world_edges)
+            if use_we_here and skip['w_attr'] is not None:
+                current_graph.world_edge_attr  = skip['w_attr']
                 current_graph.world_edge_index = skip['w_idx']
 
             level_z_per_node = skip_states[i].get('z_per_node') if self.use_vae else None
@@ -466,6 +477,8 @@ class EncoderProcessorDecoder(nn.Module):
                 'c_ei': graph[f'coarse_edge_index_{i}'],
                 'c_ea': graph[f'coarse_edge_attr_{i}'],
                 'n_c': int(graph[f'num_coarse_{i}'].sum()),
+                'c_we_idx': getattr(graph, f'coarse_world_edge_index_{i}', None),
+                'c_we_attr': getattr(graph, f'coarse_world_edge_attr_{i}', None),
             }
             if self.use_multiscale and getattr(self, 'bipartite_unpool', False):
                 ld['up_ei'] = graph[f'unpool_edge_index_{i}']

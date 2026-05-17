@@ -1,613 +1,195 @@
-# Multiscale Hierarchical Coarsening in MeshGraphNets
+# Multiscale Coarsening And V-Cycle
 
-This document describes the two graph coarsening algorithms used to build hierarchical,
-multi-resolution GNN representations of FEA meshes: **BFS Bi-Stride** and **FPS-Voronoi**.
-Both are implemented in [`model/coarsening.py`](../model/coarsening.py) and integrate
-into the V-cycle processor inside [`model/MeshGraphNets.py`](../model/MeshGraphNets.py).
+This document describes the current multiscale path implemented by:
 
----
+- `model/coarsening.py`
+- `general_modules/multiscale_helpers.py`
+- `general_modules/mesh_dataset.py`
+- `model/MeshGraphNets.py`
 
-## Table of Contents
+The multiscale implementation is optional and controlled by `use_multiscale`.
+When enabled, the model replaces the flat processor with a V-cycle over one or
+more coarsened graph levels.
 
-1. [Why Coarsening?](#1-why-coarsening)
-2. [Shared Output Contract](#2-shared-output-contract)
-3. [BFS Bi-Stride Coarsening](#3-bfs-bi-stride-coarsening)
-4. [FPS-Voronoi Coarsening](#4-fps-voronoi-coarsening)
-5. [Shared Infrastructure](#5-shared-infrastructure)
-6. [V-Cycle Architecture](#6-v-cycle-architecture)
-7. [Data Loading and Batching](#7-data-loading-and-batching)
-8. [Configuration Reference](#8-configuration-reference)
-9. [Comparison and When to Use Each](#9-comparison-and-when-to-use-each)
+## Configuration
 
----
+| Key | Meaning |
+| --- | --- |
+| `use_multiscale` | Enables multiscale graph data and the V-cycle processor. |
+| `multiscale_levels` | Number of coarse levels. |
+| `coarsening_type` | `bfs`, `voronoi`, or a comma list with one method per level. |
+| `voronoi_clusters` | Cluster count for Voronoi levels; scalar or comma list. |
+| `mp_per_level` | Processor block counts. Must have `2 * multiscale_levels + 1` entries. |
+| `bipartite_unpool` | Enables learned coarse-to-fine unpooling. |
+| `coarse_cache_per_worker` | Limits each worker's hierarchy cache. |
 
-## 1. Why Coarsening?
+For `multiscale_levels = L`, `mp_per_level` is interpreted as:
 
-Standard GNNs propagate information one hop per layer. On a fine FEA mesh with
-20,000+ nodes, reaching a node 100 edges away requires 100 message-passing layers —
-far too expensive and prone to over-smoothing.
-
-Hierarchical coarsening solves this by building a multi-resolution graph pyramid.
-The network processes coarse levels with many fewer nodes, then unpools back to
-full resolution, merging global structure with local detail. This is the graph
-analogue of multigrid solvers in numerical PDE methods.
-
-**Reduction rates:**
-| Method   | Typical ratio per level | Controllable? |
-|----------|------------------------|---------------|
-| BFS Bi-Stride | ~4x (triangular mesh) | No (topology-driven) |
-| FPS-Voronoi   | Any (e.g. 100x)       | Yes (`num_clusters`) |
-
----
-
-## 2. Shared Output Contract
-
-Both methods return the same three-tuple:
-
-```
-(fine_to_coarse [N], coarse_edge_index [2, E_c], num_coarse int)
+```text
+[pre_0, pre_1, ..., pre_(L-1), coarsest, post_(L-1), ..., post_1, post_0]
 ```
 
-| Output | Shape | Description |
-|--------|-------|-------------|
-| `fine_to_coarse` | `[N] int32` | Cluster index in `[0, M-1]` for each fine node |
-| `coarse_edge_index` | `[2, E_c] int64` | Bidirectional edges between coarse nodes |
-| `num_coarse` | `int M` | Total number of coarse nodes |
+If `mp_per_level` is omitted, the one-level fallback is:
 
-Coarse edge construction is **always boundary-based**: two coarse nodes are connected
-iff at least one fine node in cluster A is a neighbor of some fine node in cluster B
-in the original fine mesh. This preserves the topological connectivity structure
-regardless of coarsening method.
-
----
-
-## 3. BFS Bi-Stride Coarsening
-
-### 3.1 Concept
-
-BFS Bi-Stride (Cao et al., ICML 2023, "Efficient Graph Neural Network Inference at
-Large Scale") coarsens by BFS depth parity. Even-depth nodes become the coarse graph;
-odd-depth nodes are mapped to their BFS parent (always even).
-
-On a regular triangular mesh, even-depth nodes form an approximately uniform
-sub-sampling with roughly 1/4 the original count. The name "bi-stride" refers to the
-fact that the coarse graph corresponds to every other BFS frontier.
-
-### 3.2 Algorithm Step by Step
-
-**Step 1 — Build CSR adjacency matrix**
-
-```
-edge_index_np [2, E]  →  CSR adjacency A [N, N]
+```text
+[fine_mp_pre, coarse_mp_num, fine_mp_post]
 ```
 
-The fine mesh edge list is converted to a scipy `csr_matrix` using vectorized
-`np.ones` weights. This C-level representation is required for scipy's fast BFS.
+When multiscale is enabled, `message_passing_num` is ignored by the processor.
 
-**Step 2 — Detect connected components**
+## Coarsening Output Contract
 
-```
-n_comp, comp_labels = connected_components(A, directed=False)
-```
+Both coarsening algorithms return:
 
-FEA assemblies often have multiple disconnected parts (e.g., PCB + chip + steel
-plate). The algorithm handles each component independently to avoid false BFS
-depth assignments across isolated regions.
-
-**Step 3 — Multi-source BFS, one component at a time**
-
-For each connected component:
-1. Pick the component's first node as the seed.
-2. Run `scipy.sparse.csgraph.breadth_first_order` from that seed — this is a
-   C-level BFS that returns both the visit order and the predecessor array.
-3. Assign depths from predecessors: `depth[node] = depth[predecessor[node]] + 1`.
-
-After all components are processed, every node has a depth ≥ 0.
-
-```
-depth[seed_i] = 0
-depth[node]   = depth[predecessor[node]] + 1   ∀ node ≠ seed
+```text
+fine_to_coarse:    [N] cluster id for each fine node
+coarse_edge_index: [2, E_c] directed coarse graph edges
+num_coarse:        number of coarse nodes
 ```
 
-**Step 4 — Partition by depth parity**
+`build_multiscale_hierarchy` extends that base contract with data needed by the
+model and DataLoader, including:
 
-```
-coarse_mask  = (depth % 2 == 0)   →  True for coarse nodes
-fine_only    = (depth % 2 == 1)   →  True for fine-only nodes
-```
+- coarse edge attributes computed with the same 8-D edge layout as mesh edges
+- coarse centroids for each level
+- optional bipartite unpool edges from coarse nodes to fine nodes
 
-Coarse nodes are assigned contiguous indices `0 … M-1`.
+The dataset attaches these tensors as `fine_to_coarse_i`,
+`coarse_edge_index_i`, `coarse_edge_attr_i`, `num_coarse_i`, and, when
+`bipartite_unpool True`, `unpool_edge_index_i` and `coarse_centroid_i`.
 
-**Step 5 — Build `fine_to_coarse` mapping**
+## BFS Bi-Stride
 
-```
-fine_to_coarse[i] = coarse_idx_of[i]            if depth[i] is even
-fine_to_coarse[i] = coarse_idx_of[parent[i]]    if depth[i] is odd
-```
+`bfs_bistride_coarsen` performs topology-driven coarsening:
 
-Every fine-only (odd) node maps to its BFS parent, which is always even-depth
-(proven by BFS tree structure: parent of an odd-depth node is at depth−1, which
-is even).
+1. Build adjacency from the current level's graph.
+2. Traverse connected components with BFS.
+3. Select even-depth nodes as coarse representatives.
+4. Map odd-depth nodes to nearby selected representatives.
+5. Build coarse edges from boundary crossings between fine clusters.
 
-**Step 6 — Build coarse edges** (shared with Voronoi; see Section 5.1)
+This method needs only graph topology. The reduction ratio depends on mesh
+structure and is not controlled by a requested cluster count.
 
-### 3.3 Illustrative Example
+Use it when topology-preserving, deterministic coarsening is more important than
+controlling the exact coarse node count.
 
-```
-Fine graph:    0 — 1 — 2 — 3 — 4 — 5
-BFS depth:     0   1   2   3   4   5
-Parity:        C   F   C   F   C   F
-Coarse nodes:  0       1       2
-fine_to_coarse:[0, 0,  1, 1,   2, 2]
-Coarse edges:  0—1, 1—2
-```
+## FPS-Voronoi
 
-In 2D triangular meshes the pattern is more complex, but the principle is identical:
-even-parity BFS nodes form the coarse graph, with ~4x reduction per level.
+`fps_voronoi_coarsen` performs geometry-driven coarsening:
 
-### 3.4 Properties
+1. Select `num_clusters` seed nodes using farthest point sampling over positions.
+2. Assign every fine node to the nearest seed.
+3. Build coarse edges from boundary crossings between clusters.
 
-| Property | Value |
-|----------|-------|
-| Reduction per level | ~4x (triangular mesh), ~2x (path/chain) |
-| Deterministic? | Yes (given fixed seed selection — first node per component) |
-| Handles disconnected graphs? | Yes — per-component BFS with independent seeding |
-| Topology-aware? | Yes — never creates cross-boundary false edges |
-| Requires node positions? | No — purely topological |
-| Computational complexity | O(N + E) — C-level BFS via scipy |
+This method requires reference positions. It gives direct control over the
+coarse graph size through `voronoi_clusters`.
 
-### 3.5 Code Location
+Use it when the model must fit a fixed or aggressive coarse resolution, for
+example the `_b8_all_warpage_input` configs with `voronoi_clusters 200`.
 
-```python
-# model/coarsening.py
-def bfs_bistride_coarsen(edge_index_np, num_nodes):
-    ...
+## Iterative Hierarchy
+
+For multiple levels, coarsening is iterative:
+
+```text
+fine graph -> level 0 coarse graph -> level 1 coarse graph -> ...
 ```
 
----
+Each level's `fine_to_coarse_i` maps from that level's fine nodes to that
+level's coarse nodes. At level 0 the fine nodes are original mesh nodes; at
+later levels the fine nodes are the previous level's coarse nodes.
 
-## 4. FPS-Voronoi Coarsening
+The model stops at the number of levels whose tensors are actually present on
+the graph. This lets the forward path tolerate samples where fewer levels were
+attached than requested, although the normal training path builds all requested
+levels.
 
-### 4.1 Concept
+## Data Loading And Caching
 
-FPS-Voronoi is a two-stage algorithm:
+`MeshGraphDataset.prepare_preprocessing()` computes normalization statistics on
+the train split. When multiscale is enabled, it also computes coarse-edge
+normalization statistics for each level.
 
-1. **Farthest Point Sampling (FPS)** selects `k` seed nodes that are maximally
-   spread apart across the mesh — ensuring the coarse graph covers the entire domain
-   without clustering all seeds in one region.
-2. **Multi-source BFS (Voronoi partition)** assigns each fine node to its nearest
-   seed, forming `k` approximately equal-size clusters shaped by mesh topology.
+During `__getitem__`:
 
-The result is a graph-analogue of a Voronoi diagram, where "distance" is measured
-in hops rather than Euclidean space (unless positions are available, in which case
-Euclidean FPS is used as a faster approximation).
+1. The base graph is loaded from HDF5.
+2. Node, edge, and delta features are normalized.
+3. If the per-worker coarse cache does not contain the sample, the hierarchy is
+   built and cached.
+4. `attach_coarse_levels_to_graph` attaches normalized coarse edge attributes and
+   mapping tensors to the PyG data object.
 
-This method allows **precise control** over the coarse graph size: set
-`num_clusters = 200` and you get exactly ~200 coarse nodes regardless of the mesh
-size or topology.
+Coarse hierarchy data is not stored permanently in the dataset by default. It is
+computed and cached by workers at runtime. The normalization arrays are stored in
+checkpoints and, when explicitly written, under
+`metadata/normalization_params` in the HDF5 file.
 
-### 4.2 Farthest Point Sampling
+## V-Cycle Forward Pass
 
-FPS is a greedy algorithm that builds a set of seeds maximally spread in the
-space defined by the chosen distance metric.
+The multiscale processor in `model/MeshGraphNets.py` works as:
 
-**Euclidean FPS** (used when `ref_pos` is provided):
+1. Encode node and edge features on the fine graph.
+2. Descend through each level:
+   - run that level's pre-blocks
+   - save a skip state
+   - pool node states with `pool_features`
+   - encode normalized coarse edge attributes
+3. Run coarsest graph blocks.
+4. Ascend through the levels in reverse:
+   - unpool coarse states to the finer level
+   - merge with the saved skip state through `skip_projs[i]`
+   - run that level's post-blocks
+5. Decode the final fine-node states.
 
-```
-seeds = [random_start]
-min_sq_dists[i] = inf for all i
+There is no global gated skip path in the current implementation. Skip merging is
+a per-level linear projection from concatenated skip and upsampled features:
 
-for j in 1 .. k-1:
-    for each node i:
-        min_sq_dists[i] = min(min_sq_dists[i], ||pos[i] - pos[seeds[j-1]]||²)
-    seeds[j] = argmax(min_sq_dists)
-```
-
-At each step, the next seed is the node farthest from all currently selected seeds.
-The `min_sq_dists` array is updated incrementally (only comparing against the newest
-seed), making the total cost O(N·k).
-
-**Geodesic FPS** (fallback when positions are unavailable):
-
-```
-seeds = [random_start]
-min_dists[i] = BFS_distance(seeds[0], i)  for all i
-
-for j in 1 .. k-1:
-    seeds[j] = argmax(min_dists)
-    new_dists = BFS_distance(seeds[j], *)
-    min_dists = element-wise min(min_dists, new_dists)
+```text
+Linear(2 * latent_dim -> latent_dim)
 ```
 
-Same greedy logic but distance is measured in hops (number of graph edges). This
-requires one full BFS per new seed, making it O(N·k·(N+E)) — significantly slower,
-but topology-correct even for irregular meshes.
+## Unpooling Modes
 
-**FPS guarantee:** The minimum pairwise distance among selected seeds is maximized.
-This ensures seeds are spread as uniformly as possible across the domain.
+With `bipartite_unpool False`, `unpool_features` broadcasts each coarse node
+state to fine nodes using `fine_to_coarse`.
 
-### 4.3 Multi-Source BFS (Voronoi Partition)
+With `bipartite_unpool True`, `UnpoolBlock` runs learned message passing over
+`unpool_edge_index_i`:
 
-Once seeds are chosen, all seeds are inserted simultaneously into a BFS queue:
-
-```
-fine_to_coarse[seed_i] = i     ∀ seed i ∈ seeds
-dist[seed_i] = 0               ∀ seed i ∈ seeds
-queue = [seed_0, seed_1, ..., seed_{k-1}]
-
-while queue not empty:
-    node = queue.popleft()
-    for each neighbor nbr of node:
-        if dist[node] + 1 < dist[nbr]:
-            dist[nbr] = dist[node] + 1
-            fine_to_coarse[nbr] = fine_to_coarse[node]  # inherit cluster
-            queue.append(nbr)
+```text
+message = MLP(coarse_state, fine_skip_state, relative_position)
+fine_state = MLP(fine_skip_state, summed_messages)
 ```
 
-This is a standard multi-source BFS. Since all seeds start at distance 0, each node
-is assigned to the seed it can reach in the fewest hops. On a uniform grid, this
-produces Voronoi-like cells of approximately equal size.
-
-**Voronoi correctness:** Any node that is equally close to two seeds will be
-assigned to whichever seed's wavefront arrives first in BFS queue order (FIFO tie-
-breaking). The cells are always connected and convex in the hop-distance metric.
-
-### 4.4 Disconnected Component Handling
-
-After FPS, the algorithm checks whether every connected component has at least one
-seed:
-
-```python
-comp_has_seed = set(comp_labels[s] for s in seeds)
-for comp_id in range(n_comp):
-    if comp_id not in comp_has_seed:
-        seeds.append(first_node_in_component(comp_id))
-```
-
-This guarantees that isolated parts (e.g., a chip separated from the PCB) are always
-coarsened — even if FPS happened to skip them.
-
-### 4.5 Cluster ID Compaction
-
-After multi-source BFS, some seeds may not have attracted any nodes (possible if
-`k > N` or in degenerate topologies). Empty clusters are removed and IDs are
-remapped to contiguous integers `[0, M-1]` where `M ≤ k`.
-
-### 4.6 Properties
-
-| Property | Value |
-|----------|-------|
-| Reduction per level | User-controlled via `num_clusters` |
-| Deterministic? | No — random initial seed (can fix with `np.random.seed`) |
-| Handles disconnected graphs? | Yes — per-component seed injection |
-| Topology-aware? | Yes — Voronoi partition via BFS preserves connectivity |
-| Requires node positions? | Optional (Euclidean FPS is faster; geodesic FPS works without) |
-| Complexity (Euclidean FPS) | O(N·k) FPS + O(N+E) BFS |
-| Complexity (Geodesic FPS) | O(N·k·(N+E)) — slow for large k |
-
-### 4.7 Code Location
-
-```python
-# model/coarsening.py
-def fps_voronoi_coarsen(edge_index_np, num_nodes, num_clusters, ref_pos=None):
-    ...
-```
-
----
-
-## 5. Shared Infrastructure
-
-### 5.1 Boundary-Based Coarse Edge Construction
-
-```python
-def _build_coarse_edges(fine_to_coarse, edge_index_np, num_coarse):
-```
-
-Two coarse nodes `a` and `b` are connected iff the fine mesh contains at least one
-edge `(u, v)` where `fine_to_coarse[u] = a` and `fine_to_coarse[v] = b`.
-
-**Implementation:**
-1. Map each fine edge endpoint to its coarse cluster: `cu = fine_to_coarse[src]`, `cv = fine_to_coarse[dst]`.
-2. Keep only cross-cluster edges (`cu ≠ cv`).
-3. Canonicalize by sorting each pair: `(min, max)`.
-4. Deduplicate via integer encoding: `encoded = a*(M+1) + b`, then `np.unique`.
-5. Both directions `(a, b)` and `(b, a)` are emitted to maintain bidirectionality.
-
-This step is the same regardless of how `fine_to_coarse` was computed — it only
-depends on the final cluster assignments and the original fine edge list.
-
-### 5.2 Coarse Edge Features (8D)
-
-Coarse edge features are computed by `attach_coarse_levels_to_graph` in
-`general_modules/multiscale_helpers.py`. Coarse nodes are positioned at the
-**centroid** of their constituent fine nodes:
-```
-coarse_ref_pos[c]  = mean(reference_pos[i]  for i where fine_to_coarse[i] = c)
-coarse_def_pos[c]  = mean(deformed_pos[i]   for i where fine_to_coarse[i] = c)
-```
-
-Coarse edge features use the same 8D format as fine mesh edges:
-```
-[deformed_dx, deformed_dy, deformed_dz, deformed_dist,
- ref_dx,      ref_dy,      ref_dz,      ref_dist]
-```
-computed between the centroid positions of adjacent coarse clusters.
-
-These edge features are **normalized** at training time. The normalization stats are
-saved in the checkpoint under `coarse_edge_means` / `coarse_edge_stds` (one set
-per level).
-
-### 5.3 Pool and Unpool Operators
-
-**Pool (fine → coarse): mean aggregation**
-```python
-def pool_features(h_fine, fine_to_coarse, num_coarse):
-    return scatter(h_fine, fine_to_coarse, dim=0, dim_size=num_coarse, reduce='mean')
-```
-Each coarse node receives the average latent feature of all its fine-level children.
-This is a *lossy* operation — fine-grained variation within a cluster is collapsed.
-
-**Unpool (coarse → fine): broadcast**
-```python
-def unpool_features(h_coarse, fine_to_coarse):
-    return h_coarse[fine_to_coarse]
-```
-Each fine node simply copies the latent feature of its coarse cluster. There are no
-learned weights in the unpool step — information recovery happens through the
-post-processing GnBlocks and skip connections.
-
-### 5.4 MultiscaleData and PyG Batching
-
-The `MultiscaleData` class (a `torch_geometric.data.Data` subclass) stores per-level
-coarsening attributes with correct batching semantics:
-
-```
-fine_to_coarse_0    [N_0] long    # mapping from level-0 to level-1
-coarse_edge_index_0 [2, E_0]      # edges at level 1
-coarse_edge_attr_0  [E_0, 8]      # edge features at level 1
-num_coarse_0        [1] long      # node count at level 1
-...
-fine_to_coarse_{L-1}  ...         # mapping to coarsest level
-```
-
-When `Batch.from_data_list` combines multiple samples into a mini-batch, the
-`__inc__` override ensures `fine_to_coarse_i` and `coarse_edge_index_i` are offset
-by the cumulative `num_coarse_i` from previous samples in the batch — exactly like
-the standard `edge_index` offset in PyG.
-
----
-
-## 6. V-Cycle Architecture
-
-The V-cycle is the core execution pattern of the multiscale GNN. It mirrors
-multigrid V-cycle solvers in numerical analysis.
-
-### 6.1 V-Cycle Structure
-
-For `L` coarsening levels, the `mp_per_level` config list has `2L+1` entries:
-
-```
-[pre_0, pre_1, ..., pre_{L-1},  coarsest,  post_{L-1}, ..., post_1, post_0]
-```
-
-Example with `L=2`, `mp_per_level = [3, 3, 5, 3, 3]`:
-
-```
-Level 0 (fine):     pre[0] = 3 GnBlocks
-                    ↓  pool
-Level 1:            pre[1] = 3 GnBlocks
-                    ↓  pool
-Level 2 (coarsest): coarsest = 5 GnBlocks
-                    ↑  unpool
-Level 1:            post[1] = 3 GnBlocks
-                    ↑  unpool
-Level 0 (fine):     post[0] = 3 GnBlocks
-```
-
-### 6.2 Forward Pass (Descending Arm)
-
-```
-1. Encode fine graph (node MLP + edge MLP → latent embeddings)
-2. Save encoder output as encoder_x (for global skip connection)
-
-For i = 0 to L-1:
-    a. Run pre_blocks[i]  — GnBlocks at level i
-    b. Save skip state:  (h_i, edge_attr_i, edge_index_i)
-    c. Pool:  h_coarse = mean_scatter(h_i, fine_to_coarse_i)
-    d. Encode coarse edges:  e_coarse = coarse_eb_encoders[i](coarse_edge_attr_i)
-    e. Build coarse graph: Data(h_coarse, e_coarse, coarse_edge_index_i)
-```
-
-Note: world edges (long-range connectivity between mesh parts) are only active at
-the finest level (i=0). Coarser levels use only the coarsened local mesh topology.
-
-### 6.3 Coarsest Level
-
-```
-Run coarsest_blocks — GnBlocks operating on the smallest graph
-```
-
-At this level, even distant fine-mesh nodes are neighbors in the coarsened graph.
-This is where long-range information exchange happens efficiently.
-
-### 6.4 Forward Pass (Ascending Arm)
-
-```
-For i = L-1 down to 0:
-    a. Unpool:  h_up = h_coarse[fine_to_coarse_i]
-    b. Merge skip:  h_merged = skip_projs[i](cat([skip.h_i, h_up], dim=-1))
-       (Linear(2D, D) projection of concatenated skip + unpooled features)
-    c. Restore graph at level i with saved edge topology
-    d. Run post_blocks[i] — GnBlocks at level i
-```
-
-The skip connection `Linear(2D → D)` is learned separately per level. It allows
-the ascending arm to selectively combine fine-level detail preserved in the skip
-state with the global context recovered from the coarser level.
-
-### 6.5 Global Gated Skip Connection
-
-After the V-cycle, a global skip from the *encoder output* to the *post-processor
-output* is added:
-
-```python
-gate = sigmoid(Linear(2D → D)(cat([h_out, encoder_x])))
-h_final = h_out + gate * encoder_x
-```
-
-This is a learned gate that controls how much of the original encoded node features
-(before any message passing) is injected back at the end. It acts as a global
-residual and stabilizes training.
-
-### 6.6 Decode
-
-```
-output = decoder_mlp(h_final)  →  predicted normalized delta [N, output_var]
-```
-
-The decoder is a 2-hidden-layer MLP with no LayerNorm on the output.
-
-### 6.7 Module Structure
-
-| Module | Count | Description |
-|--------|-------|-------------|
-| `pre_blocks[i]` | `mp_per_level[i]` GnBlocks | Pre-pooling blocks at level i |
-| `post_blocks[i]` | `mp_per_level[2L-i]` GnBlocks | Post-unpool blocks at level i |
-| `coarsest_blocks` | `mp_per_level[L]` GnBlocks | Blocks at coarsest level |
-| `coarse_eb_encoders[i]` | 1 MLP per level | Encodes coarse edge features |
-| `skip_projs[i]` | `Linear(2D, D)` per level | Skip merge projections |
-| `skip_gate` | 1 shared module | Global encoder→output gate |
-
----
-
-## 7. Data Loading and Batching
-
-Coarsening is computed **offline** at dataset load time, not during training. Each
-sample in `MultiscaleDataset.__getitem__` triggers:
-
-1. Build fine mesh `edge_index` from HDF5 connectivity.
-2. For each level `i = 0 … L-1`:
-   - Call `coarsen_graph(edge_index_i, num_nodes_i, method=coarsening_type[i], ...)`
-   - Compute coarse edge attributes from centroid positions.
-   - Store results as `MultiscaleData` attributes `fine_to_coarse_i`, etc.
-3. Return the `MultiscaleData` object to the DataLoader.
-
-The `MultiscaleData.__inc__` and `__cat_dim__` overrides handle batch index
-offsetting automatically when PyG's `Batch.from_data_list` collates samples.
-
-Coarsening is typically applied once (or cached) per sample, since the mesh topology
-does not change across time steps. Only the node features (physical state) differ.
-
----
-
-## 8. Configuration Reference
-
-```ini
-use_multiscale True           # Enable hierarchical V-cycle
-multiscale_levels 2           # Number of coarsening levels (L)
-mp_per_level 3, 3, 5, 3, 3   # GnBlocks per stage (2L+1 values)
-
-# Coarsening method per level (comma-separated, one per level)
-coarsening_type bfs           # 'bfs' or 'voronoi' (or mixed: 'bfs, voronoi')
-
-# For voronoi levels — number of coarse nodes per level (comma-separated)
-voronoi_clusters 500, 50      # e.g., level 0 → 500 nodes, level 1 → 50 nodes
-```
-
-**`mp_per_level` layout** for `L` levels:
-
-```
-Index:  0        1      ...   L-1      L         L+1    ...   2L
-Role:   pre[0]  pre[1]  ...  pre[L-1]  coarsest  post[L-1] ...  post[0]
-```
-
-The sum `sum(mp_per_level)` is the total number of GnBlocks and should equal
-`message_passing_num` for consistent bookkeeping.
-
----
-
-## 9. Comparison and When to Use Each
-
-### BFS Bi-Stride
-
-**Strengths:**
-- Completely deterministic (no randomness).
-- Purely topology-based — no dependency on node positions.
-- Natural ~4x reduction on triangular FEA meshes with no tuning.
-- Coarse nodes are actual fine-mesh nodes (not virtual centroids), preserving
-  physical meaning.
-- O(N+E) time; fastest option.
-
-**Weaknesses:**
-- Reduction ratio is fixed by topology — cannot be specified precisely.
-- Very irregular meshes (e.g., refined areas near stress concentrations) may
-  produce unbalanced coarse graphs.
-- Multiple levels may over-coarsen small components in multi-part assemblies.
-
-**Best for:** Standard triangular/tetrahedral FEA meshes where ~4x reduction per
-level is acceptable and speed is a priority.
-
-### FPS-Voronoi
-
-**Strengths:**
-- Exact control over coarse graph size via `num_clusters`.
-- Clusters tend to be geometrically compact and of uniform size (especially with
-  Euclidean FPS).
-- Aggressive coarsening in a single level is possible (e.g., 20,000 → 100 nodes).
-- Works well for highly non-uniform meshes.
-
-**Weaknesses:**
-- Non-deterministic with random initial FPS seed (unless seeded).
-- Euclidean FPS requires node positions (not always meaningful for abstract GNNs).
-- Geodesic FPS is O(N·k·(N+E)) — slow for large k.
-- Coarse nodes are virtual centroids; positional meaning is approximate.
-
-**Best for:** Applications requiring a specific coarse graph size, or very
-non-uniform meshes where BFS would produce poorly balanced partitions.
-
-### Mixed Strategies
-
-The `coarsening_type` config accepts per-level methods. For example:
-
-```ini
-coarsening_type bfs, voronoi
-multiscale_levels 2
-voronoi_clusters 100
-```
-
-This applies BFS at level 0 (fine → ~4x smaller) and Voronoi at level 1 (→ exactly
-100 coarse nodes). This combines BFS's topological fidelity at fine resolution with
-Voronoi's size control at the coarsest level.
-
----
-
-## Summary Diagram
-
-```
-Fine mesh (N nodes)
-        │
-        ▼ BFS/Voronoi coarsening (level 0)
-Coarse level 1 (~N/4 or k₁ nodes)
-        │
-        ▼ BFS/Voronoi coarsening (level 1)
-Coarse level 2 (~N/16 or k₂ nodes)
-        │
-        ▼ (coarsest)
-        ...
-
-V-cycle forward pass:
-                  fine
-                 /    \
-            pre[0]     post[0]
-               |         |
-         pool  ↓    skip  ↑ unpool+merge
-            level 1      level 1
-          pre[1]  post[1]
-              |      |
-        pool  ↓  ↑ unpool
-            coarsest
-          (mp_per_level[L] blocks)
-```
-
-The skip connections at each level preserve fine-scale detail while the ascending
-arm restores spatial resolution with global context from the coarsest level.
+Relative position is computed from fine positions and coarse centroids at that
+level.
+
+## World Edges With Multiscale
+
+By default (`coarse_world_edges False`), world-edge message passing is only used
+on the original fine graph. Coarse processor blocks are built with
+`use_world_edges False`. World-edge attributes are carried through the level-0
+skip state so the ascending fine-level post blocks can still use them.
+
+Set `coarse_world_edges True` to lift world edges to every coarse level. For each
+fine world edge (u, v) where `fine_to_coarse[u] ≠ fine_to_coarse[v]`, a coarse
+world edge is added between the cluster centroids. Lifting is applied iteratively
+across levels so contact topology is consistent at all scales. Coarse GnBlocks
+receive explicit contact-graph awareness, which matters for contact-rich FEA where
+contact has large-scale structural consequences (e.g. multi-body assemblies).
+
+Without `coarse_world_edges`, coarser message-passing stages that capture global
+load redistribution have no direct awareness of contact topology — contact effects
+are present only implicitly through the pooled fine-level node features.
+
+## Failure Checks
+
+Common multiscale errors are usually shape or config mismatches:
+
+- `mp_per_level` length must be `2 * multiscale_levels + 1`.
+- `edge_var` must be `8`.
+- Voronoi levels need a valid `voronoi_clusters` value.
+- Missing `fine_to_coarse_i` or `coarse_edge_attr_i` means hierarchy attachment
+  did not run for that graph.
+- Very large `coarse_cache_per_worker` values increase host RAM pressure.

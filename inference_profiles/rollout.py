@@ -409,11 +409,17 @@ def run_rollout(config, config_filename='config.txt'):
 
                     # --- h2. Attach per-level coarse graph data if multiscale ---
                     if use_multiscale and coarse_hierarchy is not None:
+                        use_cwe = bool(config.get('coarse_world_edges', False))
+                        world_ei_for_coarse = (
+                            graph.world_edge_index.cpu().numpy()
+                            if use_world_edges and use_cwe else None
+                        )
                         attach_coarse_levels_to_graph(
                             graph, coarse_hierarchy,
                             ref_pos, deformed_pos,
                             coarse_edge_means, coarse_edge_stds,
                             device=device,
+                            world_edge_index=world_ei_for_coarse,
                         )
 
                     if use_vae and conditional_prior is not None and fixed_z is None:

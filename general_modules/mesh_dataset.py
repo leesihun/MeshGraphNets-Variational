@@ -331,6 +331,7 @@ class MeshGraphDataset(Dataset):
 
         # World edge parameters
         self.use_world_edges = config.get('use_world_edges', False)
+        self.coarse_world_edges = config.get('coarse_world_edges', False)
         self.world_radius_multiplier = config.get('world_radius_multiplier', 1.5)
         self.world_max_num_neighbors = config.get('world_max_num_neighbors', 64)
         self.world_edge_radius = None  # Computed from mesh statistics
@@ -629,6 +630,7 @@ class MeshGraphDataset(Dataset):
         subset.num_node_types = None
         subset.node_type_to_idx = None
         subset.use_world_edges = self.use_world_edges
+        subset.coarse_world_edges = self.coarse_world_edges
         subset.world_radius_multiplier = self.world_radius_multiplier
         subset.world_max_num_neighbors = self.world_max_num_neighbors
         subset.world_edge_backend = self.world_edge_backend
@@ -1222,10 +1224,15 @@ class MeshGraphDataset(Dataset):
                 self._coarse_cache[sample_id] = hierarchy
 
             hierarchy = self._coarse_cache[sample_id]
+            world_ei_for_coarse = (
+                graph_data.world_edge_index.numpy()
+                if self.use_world_edges and self.coarse_world_edges else None
+            )
             attach_coarse_levels_to_graph(
                 graph_data, hierarchy,
                 pos.numpy(), deformed_pos.astype(np.float32),
                 self.coarse_edge_means, self.coarse_edge_stds,
+                world_edge_index=world_ei_for_coarse,
             )
 
         return graph_data

@@ -70,6 +70,21 @@ def build_multiscale_hierarchy(
     return hierarchy
 
 
+def lift_world_edges(world_ei: np.ndarray, ftc: np.ndarray) -> np.ndarray:
+    """Lift fine world edge index to coarse level via fine_to_coarse mapping.
+    Drops intra-cluster edges (self-loops at coarse level) and deduplicates.
+    Returns [2, E_coarse_world] int64, possibly empty.
+    """
+    if world_ei.shape[1] == 0:
+        return np.zeros((2, 0), dtype=np.int64)
+    src_c = ftc[world_ei[0]]
+    dst_c = ftc[world_ei[1]]
+    mask = src_c != dst_c
+    if not mask.any():
+        return np.zeros((2, 0), dtype=np.int64)
+    return np.unique(np.stack([src_c[mask], dst_c[mask]], axis=0), axis=1).astype(np.int64)
+
+
 def attach_coarse_levels_to_graph(
     graph,
     hierarchy: List[dict],
@@ -78,6 +93,7 @@ def attach_coarse_levels_to_graph(
     coarse_edge_means: Sequence[np.ndarray],
     coarse_edge_stds: Sequence[np.ndarray],
     device: Optional[torch.device] = None,
+    world_edge_index: Optional[np.ndarray] = None,
 ) -> None:
     """
     Compute per-level centroids and coarse edge features for a single timestep,
@@ -140,5 +156,29 @@ def attach_coarse_levels_to_graph(
             if device is not None:
                 up_t = up_t.to(device)
             graph[f'unpool_edge_index_{level}'] = up_t
+
+        if world_edge_index is not None:
+            cw_ei = lift_world_edges(world_edge_index, ftc)
+            if cw_ei.shape[1] > 0:
+                cw_ea_raw = compute_edge_attr(
+                    coarse_ref.astype(np.float32),
+                    coarse_def.astype(np.float32),
+                    cw_ei,
+                )
+                if level < len(coarse_edge_means):
+                    cw_ea_norm = (cw_ea_raw - coarse_edge_means[level]) / coarse_edge_stds[level]
+                else:
+                    cw_ea_norm = cw_ea_raw
+            else:
+                cw_ea_norm = np.zeros((0, EDGE_FEATURE_DIM), dtype=np.float32)
+
+            cw_ei_t = torch.from_numpy(cw_ei)
+            cw_ea_t = torch.from_numpy(cw_ea_norm.astype(np.float32))
+            if device is not None:
+                cw_ei_t = cw_ei_t.to(device)
+                cw_ea_t = cw_ea_t.to(device)
+            graph[f'coarse_world_edge_index_{level}'] = cw_ei_t
+            graph[f'coarse_world_edge_attr_{level}']  = cw_ea_t
+            world_edge_index = cw_ei  # lift further for next level
 
         cur_ref, cur_def = coarse_ref, coarse_def

@@ -1,324 +1,145 @@
-# VRAM Optimization Plan: Gradient Checkpointing + AMP
+# VRAM And Throughput Controls
 
-## Overview
+This document describes the memory and speed controls currently implemented in
+the training runtime.
 
-Implement two VRAM optimization techniques for MeshGraphNets:
-1. **Step 1: Gradient Checkpointing** - Trade compute for memory by recomputing activations during backward pass
-2. **Step 2: AMP (Automatic Mixed Precision)** - Use float16 for forward/backward, float32 for optimizer
+## Current Controls
 
-**Expected VRAM Savings:**
-- Gradient checkpointing: ~60-70% reduction in activation memory
-- AMP: ~50% reduction in model/gradient memory
-- Combined: ~70-75% total VRAM reduction
+| Config key | Runtime effect |
+| --- | --- |
+| `use_checkpointing` | Recomputes processor activations during backward to reduce activation memory. |
+| `use_amp` | Enables bfloat16 autocast in the training and validation loops. |
+| `grad_accum_steps` | Trades optimizer-step frequency for lower physical batch size. |
+| `num_workers` | Controls DataLoader worker count. |
+| `use_ema` | Maintains an EMA copy for evaluation/inference; costs extra model memory. |
+| `use_compile` | Applies `torch.compile(dynamic=True)` to the simulator. |
+| `parallel_mode model_split` | Experimental model split across GPUs instead of DDP replication. |
 
----
+## Activation Checkpointing
 
-## Design Decisions
+Activation checkpointing is implemented in `model/checkpointing.py` and wired
+through `model/MeshGraphNets.py`.
 
-### 1. How to handle PyG Data objects with torch.utils.checkpoint?
+Flat processor:
 
-**Problem**: `torch.utils.checkpoint.checkpoint()` requires tensor inputs, but `GnBlock.forward()` takes and returns `Data` objects.
+- `process_with_checkpointing` checkpoints each `GnBlock`.
+- Optional VAE `z` fusion is applied before the checkpointed block.
+- World-edge tensors are preserved across the wrapper.
 
-**Solution**: Create a wrapper function that unpacks `Data` to tensors, calls the checkpointed function, and repacks to `Data`.
+Multiscale processor:
 
-### 2. Checkpoint each block individually or group them?
+- the same helper is used for pre, coarsest, and post block lists
+- per-arm VAE fusers are supported
+- world-edge tensors are only present on the fine-level blocks
 
-**Decision**: Checkpoint each block individually.
-- 15 GN blocks with individual checkpointing provides fine-grained memory control
-- Simpler to implement and debug than grouping
+Use:
 
-### 3. Where should autocast boundaries be?
-
-**Decision**: Wrap only the forward pass and loss computation inside `autocast`.
-- Backward pass happens outside autocast (handled automatically by GradScaler)
-- LayerNorm is safe with AMP (uses FP32 accumulation internally)
-
-### 4. How to handle gradient clipping with scaled gradients?
-
-**Solution**: Use `scaler.unscale_(optimizer)` before `clip_grad_norm_`, then `scaler.step()`.
-
----
-
-## Files to Modify
-
-| File | Purpose |
-|------|---------|
-| `config.txt` | Add toggle options |
-| `model/MeshGraphNets.py` | Add checkpointing to processor loop |
-| `training_profiles/training_loop.py` | Add autocast + scaler handling |
-| `training_profiles/single_training.py` | Initialize GradScaler, enable checkpointing |
-| `training_profiles/distributed_training.py` | Same as single_training.py for DDP |
-
----
-
-## Step 1: Gradient Checkpointing
-
-### 1.1 Add Config Option
-
-**File:** `config.txt`
-
-```
-use_checkpointing   True
-```
-
-### 1.2 Modify model/MeshGraphNets.py
-
-**Add import at top:**
-```python
-from torch.utils.checkpoint import checkpoint
-```
-
-**Add to EncoderProcessorDecoder.__init__ (after line 66):**
-```python
-self.use_checkpointing = config.get('use_checkpointing', False)
-```
-
-**Add helper method to EncoderProcessorDecoder:**
-```python
-def _run_gn_block(self, block, x, edge_attr, edge_index):
-    """Helper for checkpointing - converts tensors to Data and back."""
-    graph = Data(x=x, edge_attr=edge_attr, edge_index=edge_index)
-    out_graph = block(graph)
-    return out_graph.x, out_graph.edge_attr
-
-def set_checkpointing(self, enabled: bool):
-    """Enable or disable gradient checkpointing."""
-    self.use_checkpointing = enabled
-```
-
-**Replace forward method (lines 77-84):**
-```python
-def forward(self, graph):
-    graph = self.encoder(graph)
-
-    if self.use_checkpointing and self.training:
-        # Checkpointing requires tensors, not Data objects
-        x = graph.x
-        edge_attr = graph.edge_attr
-        edge_index = graph.edge_index
-
-        for block in self.processer_list:
-            x, edge_attr = checkpoint(
-                self._run_gn_block,
-                block,
-                x,
-                edge_attr,
-                edge_index,
-                use_reentrant=False
-            )
-
-        graph = Data(x=x, edge_attr=edge_attr, edge_index=edge_index)
-    else:
-        for model in self.processer_list:
-            graph = model(graph)
-
-    output = self.decoder(graph)
-    return output
-```
-
-**Add to MeshGraphNets class (after line 22):**
-```python
-def set_checkpointing(self, enabled: bool):
-    """Enable or disable gradient checkpointing."""
-    self.model.set_checkpointing(enabled)
-```
-
----
-
-## Step 2: AMP (Automatic Mixed Precision)
-
-### 2.1 Add Config Option
-
-**File:** `config.txt`
-
-```
-use_amp             True
-```
-
-### 2.2 Modify training_profiles/training_loop.py
-
-**Add import at top:**
-```python
-from torch.amp import autocast, GradScaler
-```
-
-**Modify train_epoch signature (line 5):**
-```python
-def train_epoch(model, dataloader, optimizer, device, config, epoch, scaler=None):
-```
-
-**Replace forward/backward pass (lines 29-48):**
-```python
-        use_amp = config.get('use_amp', False) and device.type == 'cuda'
-
-        # Forward pass with optional AMP
-        with autocast(device_type='cuda', enabled=use_amp):
-            predicted_acc, target_acc = model(graph)
-            errors = ((predicted_acc - target_acc) ** 2)
-            loss = torch.mean(errors)
-
-        optimizer.zero_grad()
-
-        if scaler is not None:
-            # AMP backward pass
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            # Standard backward pass
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-```
-
-**Modify validate_epoch to add autocast:**
-```python
-def validate_epoch(model, dataloader, device, config):
-    model.eval()
-    use_amp = config.get('use_amp', False) and device.type == 'cuda'
-
-    with torch.no_grad():
-        for batch_idx, graph in enumerate(dataloader):
-            graph = graph.to(device)
-
-            with autocast(device_type='cuda', enabled=use_amp):
-                predicted, target = model(graph)
-                errors = ((predicted - target) ** 2)
-                loss = torch.mean(errors)
-            # ... rest unchanged
-```
-
-### 2.3 Modify training_profiles/single_training.py
-
-**Add import:**
-```python
-from torch.amp import GradScaler
-```
-
-**Initialize GradScaler and checkpointing (after model creation, ~line 72):**
-```python
-    # Enable gradient checkpointing if configured
-    if config.get('use_checkpointing', False):
-        model.set_checkpointing(True)
-        print("Gradient checkpointing enabled")
-
-    # Initialize GradScaler for AMP
-    use_amp = config.get('use_amp', False) and torch.cuda.is_available()
-    scaler = GradScaler(enabled=use_amp) if use_amp else None
-    if use_amp:
-        print("AMP enabled")
-```
-
-**Update training loop call (line 132):**
-```python
-        train_loss = train_epoch(model, train_loader, optimizer, device, config, epoch, scaler=scaler)
-```
-
-**Update checkpoint saving (lines 146-153):**
-```python
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'scaler_state_dict': scaler.state_dict() if scaler else None,
-                'train_loss': train_loss,
-                'valid_loss': valid_loss,
-            }, checkpoint_path)
-```
-
-### 2.4 Modify training_profiles/distributed_training.py
-
-**Add import:**
-```python
-from torch.amp import GradScaler
-```
-
-**Initialize after DDP wrapping (~line 100):**
-```python
-    # Enable gradient checkpointing (on underlying module, not DDP wrapper)
-    if config.get('use_checkpointing', False):
-        model.module.set_checkpointing(True)
-        if rank == 0:
-            print("Gradient checkpointing enabled")
-
-    # Initialize GradScaler for AMP
-    use_amp = config.get('use_amp', False)
-    scaler = GradScaler(enabled=use_amp) if use_amp else None
-    if rank == 0 and use_amp:
-        print("AMP enabled")
-```
-
----
-
-## Final config.txt Additions
-
-Add at the end of `config.txt`:
-```
-% Memory Optimization
-use_checkpointing   True
-use_amp             True
-```
-
----
-
-## Verification Plan
-
-### Test 1: Gradient Checkpointing Only
-```
+```text
 use_checkpointing True
-use_amp           False
 ```
-- Run `python MeshGraphNets_main.py`
-- Verify training completes without errors
-- Check memory logging shows reduced VRAM
 
-### Test 2: AMP Only
+Expected tradeoff: lower activation memory, higher compute time because forward
+work is recomputed during backward.
+
+## AMP
+
+The live training code uses bfloat16 autocast:
+
+```python
+torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp)
 ```
-use_checkpointing False
-use_amp           True
+
+There is no `GradScaler` in the current path. This is deliberate: bfloat16 has a
+larger exponent range than fp16 and is less prone to overflow in graph scatter
+operations on large meshes.
+
+Use:
+
+```text
+use_amp True
 ```
-- Run `python MeshGraphNets_main.py`
-- Verify no NaN/Inf in loss
-- Check memory reduction in logs
 
-### Test 3: Both Combined
+If CUDA is unavailable, autocast is effectively not useful. The code still uses
+the configured flag when entering the autocast context.
+
+## Gradient Accumulation
+
+`training_profiles/training_loop.py` supports:
+
+| Value | Meaning |
+| --- | --- |
+| `grad_accum_steps 1` | optimizer step every batch |
+| `grad_accum_steps N` | optimizer step every N batches |
+| `grad_accum_steps 0` | one optimizer step for the whole epoch |
+
+The loss is divided by the actual accumulation-window size so accumulated
+gradients approximate the mean over that window.
+
+Gradient accumulation does not reduce per-sample memory. It lets you lower
+physical `batch_size` while keeping a larger effective batch:
+
+```text
+effective_batch = batch_size * grad_accum_steps
 ```
-use_checkpointing True
-use_amp           True
-```
-- Run `python MeshGraphNets_main.py`
-- Verify maximum VRAM savings
-- Model should still converge
 
-### Expected Memory Usage
-| Configuration | VRAM per sample |
-|---------------|-----------------|
-| Baseline | ~5-8 GB |
-| Checkpointing only | ~2-3 GB |
-| AMP only | ~3-4 GB |
-| Both | ~1.5-2 GB |
+For `grad_accum_steps 0`, the effective batch is the full epoch.
 
----
+## EMA Memory Cost
 
-## Implementation Order
+`use_ema True` creates an `AveragedModel` copy of the simulator. This improves
+evaluation stability but stores an additional set of model parameters.
 
-1. `config.txt` - Add new options
-2. `model/MeshGraphNets.py` - Add checkpointing logic
-3. `training_profiles/training_loop.py` - Add autocast and scaler handling
-4. `training_profiles/single_training.py` - Initialize scaler, enable checkpointing
-5. `training_profiles/distributed_training.py` - Same changes for DDP
-6. Test each feature independently, then combined
+Use EMA when evaluation quality matters and the extra parameter memory is
+acceptable. Disable it first when trying to fit a model that is near the memory
+limit.
 
----
+## DataLoader Pressure
 
-## Potential Issues
+The loader can be CPU and host-memory heavy because it computes positional
+features, edge attributes, optional world edges, and optional multiscale
+hierarchies.
 
-| Issue | Mitigation |
-|-------|------------|
-| NaN/Inf with AMP | GradScaler automatically skips bad updates |
-| DDP + checkpointing | Use `model.module.set_checkpointing()` not `model.set_checkpointing()` |
-| Slower training | Expected ~20-30% slowdown from recomputation (checkpointing) |
-| edge_index dtype | autocast handles this automatically (keeps int64) |
+Important knobs:
+
+- `num_workers`
+- `use_parallel_stats`
+- `coarse_cache_per_worker`
+- `prefetch_factor` is hardcoded to `1` in current training DataLoaders
+- `pin_memory` is enabled when CUDA is available
+
+If workers crash or host RAM grows too much, reduce `num_workers` and
+`coarse_cache_per_worker` before changing the model.
+
+## DDP Versus Model Split
+
+Multiple `gpu_ids` normally launch DDP. DDP replicates the full model on every
+GPU, so it improves throughput but does not solve a single-sample model-fit
+problem.
+
+`parallel_mode model_split` routes to `parallelism/launcher.py` and splits model
+stages across GPUs. This is the path intended for models that do not fit on one
+GPU. It is experimental and has explicit caveats in `parallelism/launcher.py`,
+including detached reconstruction gradients across some stage boundaries.
+
+## Recommended Fit Order
+
+When a run does not fit:
+
+1. Lower physical `batch_size`.
+2. Enable `use_checkpointing True`.
+3. Keep `use_amp True`.
+4. Reduce or disable EMA.
+5. Reduce DataLoader pressure if host memory or worker stability is the problem.
+6. Use `grad_accum_steps` to recover effective batch size.
+7. For true single-sample model-fit failures, evaluate `parallel_mode model_split`
+   on the target multi-GPU machine.
+
+## Common Failure Signals
+
+| Symptom | Likely area |
+| --- | --- |
+| CUDA OOM during forward/backward | model activations, batch size, EMA, or DDP replication |
+| CUDA OOM only during validation/test visualization | rendering/test batch count, EMA copy, stored output tensors |
+| DataLoader worker exits | host RAM, HDF5 access, coarse cache, worker count |
+| GPU idle between batches | preprocessing or DataLoader throughput |
+| NaN/Inf under AMP | inspect input normalization and loss scale; current AMP is bfloat16 |

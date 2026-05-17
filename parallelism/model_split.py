@@ -157,15 +157,26 @@ class BundleRecv(torch.autograd.Function):
 # ---------------------------------------------------------------------------
 
 def _bundle_counts(use_world_edges: bool, use_vae: bool,
-                   n_skips: int, is_multiscale: bool) -> Tuple[int, int]:
-    """Return (n_grad, n_nongd) for a bundle with n_skips accumulated skip states."""
-    W = 1 if use_world_edges else 0
-    V = 1 if use_vae else 0
+                   n_skips: int, is_multiscale: bool,
+                   use_coarse_world_edges: bool = False) -> Tuple[int, int]:
+    """Return (n_grad, n_nongd) for a bundle with n_skips accumulated skip states.
 
-    n_grad = 2 + W + 2 * n_skips + (W if n_skips > 0 else 0)
-    n_nongd = (1 + W + n_skips + (W if n_skips > 0 else 0)
-               + n_skips * V + V
-               + (1 if is_multiscale else 0))
+    When use_coarse_world_edges=True every skip carries its own world-edge pair
+    (w_attr in grad, w_idx in nongd). When False (default) only skip[0] does.
+    """
+    W  = 1 if use_world_edges else 0
+    V  = 1 if use_vae else 0
+    ms = 1 if is_multiscale else 0
+
+    if use_coarse_world_edges:
+        # Every skip: (x, ea, w_attr) in grad; (ei, w_idx) in nongd
+        n_grad  = 2 + W + (2 + W) * n_skips
+        n_nongd = 1 + W + (1 + W) * n_skips + n_skips * V + V + ms
+    else:
+        # Only skip[0] carries world edges (original layout)
+        n_grad  = 2 + W + 2 * n_skips + (W if n_skips > 0 else 0)
+        n_nongd = (1 + W + n_skips + (W if n_skips > 0 else 0)
+                   + n_skips * V + V + ms)
     return n_grad, n_nongd
 
 
@@ -181,6 +192,7 @@ def _pack_bundle(
     use_world_edges: bool,
     use_vae: bool,
     is_multiscale: bool,
+    use_coarse_world_edges: bool = False,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     """Pack state into (grad_tensors, nongd_tensors) in canonical order."""
     dev = x.device
@@ -196,17 +208,25 @@ def _pack_bundle(
         grad_t.append(wea)
         nongd_t.append(wei)
 
-    # Skip states (x, ea into grad; ei into nongd)
+    # Skip states: (x, ea) in grad; ei in nongd
     for ss in skip_stack:
         grad_t.extend([ss['x'], ss['edge_attr']])
         nongd_t.append(ss['edge_index'])
 
-    # World edges from skip[0] (finest level only)
+    # World edges for skips: all skips when use_coarse_world_edges, else only skip[0]
     if use_world_edges and len(skip_stack) > 0:
-        sw_attr = skip_stack[0].get('w_attr')
-        sw_idx  = skip_stack[0].get('w_idx')
-        grad_t.append(sw_attr if sw_attr is not None else torch.zeros(0, D, device=dev, dtype=x.dtype))
-        nongd_t.append(sw_idx  if sw_idx  is not None else torch.zeros(2, 0, dtype=torch.long, device=dev))
+        if use_coarse_world_edges:
+            for ss in skip_stack:
+                w = ss.get('w_attr')
+                grad_t.append(w if w is not None else torch.zeros(0, D, device=dev, dtype=x.dtype))
+            for ss in skip_stack:
+                wi = ss.get('w_idx')
+                nongd_t.append(wi if wi is not None else torch.zeros(2, 0, dtype=torch.long, device=dev))
+        else:
+            sw_attr = skip_stack[0].get('w_attr')
+            sw_idx  = skip_stack[0].get('w_idx')
+            grad_t.append(sw_attr if sw_attr is not None else torch.zeros(0, D, device=dev, dtype=x.dtype))
+            nongd_t.append(sw_idx  if sw_idx  is not None else torch.zeros(2, 0, dtype=torch.long, device=dev))
 
     # Per-skip z_per_node
     if use_vae:
@@ -240,6 +260,7 @@ def _unpack_bundle_indexed(
     use_world_edges: bool,
     use_vae: bool,
     is_multiscale: bool,
+    use_coarse_world_edges: bool = False,
 ) -> Tuple:
     """Unpack using canonical index positions. Returns:
        (x, ea, ei, world_ea, world_ei, skip_stack, z_per_node_cur, current_level_idx)
@@ -258,13 +279,18 @@ def _unpack_bundle_indexed(
         skip_x_list.append(all_tensors[idx]); idx += 1
         skip_ea_list.append(all_tensors[idx]); idx += 1
 
-    skip_w_attr = None
+    # World attrs for skips: all skips if use_coarse_world_edges, else only skip[0]
+    skip_w_attr_list: List[Optional[torch.Tensor]] = [None] * n_skips
     if use_world_edges and n_skips > 0:
-        skip_w_attr = all_tensors[idx]; idx += 1
+        if use_coarse_world_edges:
+            for i in range(n_skips):
+                skip_w_attr_list[i] = all_tensors[idx]; idx += 1
+        else:
+            skip_w_attr_list[0] = all_tensors[idx]; idx += 1
 
     # --- Non-grad section ---
-    # n_grad = 2 + W + 2*n_skips + (W if n_skips>0 else 0)
-    n_grad = 2 + W + 2 * n_skips + (W if n_skips > 0 else 0)
+    n_grad, _ = _bundle_counts(use_world_edges, use_vae, n_skips, is_multiscale,
+                                use_coarse_world_edges)
     idx = n_grad  # reset to start of nongd section
 
     edge_index = all_tensors[idx]; idx += 1
@@ -274,9 +300,14 @@ def _unpack_bundle_indexed(
     skip_ei_list = [all_tensors[idx + i] for i in range(n_skips)]
     idx += n_skips
 
-    skip_w_idx = None
+    # World indices for skips: all skips if use_coarse_world_edges, else only skip[0]
+    skip_w_idx_list: List[Optional[torch.Tensor]] = [None] * n_skips
     if use_world_edges and n_skips > 0:
-        skip_w_idx = all_tensors[idx]; idx += 1
+        if use_coarse_world_edges:
+            for i in range(n_skips):
+                skip_w_idx_list[i] = all_tensors[idx]; idx += 1
+        else:
+            skip_w_idx_list[0] = all_tensors[idx]; idx += 1
 
     skip_zpn_list = []
     if use_vae:
@@ -300,12 +331,8 @@ def _unpack_bundle_indexed(
             'edge_attr': skip_ea_list[i],
             'edge_index': skip_ei_list[i],
         }
-        if use_world_edges and i == 0:
-            ss['w_attr'] = skip_w_attr
-            ss['w_idx'] = skip_w_idx
-        else:
-            ss['w_attr'] = None
-            ss['w_idx'] = None
+        ss['w_attr'] = skip_w_attr_list[i]
+        ss['w_idx']  = skip_w_idx_list[i]
         if use_vae and skip_zpn_list:
             ss['z_per_node'] = skip_zpn_list[i]
         else:
@@ -479,6 +506,7 @@ class _StageInner(nn.Module):
         unpool_dict: Dict[str, nn.Module] = {}
 
         bipartite_unpool = bool(config.get('bipartite_unpool', False))
+        use_coarse_we = bool(config.get('coarse_world_edges', False)) and use_world_edges
 
         for op in ops_sequence:
             if op[0] == 'block':
@@ -488,21 +516,25 @@ class _StageInner(nn.Module):
                     li = str(local_idx)
                     if lv not in pre_dict:
                         pre_dict[lv] = {}
-                    use_we = use_world_edges if level == 0 else False
-                    cfg = config if level == 0 else coarse_config
+                    use_we = use_world_edges if (level == 0 or use_coarse_we) else False
+                    cfg = config if use_we else coarse_config
                     if li not in pre_dict[lv]:
                         pre_dict[lv][li] = GnBlock(cfg, latent_dim, use_world_edges=use_we)
                 elif kind == 'coarsest':
                     li = str(local_idx)
                     if li not in coarsest_dict:
-                        coarsest_dict[li] = GnBlock(coarse_config, latent_dim, use_world_edges=False)
+                        coarsest_dict[li] = GnBlock(
+                            config if use_coarse_we else coarse_config,
+                            latent_dim,
+                            use_world_edges=use_coarse_we,
+                        )
                 elif kind == 'post':
                     lv = str(level)
                     li = str(local_idx)
                     if lv not in post_dict:
                         post_dict[lv] = {}
-                    use_we = use_world_edges if level == 0 else False
-                    cfg = config if level == 0 else coarse_config
+                    use_we = use_world_edges if (level == 0 or use_coarse_we) else False
+                    cfg = config if use_we else coarse_config
                     if li not in post_dict[lv]:
                         post_dict[lv][li] = GnBlock(cfg, latent_dim, use_world_edges=use_we)
             elif op[0] == 'save_pool':
@@ -618,6 +650,10 @@ class ModelSplitStage(nn.Module):
         self.use_multiscale  = bool(config.get('use_multiscale', False))
         self.use_vae         = bool(config.get('use_vae', False))
         self.use_world_edges = bool(config.get('use_world_edges', False))
+        self.use_coarse_world_edges = (
+            bool(config.get('coarse_world_edges', False))
+            and self.use_world_edges and self.use_multiscale
+        )
 
         my_blocks = sorted(assignment[stage_idx])
         self.my_block_indices = my_blocks
@@ -707,9 +743,11 @@ class ModelSplitStage(nn.Module):
             world_edge_attr, world_edge_index, z_per_node_cur,
             current_level_idx,
             self.use_world_edges, self.use_vae, self.use_multiscale,
+            self.use_coarse_world_edges,
         )
         n_grad, n_nongd = _bundle_counts(
-            self.use_world_edges, self.use_vae, len(skip_stack), self.use_multiscale)
+            self.use_world_edges, self.use_vae, len(skip_stack), self.use_multiscale,
+            self.use_coarse_world_edges)
         dst = self.stage_idx + 1
         return BundleSend.apply(dst, n_grad, *grad_t, *nongd_t)
 
@@ -717,12 +755,14 @@ class ModelSplitStage(nn.Module):
         src = self.stage_idx - 1
         n_skips = self._in_skip_depth
         n_grad, n_nongd = _bundle_counts(
-            self.use_world_edges, self.use_vae, n_skips, self.use_multiscale)
+            self.use_world_edges, self.use_vae, n_skips, self.use_multiscale,
+            self.use_coarse_world_edges)
         anchor = torch.zeros((), device=self.device, requires_grad=True)
         all_tensors = BundleRecv.apply(src, n_grad, n_nongd, self.device, anchor)
         return _unpack_bundle_indexed(
             all_tensors, n_skips,
             self.use_world_edges, self.use_vae, self.use_multiscale,
+            self.use_coarse_world_edges,
         )
 
     # ------------------------------------------------------------------
@@ -842,6 +882,8 @@ class ModelSplitStage(nn.Module):
             'c_ei': graph[f'coarse_edge_index_{level}'],
             'c_ea': graph[f'coarse_edge_attr_{level}'],
             'n_c': int(graph[f'num_coarse_{level}'].sum()),
+            'c_we_idx':  getattr(graph, f'coarse_world_edge_index_{level}', None),
+            'c_we_attr': getattr(graph, f'coarse_world_edge_attr_{level}', None),
         }
         if bool(self.config.get('bipartite_unpool', False)):
             up_ei = getattr(graph, f'unpool_edge_index_{level}', None)
@@ -897,21 +939,28 @@ class ModelSplitStage(nn.Module):
             elif op[0] == 'save_pool':
                 pool_level = op[1]
                 ld = self._extract_level_data(graph, pool_level)
+                use_we_here = self.use_world_edges and (
+                    pool_level == 0 or self.use_coarse_world_edges)
                 # Save skip state BEFORE pooling
                 skip_stack.append({
                     'x':         current_graph.x,
                     'edge_attr': current_graph.edge_attr,
                     'edge_index': current_graph.edge_index,
                     'w_attr': (getattr(current_graph, 'world_edge_attr', None)
-                               if pool_level == 0 and self.use_world_edges else None),
+                               if use_we_here else None),
                     'w_idx':  (getattr(current_graph, 'world_edge_index', None)
-                               if pool_level == 0 and self.use_world_edges else None),
+                               if use_we_here else None),
                     'z_per_node': z_per_node,
                 })
                 # Pool
                 h_coarse = pool_features(current_graph.x, ld['ftc'], ld['n_c'])
                 e_coarse = self.model.coarse_eb_encoders[str(pool_level)](ld['c_ea'])
                 current_graph = Data(x=h_coarse, edge_attr=e_coarse, edge_index=ld['c_ei'])
+                if self.use_coarse_world_edges:
+                    c_we_idx = ld.get('c_we_idx')
+                    if c_we_idx is not None and c_we_idx.shape[1] > 0:
+                        current_graph.world_edge_attr  = ld['c_we_attr']
+                        current_graph.world_edge_index = c_we_idx
                 # Update z_per_node for coarser level via scatter_mean
                 if self.use_vae and z_per_node is not None:
                     z_per_node = scatter(z_per_node, ld['ftc'], dim=0,
@@ -943,7 +992,9 @@ class ModelSplitStage(nn.Module):
                 current_graph = Data(x=h_merged,
                                      edge_attr=skip['edge_attr'],
                                      edge_index=skip['edge_index'])
-                if unpool_level == 0 and self.use_world_edges and skip.get('w_attr') is not None:
+                use_we_here = self.use_world_edges and (
+                    unpool_level == 0 or self.use_coarse_world_edges)
+                if use_we_here and skip.get('w_attr') is not None:
                     current_graph.world_edge_attr  = skip['w_attr']
                     current_graph.world_edge_index = skip['w_idx']
 

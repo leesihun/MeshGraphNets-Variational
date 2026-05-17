@@ -1,116 +1,123 @@
-# Visualization Denormalization
+# Visualization And Denormalization
 
-## Overview
+The model trains on normalized deltas. Visualization paths convert predictions
+back to physical units when the required normalization arrays are available.
 
-The test set visualizations now display **denormalized delta values** (actual physical units) instead of normalized z-scores.
+There are two different output schemas:
 
-## What Changed
+- training-time test visualization output from `training_profiles/training_loop.py`
+- autoregressive rollout output from `inference_profiles/rollout.py`
 
-### Before
-- Visualizations showed normalized values: -0.0002 to 0.0002 (meaningless z-scores)
-- No unit labels
-- Hard to interpret physical meaning
+## Training-Time Test Visualization
 
-### After
-- Visualizations show actual delta values:
-  - **Stress deltas**: 5-30 MPa (typical stress changes between timesteps)
-  - **Displacement deltas**: 0.001-0.1 mm (typical displacement changes)
-- Proper unit labels: "(MPa)" for stress, "(mm)" for displacements
-- Clear feature names: "Δ Stress", "Δ Disp X", "Δ Disp Y", "Δ Disp Z"
+`test_model()` in `training_profiles/training_loop.py` is run at
+`test_interval` and at the last epoch. It calls
+`general_modules/mesh_utils_fast.py::save_inference_results_fast`.
 
-## Technical Details
+For each selected test graph it saves an HDF5 file under:
 
-### Normalization Statistics (from dataset)
+```text
+outputs/test_set/<gpu_ids>/<epoch>/
+```
+
+Training-set reconstruction visualizations, when enabled, use:
+
+```text
+outputs/train_set/<gpu_ids>/<epoch>/
+```
+
+The saved HDF5 groups include:
+
+```text
+nodes/
+  pos
+  predicted_norm
+  target_norm
+  predicted_denorm
+  target_denorm
+  optional part_ids
+edges/
+  index
+  attr
+faces/
+  index
+  predicted_norm
+  target_norm
+  predicted_denorm
+  target_denorm
+  optional part_ids
+```
+
+The corresponding PNG compares normalized and denormalized predicted/target face
+values.
+
+## Denormalization Formula
+
+The test visualization path reads `dataset.delta_mean` and `dataset.delta_std`
+from the train-split preprocessing state:
 
 ```python
-delta_mean = [4.96e-07, -7.68e-10, 1.22e-07, 8.79]  # Near zero for displacements, ~8.79 MPa for stress
-delta_std  = [1.63e-04, 1.40e-04, 4.21e-04, 14919.6]  # Very large for stress (14,919 MPa)
+predicted_denorm = predicted_norm * delta_std + delta_mean
+target_denorm = target_norm * delta_std + delta_mean
 ```
 
-### Why Values Appeared So Small
+If those arrays are missing, the code falls back to storing normalized values in
+the denormalized slots. That fallback should be treated as a diagnostic problem,
+not as physical output.
 
-The normalized values were tiny (-0.0002 to 0.0002) because:
-1. Model predicts **deltas** (state(t) - state(t-1))
-2. These are z-score normalized using `delta_std`
-3. For stress, `delta_std` = 14,919 MPa (very large)
-4. Example: actual delta of 10 MPa → normalized = 10/14919 = **0.00067**
+## Feature Names And Units
 
-### Denormalization Formula
+`plot_mesh_comparison()` uses a small fixed name table:
 
-```python
-actual_delta = normalized_delta * delta_std + delta_mean
+```text
+x_disp, y_disp, z_disp, stress
 ```
 
-For stress (feature index 3 or -1):
-```
-actual_stress_delta = norm_value * 14919.6 + 8.79
-```
+For three-channel displacement configs, the plotted features are displacement
+channels only. For four-channel configs, the last channel is treated as stress.
 
-## Code Changes
+Units are assigned by feature name:
 
-### 1. `training_loop.py`
-- Added `dataset` parameter to `infer_model()`
-- Extract `delta_mean` and `delta_std` from dataset
-- Denormalize predictions before saving: `predicted_denorm = predicted_np * delta_std + delta_mean`
+- displacement channels: `mm`
+- stress channel: `MPa`
 
-### 2. `mesh_utils_fast.py`
-- Updated `plot_mesh_comparison()` to show feature names and units
-- Added colorbar labels: "Δ Stress (MPa)", "Δ Disp X (mm)", etc.
-- Updated MAE in title to include units
+`plot_feature_idx -1` selects the last available predicted channel.
 
-### 3. `single_training.py` and `distributed_training.py`
-- Pass `dataset` to `infer_model()` call
+## Training Loss Versus Visualization Values
 
-## Visualization Output
+Loss is computed on normalized deltas:
 
-### Colorbar Label Examples
-- `Δ Stress (MPa)` - for stress deltas
-- `Δ Disp X (mm)` - for X displacement deltas
-- `Δ Disp Y (mm)` - for Y displacement deltas
-- `Δ Disp Z (mm)` - for Z displacement deltas
-
-### Title Example
-```
-Sample 42, Timestep 15 | MAE: 2.34 MPa
+```text
+Huber(predicted_norm, target_norm)
 ```
 
-## Expected Value Ranges
+Denormalization is only for saved inspection artifacts and plots. It does not
+change training gradients, validation loss, checkpoint selection, or rollout
+state updates.
 
-Based on dataset statistics:
+## Rollout Output
 
-| Feature | Typical Delta Range |
-|---------|-------------------|
-| Disp X | 0.0001 - 0.05 mm |
-| Disp Y | 0.0001 - 0.05 mm |
-| Disp Z | 0.0001 - 0.1 mm |
-| Stress | 5 - 30 MPa |
+Autoregressive rollout uses a different HDF5 schema. It writes one dataset-like
+file per sample or per VAE sample under `inference_output_dir` or
+`outputs/rollout`.
 
-## Notes
+The rollout `nodal_data` layout is:
 
-- The model internally works with **normalized deltas** (for training stability)
-- Denormalization happens **only for visualization** (after inference)
-- HDF5 output files contain both normalized and denormalized values
-- Loss computation uses normalized values (unchanged)
-
-## Usage
-
-No changes required to your workflow. Just run training as usual:
-
-```bash
-python MeshGraphNets_main.py
+```text
+x, y, z, predicted output channels..., Part No.
 ```
 
-Test visualizations (every 10 epochs) will automatically show denormalized values with proper units.
+Rollout saves the predicted physical state over time, not the training-test
+`nodes/predicted_norm` schema. See `dataset/DATASET_FORMAT.md` for the complete
+rollout output contract.
 
-## Verification
+## Practical Checks
 
-Run the verification script to check normalization statistics:
+If plots look wrong:
 
-```bash
-python misc/check_normalization.py
-```
-
-This shows:
-- Dataset normalization parameters
-- Denormalization examples
-- Expected value ranges
+- confirm the checkpoint and dataset use the same normalization statistics
+- check `plot_feature_idx`
+- confirm `output_var` matches the intended channels
+- inspect `delta_mean` and `delta_std` printed by `test_model()`
+- remember that very small normalized values can still correspond to meaningful
+  physical deltas when `delta_std` is large

@@ -1,735 +1,283 @@
-# MeshGraphNets Architecture Documentation
+# MeshGraphNets Architecture
 
-## Overview
+This document describes the architecture implemented in the current codebase.
+The authoritative modules are:
 
-MeshGraphNets is a Graph Neural Network architecture designed for learning mesh-based simulations. It uses **Graph Network (GN) blocks** to perform message passing on mesh structures, enabling predictions of physical field data from mesh geometry.
+- `model/MeshGraphNets.py`
+- `model/encoder_decoder.py`
+- `model/blocks.py`
+- `model/mlp.py`
+- `model/vae.py`
+- `model/conditional_prior.py`
+- `training_profiles/training_loop.py`
+- `training_profiles/posthoc_prior.py`
 
-**Paper**: "Learning Mesh-Based Simulation with Graph Networks" (Pfaff et al., 2020, ICML)
-**Original Implementation**: DeepMind Research (TensorFlow)
-**Our Implementation**: PyTorch + PyTorch Geometric
+## Runtime Entry Points
 
----
+`MeshGraphNets_main.py` loads a text config and dispatches by `mode`:
 
-## Table of Contents
+| Mode | Runtime path |
+| --- | --- |
+| `train` | simulator training through `single_training.py` or DDP in `distributed_training.py` |
+| `train_with_prior` | simulator training, then post-hoc conditional-prior training |
+| `train_prior` | post-hoc conditional-prior training against an existing checkpoint |
+| `inference` | rollout through `inference_profiles/rollout.py` |
 
-1. [High-Level Architecture](#high-level-architecture)
-2. [Graph Representation](#graph-representation)
-3. [Core Components](#core-components)
-4. [Data Flow](#data-flow)
-5. [Hyperparameters](#hyperparameters)
-6. [Implementation Details](#implementation-details)
+With multiple `gpu_ids`, the default path is DDP data parallelism. Setting
+`parallel_mode model_split` uses the experimental pipeline split launcher under
+`parallelism/`.
 
----
+## Graph Contract
 
-## High-Level Architecture
+Each training sample becomes a PyG `Data` or `MultiscaleData` object with:
 
-MeshGraphNets follows an **Encode-Process-Decode** paradigm:
+| Field | Shape | Meaning |
+| --- | --- | --- |
+| `x` | `[N, input_var + positional_features + optional node_types]` | normalized node input |
+| `y` | `[N, output_var]` | normalized target delta |
+| `pos` | `[N, 3]` | unnormalized reference position |
+| `edge_index` | `[2, E]` | bidirectional mesh edges |
+| `edge_attr` | `[E, 8]` | normalized mesh edge features |
+| `world_edge_index` | `[2, E_world]` | optional radius edges, empty when disabled |
+| `world_edge_attr` | `[E_world, 8]` | optional normalized world-edge features |
+| `part_ids` | `[N]` | optional raw part numbers for visualization |
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         MESHGRAPHNET                                │
-│                                                                     │
-│  ┌──────────┐      ┌──────────────┐      ┌──────────┐            │
-│  │          │      │              │      │          │            │
-│  │ ENCODER  │ ───> │  PROCESSOR   │ ───> │ DECODER  │            │
-│  │          │      │  (15 layers) │      │          │            │
-│  └──────────┘      └──────────────┘      └──────────┘            │
-│       │                    │                    │                 │
-│   Embed to             Message              Map to               │
-│   latent              Passing              output                │
-│   space                                                          │
-└─────────────────────────────────────────────────────────────────────┘
-```
+`edge_var` must be `8`. The code validates it against `EDGE_FEATURE_DIM` in
+`general_modules/edge_features.py`.
 
-### Component Breakdown
+Edge feature order:
 
-```
-INPUT:
-  Node Features: [num_nodes, node_input_dim]
-  Edge Features: [num_edges, edge_input_dim]
-  Graph Topology: edge_index [2, num_edges]
-
-       ↓
-
-┌─────────────────────────────────────────┐
-│           ENCODER                       │
-│  ┌────────────────┐  ┌───────────────┐ │
-│  │  Node Encoder  │  │ Edge Encoder  │ │
-│  │   (MLP + LN)   │  │  (MLP + LN)   │ │
-│  └────────────────┘  └───────────────┘ │
-│         │                    │          │
-│    [N, 128]             [E, 128]       │
-└─────────────────────────────────────────┘
-
-       ↓
-
-┌─────────────────────────────────────────┐
-│          PROCESSOR                      │
-│  ┌────────────────────────────────┐    │
-│  │   Graph Network Block 1        │    │
-│  │  (Edge Update + Node Update)   │    │
-│  └────────────────────────────────┘    │
-│              ↓                          │
-│  ┌────────────────────────────────┐    │
-│  │   Graph Network Block 2        │    │
-│  └────────────────────────────────┘    │
-│              ↓                          │
-│            ...                          │
-│              ↓                          │
-│  ┌────────────────────────────────┐    │
-│  │   Graph Network Block 15       │    │
-│  └────────────────────────────────┘    │
-└─────────────────────────────────────────┘
-
-       ↓
-
-┌─────────────────────────────────────────┐
-│           DECODER                       │
-│  ┌────────────────┐                    │
-│  │  Node Decoder  │                    │
-│  │     (MLP)      │                    │
-│  └────────────────┘                    │
-│         │                               │
-│    [N, output_dim]                     │
-└─────────────────────────────────────────┘
-
-       ↓
-
-OUTPUT:
-  Predicted Fields: [num_nodes, node_output_dim]
+```text
+deformed_dx, deformed_dy, deformed_dz, deformed_dist,
+ref_dx, ref_dy, ref_dz, ref_dist
 ```
 
----
+For single-timestep datasets, the node input physical channels are zeros and the
+target is the final displacement/state. For multi-timestep datasets, the node
+input is state `t` and the target is `state[t + 1] - state[t]`.
 
-## Graph Representation
+## MLP Building Block
 
-### Mesh as Graph
+`model/mlp.py::build_mlp` builds:
 
-A mesh structure is represented as a graph where:
-- **Nodes** = mesh vertices/points
-- **Edges** = mesh connectivity (edges, faces)
-
-```
-Mesh Example (2D):                 Graph Representation:
-
-    v2 -------- v3                     n2 -------- n3
-    |  \        |                      |  \        |
-    |    \      |                      |    \      |
-    |      \    |                      |      \    |
-    v0 -------- v1                     n0 -------- n1
-
-Physical Mesh                      Graph Structure
-- Vertices                         - Nodes
-- Edges/Faces                      - Edges
+```text
+Linear -> SiLU -> Linear -> SiLU -> Linear -> optional LayerNorm
 ```
 
-### Edge Features from Geometry
+LayerNorm is enabled for encoders, processor blocks, coarse edge encoders,
+unpool blocks, VAE encoders, and the conditional prior. It is disabled for the
+final simulator decoder and the VAE auxiliary decoder.
 
-For each edge connecting nodes i and j:
+Weights are initialized with Kaiming uniform for `nn.Linear` and zero bias.
 
-```
-Node i position: pi = [xi, yi, zi]
-Node j position: pj = [xj, yj, zj]
+## Flat Encoder-Processor-Decoder
 
-Relative Position Vector:
-  rij = pj - pi = [Δx, Δy, Δz]
+The top-level wrapper `MeshGraphNets` owns an `EncoderProcessorDecoder` as
+`model`.
 
-Euclidean Distance:
-  dij = ||rij||₂ = √(Δx² + Δy² + Δz²)
+### Encoder
 
-Edge Feature:
-  edge_attr = [Δx, Δy, Δz, dij]  ← 4D vector
-```
+`Encoder` maps raw node and edge features into `latent_dim`:
 
-**Visualization:**
+- node encoder: node input size to `latent_dim`
+- mesh edge encoder: 8-D edge features to `latent_dim`
+- optional world edge encoder: 8-D world-edge features to `latent_dim`
 
-```
-        pj (receiver)
-         ●
-        /│
-       / │
-      /  │ dij (distance)
-     /   │
-    /    │
-   /     │
-  ●──────┘
- pi (sender)
+### Processor
 
-  rij = [Δx, Δy, Δz]  (relative position vector)
-```
+When `use_multiscale False`, the processor is a `ModuleList` of
+`message_passing_num` `GnBlock` layers.
 
----
+Each `GnBlock` does:
 
-## Core Components
+1. Mesh edge update from sender node, receiver node, and current mesh edge state.
+2. Optional world edge update with the same edge-block structure.
+3. Node update from current node state plus summed incoming mesh edge messages.
+4. If world edges are enabled, node update also receives summed incoming
+   world-edge messages through `HybridNodeBlock`.
+5. Residual node and edge updates scaled by `residual_scale`.
+6. Optional PairNorm on node features when `use_pairnorm True`.
 
-### 1. Graph Network Block
+Aggregation is `sum`, matching the NVIDIA PhysicsNeMo deforming-plate style in
+the local comments.
 
-The fundamental building block is the **Graph Network (GN) Block**, which updates both edges and nodes.
+### Decoder
 
-```
-┌───────────────────────────────────────────────────────────────┐
-│                   GRAPH NETWORK BLOCK                         │
-│                                                               │
-│  Input: x [N, d], edge_index [2, E], edge_attr [E, d]       │
-│                                                               │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │ STEP 1: EDGE UPDATE                                  │    │
-│  │                                                       │    │
-│  │  For each edge (i→j):                                │    │
-│  │                                                       │    │
-│  │    ┌─────┐   ┌─────┐   ┌─────┐                      │    │
-│  │    │ x_i │   │ x_j │   │ e_ij│                      │    │
-│  │    └──┬──┘   └──┬──┘   └──┬──┘                      │    │
-│  │       │         │         │                          │    │
-│  │       └─────────┴─────────┘                          │    │
-│  │               │                                       │    │
-│  │          Concatenate                                 │    │
-│  │               │                                       │    │
-│  │               ▼                                       │    │
-│  │        ┌────────────┐                                │    │
-│  │        │  Edge MLP  │                                │    │
-│  │        └─────┬──────┘                                │    │
-│  │              │                                        │    │
-│  │              ▼                                        │    │
-│  │         e'_ij = e_ij + MLP([x_i, x_j, e_ij])        │    │
-│  │                         └──────────────┘             │    │
-│  │                         Residual Connection          │    │
-│  └─────────────────────────────────────────────────────┘    │
-│                                                               │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │ STEP 2: NODE UPDATE                                  │    │
-│  │                                                       │    │
-│  │  For each node i:                                    │    │
-│  │                                                       │    │
-│  │    Aggregate incoming edge messages:                 │    │
-│  │                                                       │    │
-│  │         e'_1i   e'_2i   e'_3i                        │    │
-│  │           │       │       │                          │    │
-│  │           └───────┼───────┘                          │    │
-│  │                   │                                   │    │
-│  │                  SUM                                 │    │
-│  │                   │                                   │    │
-│  │                   ▼                                   │    │
-│  │             ┌──────────┐                             │    │
-│  │        x_i  │  Aggr.   │                             │    │
-│  │          │  │ Messages │                             │    │
-│  │          │  └────┬─────┘                             │    │
-│  │          └───────┘                                    │    │
-│  │               │                                       │    │
-│  │          Concatenate                                 │    │
-│  │               │                                       │    │
-│  │               ▼                                       │    │
-│  │        ┌────────────┐                                │    │
-│  │        │  Node MLP  │                                │    │
-│  │        └─────┬──────┘                                │    │
-│  │              │                                        │    │
-│  │              ▼                                        │    │
-│  │         x'_i = x_i + MLP([x_i, Σe'_ji])             │    │
-│  │                      └────────────┘                  │    │
-│  │                      Residual Connection             │    │
-│  └─────────────────────────────────────────────────────┘    │
-│                                                               │
-│  Output: x' [N, d], edge_attr' [E, d]                       │
-└───────────────────────────────────────────────────────────────┘
+`Decoder` maps latent node states to `output_var` normalized delta channels. The
+decoder MLP has no final LayerNorm. For delta prediction (`num_timesteps` absent
+or greater than 1), the last decoder layer is scaled by `0.01` at construction
+time so the initial prior is close to no change.
+
+## Multiscale V-Cycle
+
+When `use_multiscale True`, the flat `message_passing_num` processor is replaced
+by a V-cycle built in `EncoderProcessorDecoder._build_multiscale_processor`.
+
+For `L = multiscale_levels`, `mp_per_level` must contain `2 * L + 1` integers:
+
+```text
+[pre_0, pre_1, ..., pre_(L-1), coarsest, post_(L-1), ..., post_1, post_0]
 ```
 
-### 2. MLP Architecture
+The default fallback for one level is:
 
-Each MLP (Multi-Layer Perceptron) follows this structure:
-
-```
-┌────────────────────────────────────────┐
-│           MLP STRUCTURE                │
-│                                        │
-│  Input [dim_in]                        │
-│      │                                 │
-│      ▼                                 │
-│  ┌────────────────┐                   │
-│  │ Linear(hidden) │                   │
-│  └────────┬───────┘                   │
-│           ▼                            │
-│  ┌────────────────┐                   │
-│  │  LayerNorm     │  ← Encoder/Proc  │
-│  └────────┬───────┘     only          │
-│           ▼                            │
-│  ┌────────────────┐                   │
-│  │     ReLU       │                   │
-│  └────────┬───────┘                   │
-│           ▼                            │
-│  ┌────────────────┐                   │
-│  │ Linear(hidden) │                   │
-│  └────────┬───────┘                   │
-│           ▼                            │
-│  ┌────────────────┐                   │
-│  │  LayerNorm     │  ← Encoder/Proc  │
-│  └────────┬───────┘     only          │
-│           ▼                            │
-│  ┌────────────────┐                   │
-│  │     ReLU       │                   │
-│  └────────┬───────┘                   │
-│           ▼                            │
-│  ┌────────────────┐                   │
-│  │ Linear(output) │                   │
-│  └────────┬───────┘                   │
-│           ▼                            │
-│  Output [dim_out]                     │
-│                                        │
-│  Note: Decoder MLP has NO LayerNorm   │
-└────────────────────────────────────────┘
+```text
+[fine_mp_pre, coarse_mp_num, fine_mp_post]
 ```
 
-**MLP Specifications:**
-- **Encoder/Processor MLPs**: 2 hidden layers + output layer, with LayerNorm after each Linear
-- **Decoder MLP**: 2 hidden layers + output layer, NO LayerNorm
-- **Activation**: ReLU
-- **Hidden size**: 128 (default)
+The forward pass is:
 
-### 3. Message Passing Visualization
+1. Encode the fine graph.
+2. Run pre-blocks on each level.
+3. Save a fine-level skip state.
+4. Pool node states by `fine_to_coarse_i`.
+5. Encode the corresponding coarse edge attributes.
+6. Run coarsest blocks.
+7. Unpool back up each level.
+8. Merge skip state and unpooled state with `skip_projs[i]`, a linear projection
+   from `2 * latent_dim` to `latent_dim`.
+9. Run post-blocks and decode.
 
-```
-BEFORE Message Passing:              AFTER Message Passing:
+If `bipartite_unpool True`, unpooling is a learned `UnpoolBlock` over
+`unpool_edge_index_i` using coarse state, fine skip state, and relative position.
+Otherwise, coarse node states are broadcast to fine nodes by cluster assignment.
 
-    n2 -------- n3                      n2' ------- n3'
-    |  \        |                       |  \        |
-    |    \      |                       |    \      |
-    |      \    |                       |      \    |
-    n0 -------- n1                      n0' ------- n1'
+There is no global gated skip module in the current code. Skip merging is the
+per-level linear `skip_projs` described above.
 
-Each node has:                      Each node updated with:
-- Own features                      - Own features
-                                    - Aggregated neighbor info
+World-edge message passing only applies on the original fine level. Coarse-level
+blocks are constructed with `use_world_edges False`.
 
-Example for node n1:
+## VAE Branch
 
-STEP 1 - Edge Updates:
-  e(0→1) ← MLP([n0, n1, e(0→1)])
-  e(2→1) ← MLP([n2, n1, e(2→1)])
-  e(3→1) ← MLP([n3, n1, e(3→1)])
+When `use_vae True`, the model adds a graph variational encoder and injects a
+global latent `z` into the simulator processor.
 
-STEP 2 - Aggregate:
-  messages_1 = e'(0→1) + e'(2→1) + e'(3→1)
-                  │        │        │
-                  └────────┼────────┘
-                           │
-                          SUM
+### Posterior Encoder
 
-STEP 3 - Node Update:
-  n1' ← MLP([n1, messages_1])
-```
+`GNNVariationalEncoder` encodes target delta `y` into a graph-level latent:
 
----
+1. Encode `y` with an MLP.
+2. If `vae_graph_aware True`, encode graph input `x` with a second MLP and fuse
+   it with the encoded `y`.
+3. Encode 8-D mesh edge attributes.
+4. Run `vae_mp_layers` `GnBlock` layers.
+5. Pool with `GlobalAttention`.
+6. Predict `mu` and `logvar`.
+7. Reparameterize to sample `z`.
 
-## Data Flow
+The posterior regularizer used in training is MMD between sampled posterior `z`
+and `N(0,I)`. Optional free-bits KL can be enabled with `free_bits > 0`.
 
-### Complete Forward Pass
+### Latent Injection
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      FORWARD PASS                               │
-└─────────────────────────────────────────────────────────────────┘
+During training, the simulator uses posterior `z`. During inference, it uses a
+fixed `z`, conditional-prior sample, legacy GMM sample, or standard normal sample
+depending on checkpoint contents and config.
 
-INPUT DATA:
-  Mesh geometry:    Node positions [95008, 3]
-  Graph topology:   edge_index [2, num_edges]
-  Node features:    Initial conditions, BCs [95008, feat_dim]
+Flat processor:
 
-                            ↓
+- one `z_fusers[i]` linear layer per processor block
+- each fuser maps `[node_latent, z]` back to `latent_dim`
 
-┌─────────────────────────────────────────────────────────────────┐
-│ PREPROCESSING: Compute Edge Features                           │
-│                                                                 │
-│  for each edge (i, j) in edge_index:                           │
-│    relative_pos = pos[j] - pos[i]        # [Δx, Δy, Δz]       │
-│    distance = ||relative_pos||           # scalar              │
-│    edge_attr[i,j] = [relative_pos, distance]  # 4D            │
-└─────────────────────────────────────────────────────────────────┘
+Multiscale processor:
 
-                            ↓
+- separate fusers for each pre arm, coarsest arm, and post arm
+- pooled batch assignments are used to map graph-level `z` to coarse nodes
 
-┌─────────────────────────────────────────────────────────────────┐
-│ ENCODER                                                         │
-│                                                                 │
-│  Node: [95008, feat_dim] → MLP → [95008, 128]                 │
-│  Edge: [E, 4] → MLP → [E, 128]                                │
-└─────────────────────────────────────────────────────────────────┘
+The auxiliary decoder predicts per-graph target mean and standard deviation from
+`z`, and its loss is weighted by `beta_aux`.
 
-                            ↓
+## Conditional Prior
 
-┌─────────────────────────────────────────────────────────────────┐
-│ PROCESSOR (15 iterations)                                       │
-│                                                                 │
-│  Layer 1:  GN Block → [95008, 128], [E, 128]                  │
-│  Layer 2:  GN Block → [95008, 128], [E, 128]                  │
-│  Layer 3:  GN Block → [95008, 128], [E, 128]                  │
-│  ...                                                            │
-│  Layer 15: GN Block → [95008, 128], [E, 128]                  │
-│                                                                 │
-│  Each layer performs:                                          │
-│    1. Update all edges                                         │
-│    2. Aggregate messages to nodes                              │
-│    3. Update all nodes                                         │
-└─────────────────────────────────────────────────────────────────┘
+`model/conditional_prior.py::ConditionalMixturePrior` is a post-hoc prior network
+for VAE checkpoints.
 
-                            ↓
+It uses the same node input accounting as the simulator:
 
-┌─────────────────────────────────────────────────────────────────┐
-│ DECODER                                                         │
-│                                                                 │
-│  Node: [95008, 128] → MLP → [95008, output_dim]               │
-│                                                                 │
-│  (Edge features discarded)                                      │
-└─────────────────────────────────────────────────────────────────┘
-
-                            ↓
-
-OUTPUT:
-  Predicted field: [95008, output_dim]
-  (e.g., velocity field, pressure, temperature, etc.)
+```text
+input_var + positional_features + optional num_node_types
 ```
 
----
+Its edge input is also `edge_var`, which must be 8. The prior:
 
-## Hyperparameters
+1. Encodes node and edge features.
+2. Runs `prior_mp_layers` graph blocks.
+3. Pools with `GlobalAttention`.
+4. Predicts mixture logits, means, and log standard deviations for
+   `prior_mixture_components` Gaussian components in latent-z space.
 
-### Default Configuration (from DeepMind paper)
+`training_profiles/posthoc_prior.py` freezes the simulator, samples target
+posterior latents from the simulator VAE encoder, optimizes mixture negative
+log-likelihood, and appends these checkpoint keys:
 
-| Parameter                    | Value | Description                              |
-|------------------------------|-------|------------------------------------------|
-| **Latent Dimension**         | 128   | Hidden feature size for nodes/edges      |
-| **MLP Hidden Layers**        | 2     | Number of hidden layers per MLP         |
-| **MLP Hidden Size**          | 128   | Width of hidden layers                   |
-| **Message Passing Steps**    | 15    | Number of GN blocks in processor         |
-| **Aggregation Function**     | Sum   | How to combine incoming edge messages    |
-| **Normalization**            | LayerNorm | Applied after encoder/processor MLPs |
-| **Activation Function**      | ReLU  | Non-linearity in MLPs                   |
-| **Residual Connections**     | Yes   | On both edge and node updates           |
+- `conditional_prior_state_dict`
+- `conditional_prior_config`
+- `conditional_prior_metrics`
 
-### Architecture Summary Table
+At inference, `rollout.py` uses the conditional prior only when all of these are
+true after checkpoint model_config overrides:
 
-```
-┌────────────────────────────────────────────────────────────┐
-│ Component      │ Input         │ Output        │ Layers   │
-├────────────────────────────────────────────────────────────┤
-│ Node Encoder   │ [N, d_in]     │ [N, 128]      │ 3-layer  │
-│                │               │               │ MLP+LN   │
-├────────────────────────────────────────────────────────────┤
-│ Edge Encoder   │ [E, 4]        │ [E, 128]      │ 3-layer  │
-│                │               │               │ MLP+LN   │
-├────────────────────────────────────────────────────────────┤
-│ Edge MLP       │ [2×128+128]   │ [128]         │ 3-layer  │
-│ (in GN block)  │ = [384]       │               │ MLP+LN   │
-├────────────────────────────────────────────────────────────┤
-│ Node MLP       │ [128+128]     │ [128]         │ 3-layer  │
-│ (in GN block)  │ = [256]       │               │ MLP+LN   │
-├────────────────────────────────────────────────────────────┤
-│ Processor      │ [N,128],[E,128│ [N,128],[E,128│ 15 GN    │
-│                │               │               │ blocks   │
-├────────────────────────────────────────────────────────────┤
-│ Decoder        │ [N, 128]      │ [N, d_out]    │ 3-layer  │
-│                │               │               │ MLP only │
-└────────────────────────────────────────────────────────────┘
+- `use_vae True`
+- `use_conditional_prior True`
+- checkpoint contains `conditional_prior_state_dict`
 
-Legend: N = num_nodes, E = num_edges
-        d_in = input feature dim, d_out = output dim
-        LN = LayerNorm
+If that path is not active, VAE inference falls back to the legacy GMM artifact
+when present; otherwise it samples `N(0,I)`.
+
+Sampling temperature divides mixture logits and scales component standard
+deviations by `sqrt(temperature)`.
+
+## Training Objective
+
+The simulator predicts normalized target deltas. Reconstruction loss is Huber
+loss with `delta=1.0`, optionally weighted per output channel by
+`feature_loss_weights` after normalizing those weights to sum to 1.
+
+Without VAE:
+
+```text
+loss = reconstruction_loss
 ```
 
----
+With VAE:
 
-## Implementation Details
-
-### 1. Residual Connections
-
-Residual connections are crucial for training deep networks (15 layers):
-
-```
-WITHOUT Residuals:              WITH Residuals:
-
-x → MLP → x'                    x → MLP ──┐
-                                          │
-Gradient vanishing                        │ +
-issues after 15 layers                    │
-                                          ↓
-                                x ────→  x' = x + MLP(x)
-
-                                Stable gradients,
-                                easier optimization
+```text
+loss = alpha_recon * reconstruction_loss
+     + lambda_mmd * mmd_loss
+     + beta_aux * auxiliary_loss
+     + optional free_bits_kl
 ```
 
-**Mathematical Form:**
+Other training behavior:
+
+- Adam optimizer, fused when CUDA is available.
+- Linear warmup followed by cosine warm restarts.
+- bfloat16 autocast when `use_amp True`.
+- gradient clipping with max norm `3.0`.
+- optional EMA shadow model.
+- optional activation checkpointing during training.
+- optional `torch.compile(dynamic=True)`.
+
+## Checkpoint And Inference Behavior
+
+Training checkpoints store:
+
+- model, optimizer, scheduler states
+- optional EMA state
+- train and validation losses
+- train-split normalization
+- architecture-critical `model_config`
+- optional VAE prior diagnostics
+
+Inference first loads normalization, then applies checkpoint `model_config` over
+the runtime config. This is intentional for shape safety, but it means changing
+architecture or prior keys only in an inference config may not take effect if
+the checkpoint stored different values.
+
+Rollout writes HDF5 files under `inference_output_dir` or `outputs/rollout` by
+default. The saved nodal layout is:
+
+```text
+x, y, z, predicted output channels..., Part No.
 ```
-Edge update:
-  e'_ij = e_ij + EdgeMLP([x_i, x_j, e_ij])
-          └────┘
-          Residual
-
-Node update:
-  x'_i = x_i + NodeMLP([x_i, Σe'_ji])
-         └──┘
-         Residual
-```
-
-### 2. Layer Normalization
-
-LayerNorm normalizes features across the feature dimension:
-
-```
-Before LayerNorm:                After LayerNorm:
-
-Feature values vary widely       Features normalized:
-                                 mean ≈ 0, std ≈ 1
-[10.2, -3.5, 100.4, -50.1]  →   [0.12, -0.45, 1.23, -0.90]
-
-Benefits:
-  ✓ Stable training
-  ✓ Faster convergence
-  ✓ Better gradient flow
-```
-
-**Applied to:**
-- Encoder MLPs (after each layer)
-- Processor MLPs (after each layer)
-- NOT applied to Decoder (to allow arbitrary output scale)
-
-### 3. Aggregation Function
-
-Sum aggregation combines messages from neighboring edges:
-
-```
-Node i receives messages from neighbors:
-
-        n_j         n_k         n_l
-         │           │           │
-      e'_ji       e'_ki       e'_li
-         │           │           │
-         └───────────┼───────────┘
-                     │
-                    SUM
-                     │
-                     ▼
-              aggregated_msg_i
-                     │
-                     ▼
-              NodeMLP([x_i, aggregated_msg_i])
-
-Alternative aggregations:
-  - Mean: average of messages
-  - Max: maximum across messages
-
-Sum is standard in MeshGraphNets
-```
-
-### 4. Memory Considerations
-
-For your mesh (95,008 nodes):
-
-```
-┌─────────────────────────────────────────────────────┐
-│ Memory Estimate (approximate)                       │
-├─────────────────────────────────────────────────────┤
-│                                                     │
-│ Nodes: 95,008                                       │
-│ Edges: ~6 × 95,008 = 570,048 (assuming 6 neighbors)│
-│                                                     │
-│ Node features: 95,008 × 128 × 4 bytes ≈ 48 MB      │
-│ Edge features: 570,048 × 128 × 4 bytes ≈ 292 MB    │
-│                                                     │
-│ Per GN block: ~340 MB                               │
-│ 15 GN blocks: ~5.1 GB                              │
-│                                                     │
-│ Recommendation:                                     │
-│   - Use gradient checkpointing                      │
-│   - Batch size = 1 or 2                            │
-│   - GPU with ≥16 GB VRAM                           │
-└─────────────────────────────────────────────────────┘
-```
-
----
-
-## Example: Predicting Flow Around Cylinder
-
-```
-INPUT MESH:                    OUTPUT PREDICTION:
-
-    Cylinder flow mesh             Velocity field
-
-    ○ ○ ○ ○ ○ ○ ○               ← ← ← ← ← ← ←
-    ○ ○ ● ● ○ ○ ○               ← ← ↑ ↓ → → →
-    ○ ○ ● ● ○ ○ ○               ← ← ↓ ↑ → → →
-    ○ ○ ○ ○ ○ ○ ○               ← ← ← ← ← ← ←
-
-    ● = cylinder                   Flow vectors around
-    ○ = fluid nodes               obstacle
-
-Node Features:                 Predicted Fields:
-- Position (x,y)               - Velocity (vx, vy)
-- Boundary flag                - Pressure (p)
-- Initial velocity
-
-Edge Features:
-- Relative position
-- Distance
-```
-
----
-
-## Comparison with Other GNN Architectures
-
-```
-┌──────────────┬─────────────┬──────────────┬─────────────┐
-│ Architecture │ Edge Update │ Aggregation  │ Best For    │
-├──────────────┼─────────────┼──────────────┼─────────────┤
-│ GCN          │ No          │ Mean         │ Node class. │
-│ GAT          │ No          │ Attention    │ Citations   │
-│ GraphSAGE    │ No          │ Mean/Max     │ Large graphs│
-│ MeshGraphNet │ YES         │ Sum          │ Mesh/Physics│
-└──────────────┴─────────────┴──────────────┴─────────────┘
-
-Key Advantage of MeshGraphNets:
-
-  Explicitly updates EDGE features, which encode
-  spatial relationships critical for physical systems
-
-  Standard GNNs only update nodes ✗
-  MeshGraphNets updates both nodes AND edges ✓
-```
-
----
-
-## Training Considerations
-
-### Loss Function
-
-For physics simulations, typically use:
-
-```
-L2 Loss (MSE):
-  L = Σ ||y_pred - y_true||²
-
-For your config (Loss_type = 1 → MSE):
-
-  loss = MSELoss(predicted_field, ground_truth_field)
-```
-
-### Normalization of Inputs/Outputs
-
-```
-┌─────────────────────────────────────────────────────┐
-│ CRITICAL: Normalize your data!                      │
-│                                                     │
-│ Before Training:                                    │
-│   1. Compute statistics on training set:           │
-│      μ_x, σ_x (node features)                      │
-│      μ_y, σ_y (output fields)                      │
-│                                                     │
-│   2. Normalize:                                     │
-│      x_norm = (x - μ_x) / σ_x                      │
-│      y_norm = (y - μ_y) / σ_y                      │
-│                                                     │
-│   3. Train on normalized data                       │
-│                                                     │
-│   4. Denormalize predictions:                       │
-│      y_pred = y_pred_norm × σ_y + μ_y              │
-└─────────────────────────────────────────────────────┘
-```
-
-### Autoregressive Rollout (Time-Series)
-
-For multi-timestep prediction:
-
-```
-Timestep:    t=0      t=1      t=2      t=3
-             │        │        │        │
-Input:       x₀ ───>  ·        ·        ·
-             │        │        │        │
-             ▼        │        │        │
-Predict:    MGN      MGN      MGN      MGN
-             │        │        │        │
-             ▼        ▼        ▼        ▼
-Output:     x₁ ───> x₂ ───> x₃ ───> x₄
-                     └─────>  └─────>
-
-Each prediction becomes input for next timestep
-(Errors accumulate!)
-```
-
----
-
-## Summary
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                  MESHGRAPHNET IN A NUTSHELL                 │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  What: GNN for mesh-based physical simulation              │
-│  How:  Encode-Process-Decode with Graph Network blocks     │
-│  Key:  Updates BOTH nodes AND edges with message passing   │
-│                                                             │
-│  Architecture:                                              │
-│    • Encoder: Embed raw features → latent space (128D)     │
-│    • Processor: 15 GN blocks with residual connections     │
-│    • Decoder: Map latent → output predictions              │
-│                                                             │
-│  Core Innovation:                                           │
-│    • Edge features encode spatial relationships            │
-│    • Two-stage update: edges first, then nodes             │
-│    • Residual connections for deep networks                │
-│                                                             │
-│  Use Cases:                                                 │
-│    ✓ Computational Fluid Dynamics (CFD)                    │
-│    ✓ Structural Mechanics                                  │
-│    ✓ Cloth Simulation                                      │
-│    ✓ Any mesh-based physics                                │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## References
-
-1. **Paper**: Pfaff, T., Fortunato, M., Sanchez-Gonzalez, A., & Battaglia, P. W. (2020).
-   "Learning Mesh-Based Simulation with Graph Networks." ICML 2021.
-   - ArXiv: https://arxiv.org/abs/2010.03409
-
-2. **Official Implementation**:
-   - https://github.com/google-deepmind/deepmind-research/tree/master/meshgraphnets
-
-3. **PyTorch Implementations**:
-   - https://github.com/echowve/meshGraphNets_pytorch
-   - https://github.com/wwMark/meshgraphnets
-
-4. **NVIDIA PhysicsNeMo Documentation**:
-   - https://docs.nvidia.com/physicsnemo/latest/user-guide/model_architecture/meshgraphnet.html
-
----
-
-## Next Steps for Implementation
-
-1. **Understand your data format**
-   - Mesh file format (VTK, FEM, etc.)
-   - Node feature dimensions
-   - Output field variables
-
-2. **Build graph from mesh**
-   - Extract connectivity → edge_index
-   - Compute edge features from geometry
-
-3. **Implement components**
-   - GraphNetworkBlock class
-   - MeshGraphNet class
-   - Data preprocessing
-
-4. **Training pipeline**
-   - Data normalization
-   - Loss function
-   - Optimizer (Adam recommended)
-
-5. **Evaluation**
-   - Rollout error for time-series
-   - Comparison with ground truth
-
----
-
-*End of Documentation*

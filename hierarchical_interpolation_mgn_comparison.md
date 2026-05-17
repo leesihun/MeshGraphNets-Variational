@@ -1076,3 +1076,268 @@ When comparing against broader PDE surrogate families, use this framing:
 - `general_modules/multiscale_helpers.py`
 - `general_modules/edge_features.py`
 - `ex1/config_train1.txt`
+
+---
+
+## 12. Appendix A. 2026-05-15 Code-Level Re-Verification
+
+Each implementation claim in Sections 1–4 was checked against the live code on
+2026-05-15. The result of that audit is summarised below.
+
+| Claim | Status | Citation |
+|---|---|---|
+| V-cycle with `mp_per_level` of length `2L+1` and per-level `Linear(2D→D)` skip merge | TRUE | `model/MeshGraphNets.py` 139–192, skip projection at 437–439 |
+| BFS bi-stride coarsening uses depth parity to choose coarse nodes | TRUE | `model/coarsening.py` 85–156 |
+| FPS-Voronoi: FPS seeds + multi-source BFS for graph-hop Voronoi (not Euclidean) | TRUE | `model/coarsening.py` 222–310 |
+| Coarse edges are boundary-induced from fine edges (no Euclidean kNN) | TRUE | `model/coarsening.py` 44–78 |
+| 8-D dual reference/deformed edge features | TRUE | `general_modules/edge_features.py` 4–23 |
+| Coarse edge features recomputed from centroid reference/deformed coordinates | TRUE | `general_modules/multiscale_helpers.py` 102–110 |
+| Learned bipartite unpool concatenates `[h_coarse, h_fine_skip, rel_pos]` over own + neighbour clusters | TRUE | `model/blocks.py` 102–135 |
+| Fine-to-coarse pooling is mean aggregation | TRUE | `model/coarsening.py` 379–396 |
+| World edges and the HybridNodeBlock are only active at the finest level (`i == 0`) | PARTIAL | `model/MeshGraphNets.py` 165 disables `use_we` for `i > 0` |
+
+Caveat to record in the paper. World edges and the HybridNodeBlock are *not*
+used at coarse V-cycle levels. Coarse-level long-range coupling therefore relies
+entirely on the multilevel mesh-edge processor, not on world-edge proximity.
+For contact-rich FEA problems this is a deliberate simplification worth stating
+explicitly rather than implying that world edges propagate through the V-cycle.
+
+---
+
+## 13. Appendix B. Publishability Assessment (2026-05-15)
+
+### 13.1 Per-Paper Closeness Grading
+
+The five papers most often quoted as "almost identical" to the current
+implementation are categorised below.
+
+| Paper | Closeness | What differs in the current implementation |
+|---|---|---|
+| Lino et al. 2021 (MultiScaleGNN, arXiv:2106.04900) | Same family, different mechanics. Multiple handcrafted scale graphs for continuum dynamics. | Automatic mesh-induced V-cycle, FEA-specific dual reference/deformed edge features, FPS-Voronoi size control. |
+| Yang et al. 2022 (AMGNET) | Closest in V-cycle skeleton. Coarsening is algebraic (strength-of-connection from a system matrix). | Topology/geometry coarsening that needs no matrix, learned bipartite unpool, autoregressive rollout instead of static field prediction. |
+| arXiv:2412.12757 2024 (Multigrid Graph U-Net for porous media) | Same V-cycle Graph U-Net family. Coefficient-aware AMG-aggregation pooling for steady multiphase flow. | See Appendix C for full breakdown. |
+| Perera and Agrawal 2024 (multigrid + AMR, CMAME) | V-cycle plus adaptive mesh refinement and transformer-style MP blocks. | Static hierarchy with no remeshing, GN blocks at coarse levels, simpler data pipeline. |
+| Lei et al. 2025 (M4GN, TMLR) | Three-tier segment hierarchy with macro transformer and modal-feature-guided segmentation. | Topology/geometry segmentation that needs no modal decomposition, pure GN processing, learned bipartite interpolation. |
+
+No paper above is a duplicate. The novelty in the present implementation is the
+*combination* of (i) FPS-Voronoi coarsening with explicit cluster count, (ii)
+boundary-induced coarse edges, (iii) centroid-recomputed reference/deformed
+edge features at every coarse level, and (iv) learned bipartite unpool that
+reads from the assigned cluster *and* its coarse neighbours. No single prior
+paper holds all four. Each piece in isolation has precedent.
+
+### 13.2 Venue Recommendation
+
+The combinatorial novelty above is enough for a strong applied venue but
+unlikely to clear NeurIPS / ICML / ICLR bars on architecture alone. Realistic
+targets:
+
+- CMAME, JCP, Computational Mechanics, Engineering with Computers. Strong fit.
+  Perera and Agrawal published in CMAME with a comparable scope.
+- TMLR. Plausible. M4GN landed here. TMLR explicitly accepts thorough
+  combination work without demanding architectural breakthrough.
+- NeurIPS / ICML / ICLR. Requires at least one of: (a) wins over BSMS-GNN,
+  MS-MGN, AND a transformer-style baseline (Transolver) on multiple benchmarks
+  with full ablations, (b) a theoretical statement about what boundary-induced
+  FPS-Voronoi coarsening preserves that competing schemes do not, (c) a million-
+  node scale demonstration, or (d) the variational/VAE branch that is excluded
+  from this comparison. Without one of these, the deterministic-only paper is
+  best routed to CMAME/TMLR.
+
+---
+
+## 14. Appendix C. Detailed Differentiation From Multigrid Graph U-Net For Porous Media
+
+Reference: "A Multigrid Graph U-Net Framework for Simulating Multiphase Flow in
+Heterogeneous Porous Media", arXiv:2412.12757, 2024. The high-level family is
+the same (V-cycle Graph U-Net with skip connections) so the difference must be
+made explicit at the level of each design axis.
+
+### 14.1 What Drives The Coarsening
+
+- Porous-media Multigrid Graph U-Net: aggregation pooling is **coefficient-
+  aware**. The permeability field (and related PDE coefficients) drives the
+  AMG-style strength-of-connection used to group fine cells into coarse
+  aggregates. Two adjacent cells whose interfacial permeability is high cluster
+  together; cells across a permeability discontinuity stay separated. Coarse
+  structure therefore reflects the physics of the specific instance.
+- Present implementation: coarsening is **topology- and geometry-driven only**.
+  BFS bi-stride uses mesh-graph distance. FPS-Voronoi uses Euclidean seeding
+  followed by graph-hop Voronoi assignment. No coefficient, material tag, or
+  permeability-like field feeds into the cluster decision. The same coarsening
+  would be produced for two FEA samples that share a mesh but differ in
+  material properties.
+
+Implication. Their pipeline cannot run without a coefficient field. Ours cannot
+exploit one even if available. For FEA structural problems where the
+"coefficient" is the constitutive law rather than a per-element scalar, the
+porous-media construction is not directly applicable.
+
+### 14.2 Coarse Adjacency
+
+- Theirs: coarse adjacency is induced by AMG strength-of-connection rules. A
+  coarse-coarse edge is present when the corresponding fine aggregates share
+  strongly connected cells in the coefficient-weighted graph.
+- Ours: coarse adjacency is purely boundary-induced. A coarse edge `(c1, c2)`
+  is present iff at least one fine edge crosses from the fine-node set assigned
+  to `c1` to the one assigned to `c2` (`model/coarsening.py` 44–78). No
+  coefficient weighting, no threshold hyperparameter.
+
+Implication. Ours has fewer hyperparameters than AMG strength-of-connection
+thresholds. Theirs adapts to coefficient heterogeneity; ours does not, but also
+does not need it.
+
+### 14.3 Edge Features
+
+- Theirs: edge features represent porous-media geometry between cell centres
+  plus, in some variants, permeability/transmissibility scalars. The medium
+  does not deform, so there is no notion of a deformed configuration.
+- Ours: 8-D dual feature `[deformed_dx, deformed_dy, deformed_dz,
+  deformed_distance, reference_dx, reference_dy, reference_dz,
+  reference_distance]` (`general_modules/edge_features.py` 4–23), recomputed at
+  every coarse level from centroid reference and deformed coordinates
+  (`general_modules/multiscale_helpers.py` 102–110). Reference geometry tracks
+  the undeformed mesh; deformed geometry tracks the current state. This is
+  meaningful only because the FEA setting has both — porous media do not.
+
+Implication. The edge-feature design is specific to deforming-mesh dynamics. It
+would be redundant for porous flow and is not present in their architecture.
+
+### 14.4 Prediction Mode
+
+- Theirs: operator-learning style. The network maps an input field
+  (permeability) to an output field (pressure / saturation) in essentially one
+  forward pass. No autoregressive rollout. The objective is the steady or
+  quasi-steady solution.
+- Ours: autoregressive time-stepper. The network predicts a normalised state
+  delta from the current state; rollout accumulates deltas across many
+  timesteps. Training contends with rollout drift (and, optionally, noise
+  injection) rather than a single-step regression loss.
+
+Implication. The two papers are evaluated against different metrics and against
+different failure modes. Their relevant baseline is FNO / Geo-FNO / GINO on
+steady operator regression. Our relevant baselines are BSMS-GNN, MS-MGN, and
+flat MGN on rollout error.
+
+### 14.5 Coarse-To-Fine Return
+
+- Theirs: recovery/interpolation is tied to the AMG operator. In aggregation
+  AMG, the natural prolongation is (loosely) the transpose of the aggregation
+  matrix, optionally smoothed by a Jacobi step. The interpolation therefore
+  follows the same coefficient-aware structure as the coarsening.
+- Ours: two configurable modes. Broadcast unpool is non-parametric. Learned
+  bipartite unpool (`model/blocks.py` 102–135) constructs each fine-node
+  message from `[h_coarse[c], h_fine_skip[f], rel_pos(c → f)]` over the
+  assigned coarse cluster and its neighbouring coarse clusters, then sums and
+  projects. Geometry-aware, not coefficient-aware. Strictly more expressive
+  than coefficient-weighted prolongation when coefficients are absent, strictly
+  less informed when coefficients are present.
+
+Implication. Their interpolation gets physics-informed routing for free from
+the AMG operator. Ours pays for expressiveness with parameters.
+
+### 14.6 Hierarchy Reuse Across Instances
+
+- Theirs: aggregation depends on the coefficient field. A new permeability
+  realisation requires a new hierarchy. This is acceptable in their setting
+  because each sample is one steady-state solve.
+- Ours: a static hierarchy is built once per mesh and reused across every
+  timestep of every rollout sample sharing that mesh. The amortisation is
+  favourable for long trajectories.
+
+### 14.7 Domain Of Applicability
+
+- Theirs: directly applicable when (i) a coefficient field exists, (ii) the
+  output is a steady scalar or vector field, (iii) the discretisation does not
+  deform.
+- Ours: directly applicable when (i) an FEA mesh exists, (ii) the prediction is
+  a time-evolving nodal state, (iii) the mesh may deform under load. No
+  coefficient field is required.
+
+These domains overlap conceptually (both are "V-cycle Graph U-Nets") but barely
+intersect in practice. Most FEA datasets do not expose a permeability-style
+coefficient; most porous-media datasets do not contain a deforming mesh.
+
+### 14.8 Summary Of Differentiation
+
+The current implementation differs from the porous-media Multigrid Graph U-Net
+on four axes simultaneously: information used for coarsening (geometry vs
+coefficients), coarse-edge construction (boundary-induced vs strength-of-
+connection), edge feature design (dual reference/deformed vs geometric/
+coefficient), and prediction mode (autoregressive delta vs single-shot
+operator). The remaining shared structure — V-cycle, mean-like pooling, skip
+connections — is generic to graph-multigrid architectures and is not unique to
+either paper.
+
+Suggested one-sentence framing for the paper.
+
+> Both methods follow a V-cycle Graph U-Net template, but the porous-media work
+> coarsens by permeability-weighted AMG aggregation and produces a steady
+> coefficient-to-field operator, whereas the present implementation coarsens
+> by topology and geometry alone and produces an autoregressive simulator for
+> deforming FEA meshes, with no coefficient field required.
+
+---
+
+## 15. Appendix D. Positioning Against X-MeshGraphNet
+
+X-MeshGraphNet (Nabian et al., arXiv:2411.17164, 2024) is framed by its authors
+as scalability infrastructure: it partitions large graphs with halo regions,
+performs gradient aggregation so that partitioned training approximates full-
+graph training, and constructs mesh-free multiscale graphs from tessellated
+geometry (e.g., STL files). It does not propose a new processor architecture;
+it proposes a way to scale MeshGraphNets-style processors to graphs that exceed
+a single GPU.
+
+The current implementation occupies an orthogonal axis. It assumes the mesh fits
+on one GPU and the bottleneck is not graph size but flat-MGN under-reaching on
+high-resolution meshes. The contribution is a learned multilevel V-cycle that
+shortens graph-hop communication, not a partitioning strategy.
+
+### 15.1 Honest Differentiation
+
+| Axis | X-MeshGraphNet | Present implementation |
+|---|---|---|
+| Primary problem | Mesh too large for one GPU. | Flat MGN under-reaches on a single-GPU mesh. |
+| Scale strategy | Graph partitioning + halo + distributed gradient aggregation. | Multilevel V-cycle on the full mesh. |
+| Input assumption | STL/CAD geometry + custom point-cloud graph construction. | FEA mesh with element connectivity already given. |
+| Multiscale graph | Coarse and fine point clouds built from geometry sampling. | Coarse and fine *mesh* hierarchies with boundary-induced coarse edges. |
+| Edge features | Geometric (relative position / distance). | 8-D dual reference/deformed features. |
+| Coarse-to-fine return | Multiscale processing across coarse and fine point graphs. | Broadcast or learned bipartite unpool with own- and neighbour-cluster reads. |
+| Infrastructure cost | Modulus / PhysicsNeMo, multi-GPU orchestration, halo exchange. | Single-process, single-GPU; standard PyTorch / PyG. |
+| Pre-existing mesh treatment | Replaced by point-cloud sampling. | Preserved and used as the primary computational structure. |
+
+### 15.2 Selling Points
+
+1. Orthogonal problem statement. X-MGN addresses "graph too big"; the present
+   work addresses "graph too deep". The two are complementary; a future version
+   of the present implementation could in principle run inside X-MGN's
+   partitioning framework.
+2. Mesh-native representation. For FEA solid mechanics the mesh already encodes
+   element connectivity, material tags, contact pairs, and boundary conditions.
+   Replacing it with a point-cloud graph discards physically meaningful
+   structure. The present implementation keeps it.
+3. Boundary-safe coarsening. Point-cloud multiscale construction can create
+   coarse edges across thin air gaps, contact interfaces, or topologically
+   disconnected parts. Boundary-induced coarse edges cannot, by construction.
+4. Dual reference/deformed edge geometry. Large-deformation structural problems
+   need both the undeformed and deformed configurations as explicit inputs.
+   X-MGN's edge features do not separate these.
+5. Single-GPU reproducibility. Most academic reviewers cannot run multi-A100
+   pipelines. A method that produces strong rollout accuracy on one GPU is
+   easier to reproduce, ablate, and extend.
+
+### 15.3 Recommended Framing
+
+> X-MeshGraphNet scales MeshGraphNets to graphs that exceed a single GPU
+> through partitioning, halo regions, and gradient aggregation. We address a
+> different and orthogonal limitation of flat MeshGraphNets: even within a
+> single-GPU mesh, message passing under-reaches across high-resolution
+> domains. Our hierarchical V-cycle could in principle be composed with
+> X-MeshGraphNet's partitioning, but in this paper we focus on the architecture
+> in a single-GPU, FEA-mesh-native setting where partitioning is not required
+> and where mesh topology is preserved rather than replaced by point-cloud
+> construction.
+
+This framing avoids competing on scale, which would lose, and instead
+emphasises mesh fidelity and orthogonality, which is defensible.
