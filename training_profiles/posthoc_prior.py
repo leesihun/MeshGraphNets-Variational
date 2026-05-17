@@ -90,7 +90,7 @@ def _evaluate_prior(prior, simulator, loader, device, config, diagnose=False):
     prior.eval()
     output_dim = int(config.get('output_var'))
     mc_samples = int(config.get('prior_mc_samples', 4))
-    loss_type = str(config.get('prior_loss_type', 'mc_nll')).lower()
+    loss_type = str(config.get('prior_loss_type', 'analytical_kl')).lower()
     total_loss = 0.0
     total_count = 0
     with torch.no_grad():
@@ -161,10 +161,10 @@ def train_posthoc_prior(config, config_filename='config.txt'):
     prior_batch_size = int(config.get('prior_batch_size', config.get('batch_size', 4)))
     prior_num_workers = int(config.get('prior_num_workers', 0))
     prior_val_interval = int(config.get('prior_val_interval', 10))
-    prior_diagnose_interval = int(config.get('prior_diagnose_interval', 0))
+    prior_diagnose_interval = int(config.get('prior_diagnose_interval', 10))
     output_dim = int(config.get('output_var'))
     mc_samples = int(config.get('prior_mc_samples', 4))
-    loss_type = str(config.get('prior_loss_type', 'mc_nll')).lower()
+    loss_type = str(config.get('prior_loss_type', 'analytical_kl')).lower()
     if loss_type not in ('mc_nll', 'analytical_kl'):
         raise ValueError(f"prior_loss_type must be 'mc_nll' or 'analytical_kl', got {loss_type}")
     print(f"  Prior loss type: {loss_type}")

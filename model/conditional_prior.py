@@ -23,7 +23,7 @@ class ConditionalMixturePrior(nn.Module):
         self.num_components = int(config.get('prior_mixture_components', 10))
         self.hidden_dim = int(config.get('prior_hidden_dim', config.get('latent_dim', 128)))
         self.num_mp_layers = int(config.get('prior_mp_layers', 3))
-        self.min_std = float(config.get('prior_min_std', 1e-3))
+        self.min_std = float(config.get('prior_min_std', 0.05))
 
         base_input_size = int(config.get('input_var'))
         base_input_size += int(config.get('positional_features', 0))
@@ -175,7 +175,7 @@ def build_prior_config(config):
         'prior_mixture_components': config.get('prior_mixture_components', 10),
         'prior_hidden_dim': config.get('prior_hidden_dim', config.get('latent_dim')),
         'prior_mp_layers': config.get('prior_mp_layers', 3),
-        'prior_min_std': config.get('prior_min_std', 1e-3),
-        'prior_loss_type': config.get('prior_loss_type', 'mc_nll'),
+        'prior_min_std': config.get('prior_min_std', 0.05),
+        'prior_loss_type': config.get('prior_loss_type', 'analytical_kl'),
         'residual_scale': config.get('residual_scale', 1.0),
     }
