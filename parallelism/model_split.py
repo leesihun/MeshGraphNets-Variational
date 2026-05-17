@@ -830,13 +830,14 @@ class ModelSplitStage(nn.Module):
         wei = getattr(encoded, 'world_edge_index', None) if self.use_world_edges else None
         return encoded.x, encoded.edge_attr, encoded.edge_index, wea, wei
 
-    def encode_vae(self, graph) -> Tuple:
+    def encode_vae(self, graph, use_zero_z: bool = False) -> Tuple:
         """Run VAE encoder on graph (stage 0 only).
 
         Returns (z_per_node, z_full, vae_losses, aux_loss).
           z_per_node  [N, vae_dim]         — fine-level (slot 0) per-node z for immediate use.
           z_full      [B, num_z, vae_dim]  — full latent for per-level slot selection in multiscale.
                                              None when num_z == 1 (no extra bundle tensor needed).
+        When use_zero_z=True, z is all-zeros with empty losses (deterministic auxiliary pass).
         """
         if not (self.is_first and self.use_vae):
             raise RuntimeError("encode_vae() called on wrong stage")
@@ -851,6 +852,16 @@ class ModelSplitStage(nn.Module):
 
         batch_bc = (original_batch if original_batch is not None
                     else torch.zeros(N, dtype=torch.long, device=device))
+        B = int(batch_bc.max().item()) + 1 if original_batch is not None else 1
+        zero_f = torch.zeros((), device=device, dtype=torch.float32)
+        empty_losses = {'mmd': zero_f, 'kl': zero_f, 'kl_raw': zero_f}
+
+        if use_zero_z:
+            z = torch.zeros(B, self._num_z, self._vae_latent_dim, device=device, dtype=dtype)
+            z_per_node = z[:, 0, :][batch_bc]
+            z_full = z if (self.use_multiscale and self._num_z > 1) else None
+            return z_per_node, z_full, empty_losses, zero_f.to(dtype=dtype)
+
         vae_free_bits   = float(self.config.get('free_bits', 0.0))
         vae_graph_aware = bool(self.config.get('vae_graph_aware', False))
 
@@ -865,10 +876,8 @@ class ModelSplitStage(nn.Module):
                 mu.float(), logvar.float(), free_bits=vae_free_bits)
             vae_losses = {'mmd': mmd, 'kl': kl_clamped, 'kl_raw': kl_raw}
         else:
-            B = int(batch_bc.max().item()) + 1 if original_batch is not None else 1
             z = torch.randn(B, self._num_z, self._vae_latent_dim, device=device, dtype=dtype)
-            zero = torch.zeros((), device=device, dtype=torch.float32)
-            vae_losses = {'mmd': zero, 'kl': zero, 'kl_raw': zero}
+            vae_losses = empty_losses
 
         # z is [B, num_z, D]. Slot 0 feeds the finest level (same as MeshGraphNets._forward_multiscale).
         z_per_node = z[:, 0, :][batch_bc] if z.dim() == 3 else z[batch_bc]
@@ -876,7 +885,6 @@ class ModelSplitStage(nn.Module):
 
         aux_loss = torch.zeros((), device=device, dtype=dtype)
         if self.training and use_posterior and original_y is not None:
-            B = z.shape[0]
             # Aux decoder uses fine-level slot (slot 0).
             z_for_aux = z[:, 0, :] if z.dim() == 3 else z
             y_mean = scatter(original_y, batch_bc, dim=0, dim_size=B, reduce='mean')

@@ -33,7 +33,8 @@ class MeshGraphNets(nn.Module):
     def set_checkpointing(self, enabled: bool):
         self.model.set_checkpointing(enabled)
 
-    def forward(self, graph, debug=False, add_noise=None, use_posterior=None, fixed_z=None):
+    def forward(self, graph, debug=False, add_noise=None, use_posterior=None,
+                fixed_z=None, use_zero_z=False):
         """
         Forward pass of the simulator.
 
@@ -41,6 +42,10 @@ class MeshGraphNets(nn.Module):
             - graph.x: normalized node features [N, input_var]
             - graph.edge_attr: normalized edge features [E, edge_var]
             - graph.y: normalized target delta (y_t+1 - x_t) [N, output_var]
+
+        use_zero_z: when True and use_vae=True, skip the VAE encoder and use z=0.
+            Returns empty vae_losses/aux_loss. Used by the deterministic auxiliary
+            loss (forces the graph-only pathway to predict y on its own).
 
         Returns:
             predicted: predicted normalized delta [N, output_var]
@@ -67,6 +72,7 @@ class MeshGraphNets(nn.Module):
 
         predicted, vae_losses, aux_loss = self.model(
             graph, debug=debug, use_posterior=use_posterior, fixed_z=fixed_z,
+            use_zero_z=use_zero_z,
         )
         return predicted, graph.y, vae_losses, aux_loss
 
@@ -263,9 +269,15 @@ class EncoderProcessorDecoder(nn.Module):
         return fuse_layer(torch.cat([x, z_per_node], dim=-1))
 
     def _encode_vae(self, original_y, original_x, original_edge_index, original_edge_attr,
-                    original_batch, N, device, dtype, use_posterior, fixed_z=None):
+                    original_batch, N, device, dtype, use_posterior, fixed_z=None,
+                    use_zero_z=False):
         zero = torch.zeros((), device=device, dtype=torch.float32)
         empty_losses = {'mmd': zero, 'kl': zero, 'kl_raw': zero}
+        if use_zero_z:
+            # Deterministic auxiliary path: skip encoder, force z=0.
+            B = int(original_batch.max().item()) + 1 if original_batch is not None else 1
+            z = torch.zeros(B, self.num_z, self.vae_latent_dim, device=device, dtype=dtype)
+            return z, empty_losses
         if fixed_z is not None:
             return fixed_z.to(device=device, dtype=dtype), empty_losses
         if use_posterior and original_y is not None:
@@ -298,15 +310,16 @@ class EncoderProcessorDecoder(nn.Module):
 
     # ── Forward ──────────────────────────────────────────────────────────────
 
-    def forward(self, graph, debug=False, use_posterior=None, fixed_z=None):
+    def forward(self, graph, debug=False, use_posterior=None, fixed_z=None,
+                use_zero_z=False):
         if use_posterior is None:
             use_posterior = self.training and self.use_vae
 
         if not self.use_multiscale:
-            return self._forward_flat(graph, debug, use_posterior, fixed_z)
-        return self._forward_multiscale(graph, debug, use_posterior, fixed_z)
+            return self._forward_flat(graph, debug, use_posterior, fixed_z, use_zero_z)
+        return self._forward_multiscale(graph, debug, use_posterior, fixed_z, use_zero_z)
 
-    def _forward_flat(self, graph, debug, use_posterior, fixed_z):
+    def _forward_flat(self, graph, debug, use_posterior, fixed_z, use_zero_z=False):
         original_y = getattr(graph, 'y', None)
         original_x = graph.x
         original_batch = getattr(graph, 'batch', None)
@@ -332,11 +345,13 @@ class EncoderProcessorDecoder(nn.Module):
                         else torch.zeros(N, dtype=torch.long, device=device))
             z, vae_losses = self._encode_vae(
                 original_y, original_x, original_edge_index, original_edge_attr,
-                original_batch, N, device, dtype, use_posterior, fixed_z=fixed_z
+                original_batch, N, device, dtype, use_posterior, fixed_z=fixed_z,
+                use_zero_z=use_zero_z,
             )
             # Flat path uses the first (and only, when num_z=1) z slot.
             z_per_node = z[:, 0, :][batch_bc] if z.dim() == 3 else z[batch_bc]
-            if self.training and original_y is not None:
+            # Skip aux_loss on the deterministic anchor pass (z is zero, no signal).
+            if self.training and original_y is not None and not use_zero_z:
                 aux_loss = self._aux_loss(z, original_y, original_batch, N, device)
 
         if self.use_checkpointing and self.training:
@@ -358,7 +373,7 @@ class EncoderProcessorDecoder(nn.Module):
             print(f"  After Decoder: out std={output.std().item():.4f}, mean={output.mean().item():.4f}")
         return output, vae_losses, aux_loss
 
-    def _forward_multiscale(self, graph, debug, use_posterior, fixed_z):
+    def _forward_multiscale(self, graph, debug, use_posterior, fixed_z, use_zero_z=False):
         L = self.multiscale_levels
 
         original_y = getattr(graph, 'y', None)
@@ -391,12 +406,14 @@ class EncoderProcessorDecoder(nn.Module):
                         else torch.zeros(N, dtype=torch.long, device=device))
             z, vae_losses = self._encode_vae(
                 original_y, original_x, original_edge_index, original_edge_attr,
-                original_batch, N, device, dtype, use_posterior, fixed_z=fixed_z
+                original_batch, N, device, dtype, use_posterior, fixed_z=fixed_z,
+                use_zero_z=use_zero_z,
             )
             # Per-level z: z is [B, num_z, D]. Slot 0 feeds the finest level.
             current_z_per_node = z[:, 0, :][batch_bc]
             current_batch = batch_bc
-            if self.training and original_y is not None:
+            # Skip aux_loss on the deterministic anchor pass (z is zero, no signal).
+            if self.training and original_y is not None and not use_zero_z:
                 aux_loss = self._aux_loss(z, original_y, original_batch, N, device)
 
         # Descending arm (fine → coarse)

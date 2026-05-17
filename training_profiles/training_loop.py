@@ -109,8 +109,10 @@ def log_training_config(config):
         lam     = config.get('lambda_mmd', 100.0)
         b_aux   = config.get('beta_aux', 0.1)
         alpha   = config.get('alpha_recon', 1.0)
+        l_det   = config.get('lambda_det', 0.5)
         print(f"VAE (MMD): ENABLED (z_dim={z_dim}, vae_mp_layers={mp_enc}, "
-              f"lambda_mmd={lam}, beta_aux={b_aux}, alpha_recon={alpha})")
+              f"lambda_mmd={lam}, beta_aux={b_aux}, alpha_recon={alpha}, "
+              f"lambda_det={l_det})")
     else:
         print("VAE: disabled")
 
@@ -142,6 +144,7 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
     total_aux_sum = 0.0
     total_kl_sum = 0.0
     total_kl_raw_sum = 0.0
+    total_det_sum = 0.0
     mmd_count = 0
     num_batches = 0
     num_steps = 0  # number of optimizer steps taken
@@ -160,6 +163,9 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
     beta_aux = float(config.get('beta_aux', 1.0))
     # Free-bits floor: when > 0, adds a per-dim KL collapse safeguard (coefficient implicit = 1.0)
     free_bits = float(config.get('free_bits', 0.0))
+    # Deterministic auxiliary loss: forces the graph-only pathway (z=0) to predict y.
+    # Closes the "posterior shortcut" — prevents z from absorbing deterministic content.
+    lambda_det = float(config.get('lambda_det', 0.5)) if use_vae else 0.0
 
     # Gradient accumulation: 0 = full epoch (1 step/epoch), 1 = per-batch (default), N = every N batches
     grad_accum_steps = config.get('grad_accum_steps', 1)
@@ -183,6 +189,16 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
             kl_loss_val = vae_losses['kl']
             kl_raw_val = vae_losses['kl_raw']
 
+            # Deterministic auxiliary forward (z=0). Forces graph-only pathway to predict y,
+            # so z cannot absorb deterministic content via the encoder->y posterior shortcut.
+            # add_noise=False: the first forward already injected noise into graph in-place.
+            det_loss_val = predicted_acc.new_zeros(())
+            if use_vae and lambda_det > 0.0:
+                predicted_det, _, _, _ = model(graph, add_noise=False, use_zero_z=True)
+                errors_det = torch.nn.functional.huber_loss(
+                    predicted_det, target_acc, reduction='none', delta=1.0)
+                det_loss_val, _, _ = _loss_from_errors(errors_det, loss_weights)
+
             if batch_idx == 0 and verbose:
                 tqdm.tqdm.write(f"\n=== DEBUG Epoch {epoch} Batch 0 ===")
                 tqdm.tqdm.write(f"  Pred:   mean={predicted_acc.mean().item():.6f}, std={predicted_acc.std().item():.6f}, min={predicted_acc.min().item():.4f}, max={predicted_acc.max().item():.4f}")
@@ -197,6 +213,8 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
             recon_loss, batch_loss_sum, batch_loss_count = _loss_from_errors(errors, loss_weights)
             if use_vae:
                 loss = alpha_recon * recon_loss + lambda_mmd * mmd_loss_val + beta_aux * aux_loss_val
+                if lambda_det > 0.0:
+                    loss = loss + lambda_det * det_loss_val
                 if free_bits > 0.0:
                     loss = loss + kl_loss_val
             else:
@@ -227,10 +245,12 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
             aux_scalar = aux_loss_val.item() if hasattr(aux_loss_val, 'item') else float(aux_loss_val)
             kl_scalar = kl_loss_val.item() if hasattr(kl_loss_val, 'item') else float(kl_loss_val)
             kl_raw_scalar = kl_raw_val.item() if hasattr(kl_raw_val, 'item') else float(kl_raw_val)
+            det_scalar = det_loss_val.item() if hasattr(det_loss_val, 'item') else float(det_loss_val)
             total_mmd_sum += mmd_scalar
             total_aux_sum += aux_scalar
             total_kl_sum += kl_scalar
             total_kl_raw_sum += kl_raw_scalar
+            total_det_sum += det_scalar
             mmd_count += 1
 
         # Step optimizer at end of accumulation window or final batch
@@ -274,6 +294,9 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
                 postfix['mmd'] = f'{mmd_val:.2e}'
                 postfix['aux'] = f'{aux_val:.2e}'
                 postfix['λ']   = f'{lambda_mmd:.1e}'
+                if lambda_det > 0.0:
+                    det_v = det_loss_val.item() if hasattr(det_loss_val, 'item') else float(det_loss_val)
+                    postfix['det'] = f'{det_v:.2e}'
                 if free_bits > 0.0:
                     kl_val = kl_loss_val.item() if hasattr(kl_loss_val, 'item') else float(kl_loss_val)
                     kl_raw_v = kl_raw_val.item() if hasattr(kl_raw_val, 'item') else float(kl_raw_val)
@@ -303,6 +326,8 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
     if use_vae and mmd_count > 0:
         result['mmd_mean'] = total_mmd_sum / mmd_count
         result['aux_mean'] = total_aux_sum / mmd_count
+        if lambda_det > 0.0:
+            result['det_mean'] = total_det_sum / mmd_count
         if free_bits > 0.0:
             result['kl_mean'] = total_kl_sum / mmd_count
             result['kl_raw_mean'] = total_kl_raw_sum / mmd_count

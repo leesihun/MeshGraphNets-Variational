@@ -270,9 +270,12 @@ def _profile_and_partition(rank, config, train_loader, device, L, num_stages):
 # One-batch forward step (dispatches flat vs multiscale)
 # ---------------------------------------------------------------------------
 
-def _forward_step(stage: ModelSplitStage, graph, device, config):
+def _forward_step(stage: ModelSplitStage, graph, device, config,
+                  det_mode: bool = False):
     """Execute one forward pass for a single batch.
 
+    When det_mode=True, z is forced to zero (deterministic auxiliary loss pass).
+    Noise injection is skipped in det_mode (graph already noised by main pass).
     Returns sync_loss (scalar) for .backward(), and (loss, count) for last stage.
     """
     rank       = stage.stage_idx
@@ -288,18 +291,21 @@ def _forward_step(stage: ModelSplitStage, graph, device, config):
 
     # ---------- First stage ----------
     if is_first:
-        stage.apply_input_noise(graph)
+        if not det_mode:
+            stage.apply_input_noise(graph)
         x, ea, ei, wea, wei = stage.encode(graph)
 
-        # VAE: encode z on stage 0
+        # VAE: encode z on stage 0 (zeros in det_mode)
         z_per_node = None
         z_full = None
         vae_sync_loss = torch.zeros((), device=device, dtype=x.dtype)
         if use_vae:
-            z_per_node, z_full, vae_losses, aux_loss = stage.encode_vae(graph)
-            vae_sync_loss = (lambda_mmd * vae_losses['mmd'].to(dtype=x.dtype)
-                             + lambda_kl  * vae_losses['kl'].to(dtype=x.dtype)
-                             + beta_aux   * aux_loss.to(dtype=x.dtype))
+            z_per_node, z_full, vae_losses, aux_loss = stage.encode_vae(
+                graph, use_zero_z=det_mode)
+            if not det_mode:
+                vae_sync_loss = (lambda_mmd * vae_losses['mmd'].to(dtype=x.dtype)
+                                 + lambda_kl  * vae_losses['kl'].to(dtype=x.dtype)
+                                 + beta_aux   * aux_loss.to(dtype=x.dtype))
 
         # Run local blocks
         if not use_ms:
@@ -372,6 +378,9 @@ def _train_one_epoch(
     num_stages = stage.num_stages
     is_last    = stage.is_last
     use_ms     = stage.use_multiscale
+    use_vae    = stage.use_vae
+
+    lambda_det = float(config.get('lambda_det', 0.5)) if use_vae else 0.0
 
     for graph in loader:
         # All stages move graph when multiscale (pool/unpool need topology) or first/last
@@ -385,6 +394,15 @@ def _train_one_epoch(
                 stage, graph, device, config)
 
         sync_loss.backward()
+
+        # Deterministic auxiliary pass: second forward with z=0, accumulates gradients.
+        # Forces the graph pathway to predict y without relying on the VAE encoder.
+        if lambda_det > 0.0:
+            with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
+                det_sync_loss, _, _ = _forward_step(
+                    stage, graph, device, config, det_mode=True)
+            (lambda_det * det_sync_loss).backward()
+
         torch.nn.utils.clip_grad_norm_(stage.parameters(), max_norm=3.0)
         optimizer.step()
 
