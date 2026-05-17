@@ -99,6 +99,55 @@ def mixture_nll(params, target_z):
     return -torch.logsumexp(log_mix + comp_log_prob, dim=-1).mean()
 
 
+def analytical_prior_kl_loss(params, q_mu, q_logvar):
+    """Variational upper bound on KL(q(z|y) || prior_mixture(z|graph)).
+
+    Uses Jensen's inequality on log Σ_k π_k N_k(z):
+        log p(z) ≥ Σ_k π_k log N_k(z) + H(π)
+    Hence H(q, p) = -E_q[log p] ≤ -Σ_k π_k E_q[log N_k(z)] - H(π)
+
+    E_q[log N(z | μ_k, σ_k²)] is closed-form when q is diagonal Gaussian:
+        = -½ [D log 2π + Σ_d log σ_k_d² + Σ_d (σ_q_d² + (μ_q_d - μ_k_d)²) / σ_k_d²]
+
+    Critically, this loss is computed against the full posterior distribution
+    (μ_q, σ_q), not against single Monte Carlo samples. That eliminates the
+    component-overfitting failure of MC NLL where prior components collapse to
+    individual posterior samples rather than covering the posterior's spread.
+
+    Args:
+        params:    dict with 'logits' [B, K], 'mu' [B, K, D], 'log_std' [B, K, D]
+        q_mu:      posterior mean [B, D]
+        q_logvar:  posterior log variance [B, D]
+
+    Returns:
+        Scalar loss (upper bound on KL(q || p) up to the constant H(q)).
+    """
+    logits = params['logits']
+    mu = params['mu']
+    log_std = params['log_std']
+
+    q_mu_b = q_mu.unsqueeze(1)
+    q_var_b = torch.exp(q_logvar).unsqueeze(1)
+    D = q_mu.shape[-1]
+
+    log_var_k = 2.0 * log_std
+    var_k = torch.exp(log_var_k)
+
+    expected_log_pk = -0.5 * (
+        D * math.log(2.0 * math.pi)
+        + log_var_k.sum(dim=-1)
+        + ((q_var_b + (q_mu_b - mu).pow(2)) / var_k).sum(dim=-1)
+    )
+
+    log_pi = torch.log_softmax(logits, dim=-1)
+    pi = log_pi.exp()
+
+    weighted_term = -(pi * expected_log_pk).sum(dim=-1)
+    entropy_pi = -(pi * log_pi).sum(dim=-1)
+
+    return (weighted_term - entropy_pi).mean()
+
+
 def sample_from_mixture(params, temperature=1.0):
     logits = params['logits']
     mu = params['mu']
@@ -127,5 +176,6 @@ def build_prior_config(config):
         'prior_hidden_dim': config.get('prior_hidden_dim', config.get('latent_dim')),
         'prior_mp_layers': config.get('prior_mp_layers', 3),
         'prior_min_std': config.get('prior_min_std', 1e-3),
+        'prior_loss_type': config.get('prior_loss_type', 'mc_nll'),
         'residual_scale': config.get('residual_scale', 1.0),
     }

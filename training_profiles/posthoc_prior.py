@@ -7,6 +7,7 @@ from torch_geometric.loader import DataLoader
 from model.MeshGraphNets import MeshGraphNets
 from model.conditional_prior import (
     ConditionalMixturePrior,
+    analytical_prior_kl_loss,
     build_prior_config,
     mixture_nll,
 )
@@ -61,10 +62,15 @@ def _load_frozen_simulator(config, checkpoint, device):
     return model
 
 
-def _posterior_samples(simulator, graph, output_dim, mc_samples):
+def _posterior_params(simulator, graph, output_dim):
+    """Return analytical posterior params (mu, logvar). One forward pass."""
     inner = getattr(simulator, 'model', simulator)
     y = graph.y[:, :output_dim]
     _, mu, logvar = inner.vae_encoder(y, graph.edge_index, graph.edge_attr, graph.batch)
+    return mu, logvar
+
+
+def _posterior_samples_from(mu, logvar, mc_samples):
     if mc_samples <= 1:
         return mu
     std = torch.exp(0.5 * logvar)
@@ -72,21 +78,47 @@ def _posterior_samples(simulator, graph, output_dim, mc_samples):
     return mu.unsqueeze(0) + eps * std.unsqueeze(0)
 
 
-def _evaluate_prior(prior, simulator, loader, device, config):
+def _prior_loss(prior_params, q_mu, q_logvar, loss_type, mc_samples):
+    """Dispatch on loss_type. Returns scalar loss."""
+    if loss_type == 'analytical_kl':
+        return analytical_prior_kl_loss(prior_params, q_mu, q_logvar)
+    target_z = _posterior_samples_from(q_mu, q_logvar, mc_samples)
+    return mixture_nll(prior_params, target_z)
+
+
+def _evaluate_prior(prior, simulator, loader, device, config, diagnose=False):
     prior.eval()
     output_dim = int(config.get('output_var'))
     mc_samples = int(config.get('prior_mc_samples', 4))
+    loss_type = str(config.get('prior_loss_type', 'mc_nll')).lower()
     total_loss = 0.0
     total_count = 0
     with torch.no_grad():
-        for graph in loader:
+        for batch_idx, graph in enumerate(loader):
             graph = graph.to(device)
-            target_z = _posterior_samples(simulator, graph, output_dim, mc_samples)
+            q_mu, q_logvar = _posterior_params(simulator, graph, output_dim)
             params = prior(graph)
-            loss = mixture_nll(params, target_z)
+            loss = _prior_loss(params, q_mu, q_logvar, loss_type, mc_samples)
             bsz = int(graph.batch.max().item()) + 1 if hasattr(graph, 'batch') else 1
             total_loss += loss.item() * bsz
             total_count += bsz
+
+            if diagnose:
+                q_sigma = torch.exp(0.5 * q_logvar)
+                prior_sigma = torch.exp(params['log_std'])
+                log_pi = torch.log_softmax(params['logits'], dim=-1)
+                mix_entropy = -(log_pi.exp() * log_pi).sum(dim=-1)
+                sample_ids = getattr(graph, 'sample_id', None)
+                tag = f"sid={sample_ids}" if sample_ids is not None else f"batch={batch_idx}"
+                print(
+                    f"    [diag] {tag}  "
+                    f"q_sigma_mean={q_sigma.mean().item():.4f}  "
+                    f"q_sigma_max={q_sigma.max().item():.4f}  "
+                    f"q_mu_abs_mean={q_mu.abs().mean().item():.4f}  "
+                    f"prior_sigma_mean={prior_sigma.mean().item():.4f}  "
+                    f"prior_sigma_min={prior_sigma.min().item():.4f}  "
+                    f"mix_entropy={mix_entropy.mean().item():.4f}"
+                )
     prior.train()
     return total_loss / max(total_count, 1)
 
@@ -129,8 +161,14 @@ def train_posthoc_prior(config, config_filename='config.txt'):
     prior_batch_size = int(config.get('prior_batch_size', config.get('batch_size', 4)))
     prior_num_workers = int(config.get('prior_num_workers', 0))
     prior_val_interval = int(config.get('prior_val_interval', 10))
+    prior_diagnose_interval = int(config.get('prior_diagnose_interval', 0))
     output_dim = int(config.get('output_var'))
     mc_samples = int(config.get('prior_mc_samples', 4))
+    loss_type = str(config.get('prior_loss_type', 'mc_nll')).lower()
+    if loss_type not in ('mc_nll', 'analytical_kl'):
+        raise ValueError(f"prior_loss_type must be 'mc_nll' or 'analytical_kl', got {loss_type}")
+    print(f"  Prior loss type: {loss_type}")
+    print(f"  Prior min std:   {config.get('prior_min_std', 1e-3)}")
 
     train_loader = DataLoader(
         train_dataset,
@@ -160,9 +198,9 @@ def train_posthoc_prior(config, config_filename='config.txt'):
             graph = graph.to(device)
             optimizer.zero_grad(set_to_none=True)
             with torch.no_grad():
-                target_z = _posterior_samples(simulator, graph, output_dim, mc_samples)
+                q_mu, q_logvar = _posterior_params(simulator, graph, output_dim)
             params = prior(graph)
-            loss = mixture_nll(params, target_z)
+            loss = _prior_loss(params, q_mu, q_logvar, loss_type, mc_samples)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(prior.parameters(), max_norm=3.0)
             optimizer.step()
@@ -174,7 +212,11 @@ def train_posthoc_prior(config, config_filename='config.txt'):
         train_loss = total_loss / max(total_count, 1)
         do_val = (epoch % prior_val_interval == 0) or (epoch == prior_epochs - 1)
         if do_val and len(val_dataset) > 0:
-            val_loss = _evaluate_prior(prior, simulator, val_loader, device, config)
+            diagnose = (prior_diagnose_interval > 0
+                        and epoch % prior_diagnose_interval == 0)
+            val_loss = _evaluate_prior(
+                prior, simulator, val_loader, device, config, diagnose=diagnose
+            )
         else:
             val_loss = train_loss
 
