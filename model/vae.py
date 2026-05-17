@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 from torch_geometric.data import Data
@@ -35,9 +37,11 @@ class GNNVariationalEncoder(nn.Module):
     """
 
     def __init__(self, node_output_size, edge_input_size, latent_dim, vae_latent_dim,
-                 num_mp_layers=2, node_input_size=None, graph_aware=False):
+                 num_mp_layers=2, node_input_size=None, graph_aware=False,
+                 posterior_min_std=0.1):
         super().__init__()
         self.graph_aware = bool(graph_aware)
+        self.min_logvar = 2.0 * math.log(max(float(posterior_min_std), 1e-6))
         self.node_encoder = build_mlp(node_output_size, latent_dim, latent_dim)
         if self.graph_aware:
             if node_input_size is None:
@@ -82,7 +86,7 @@ class GNNVariationalEncoder(nn.Module):
             g = mp(g)
         h_graph = self.attention_pool(g.x, batch)
         mu = self.mu_head(h_graph)
-        logvar = self.logvar_head(h_graph)
+        logvar = self.logvar_head(h_graph).clamp(min=self.min_logvar)
         std = torch.exp(0.5 * logvar)
         z = mu + std * torch.randn_like(std)
         return z, mu, logvar

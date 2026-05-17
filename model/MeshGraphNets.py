@@ -202,16 +202,19 @@ class EncoderProcessorDecoder(nn.Module):
         vae_mp_layers = int(config.get('vae_mp_layers', 5))
         self.vae_graph_aware = bool(config.get('vae_graph_aware', False))
         self.vae_free_bits = float(config.get('free_bits', 0.0))
+        self.vae_posterior_min_std = float(config.get('posterior_min_std', 0.1))
         self.vae_encoder = GNNVariationalEncoder(
             self.node_output_size, self.edge_input_size,
             self.latent_dim, self.vae_latent_dim, num_mp_layers=vae_mp_layers,
             node_input_size=self.node_input_size,
             graph_aware=self.vae_graph_aware,
+            posterior_min_std=self.vae_posterior_min_std,
         )
         if self.vae_graph_aware:
             print(f"  VAE encoder: graph-aware (x [N,{self.node_input_size}] fused with y [N,{self.node_output_size}])")
         if self.vae_free_bits > 0:
             print(f"  VAE free-bits floor: {self.vae_free_bits} nats/dim")
+        print(f"  VAE posterior σ floor: {self.vae_posterior_min_std}")
 
         if not self.use_multiscale:
             self.z_fusers = nn.ModuleList([
