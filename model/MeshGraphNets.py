@@ -203,13 +203,21 @@ class EncoderProcessorDecoder(nn.Module):
         self.vae_graph_aware = bool(config.get('vae_graph_aware', False))
         self.vae_free_bits = float(config.get('free_bits', 0.0))
         self.vae_posterior_min_std = float(config.get('posterior_min_std', 0.1))
+        # Per-level z: one z per V-cycle level (L coarse-arm + 1 coarsest) for multiscale,
+        # else one global z. Allows level-specific stochastic modulation.
+        if self.use_multiscale:
+            self.num_z = int(config.get('num_z', self.multiscale_levels + 1))
+        else:
+            self.num_z = int(config.get('num_z', 1))
         self.vae_encoder = GNNVariationalEncoder(
             self.node_output_size, self.edge_input_size,
             self.latent_dim, self.vae_latent_dim, num_mp_layers=vae_mp_layers,
             node_input_size=self.node_input_size,
             graph_aware=self.vae_graph_aware,
             posterior_min_std=self.vae_posterior_min_std,
+            num_z=self.num_z,
         )
+        print(f"  VAE z slots: {self.num_z}")
         if self.vae_graph_aware:
             print(f"  VAE encoder: graph-aware (x [N,{self.node_input_size}] fused with y [N,{self.node_output_size}])")
         if self.vae_free_bits > 0:
@@ -273,18 +281,20 @@ class EncoderProcessorDecoder(nn.Module):
             )
             return z, {'mmd': mmd, 'kl': kl_clamped, 'kl_raw': kl_raw}
         B = int(original_batch.max().item()) + 1 if original_batch is not None else 1
-        z = torch.randn(B, self.vae_latent_dim, device=device, dtype=dtype)
+        z = torch.randn(B, self.num_z, self.vae_latent_dim, device=device, dtype=dtype)
         return z, empty_losses
 
     def _aux_loss(self, z, original_y, original_batch, N, device):
         batch = (original_batch if original_batch is not None
                  else torch.zeros(N, dtype=torch.long, device=device))
-        B = z.shape[0]
+        # Per-level z is [B, num_z, D]; aux decoder uses the fine-level slot.
+        z_for_aux = z[:, 0, :] if z.dim() == 3 else z
+        B = z_for_aux.shape[0]
         y_mean = scatter(original_y, batch, dim=0, dim_size=B, reduce='mean')
         y_centered = original_y - y_mean[batch]
         y_std = scatter(y_centered.pow(2), batch, dim=0, dim_size=B, reduce='mean').sqrt()
         aux_target = torch.cat([y_mean, y_std], dim=-1)
-        return torch.nn.functional.mse_loss(self.aux_decoder(z), aux_target)
+        return torch.nn.functional.mse_loss(self.aux_decoder(z_for_aux), aux_target)
 
     # ── Forward ──────────────────────────────────────────────────────────────
 
@@ -324,7 +334,8 @@ class EncoderProcessorDecoder(nn.Module):
                 original_y, original_x, original_edge_index, original_edge_attr,
                 original_batch, N, device, dtype, use_posterior, fixed_z=fixed_z
             )
-            z_per_node = z[batch_bc]
+            # Flat path uses the first (and only, when num_z=1) z slot.
+            z_per_node = z[:, 0, :][batch_bc] if z.dim() == 3 else z[batch_bc]
             if self.training and original_y is not None:
                 aux_loss = self._aux_loss(z, original_y, original_batch, N, device)
 
@@ -382,7 +393,8 @@ class EncoderProcessorDecoder(nn.Module):
                 original_y, original_x, original_edge_index, original_edge_attr,
                 original_batch, N, device, dtype, use_posterior, fixed_z=fixed_z
             )
-            current_z_per_node = z[batch_bc]
+            # Per-level z: z is [B, num_z, D]. Slot 0 feeds the finest level.
+            current_z_per_node = z[:, 0, :][batch_bc]
             current_batch = batch_bc
             if self.training and original_y is not None:
                 aux_loss = self._aux_loss(z, original_y, original_batch, N, device)
@@ -419,7 +431,9 @@ class EncoderProcessorDecoder(nn.Module):
 
             if self.use_vae and z is not None:
                 current_batch = scatter(current_batch, ld['ftc'], dim=0, dim_size=ld['n_c'], reduce='min')
-                current_z_per_node = z[current_batch]
+                # Advance to the next z slot (level i+1, or the coarsest slot when i == L-1).
+                next_slot = min(i + 1, z.shape[1] - 1)
+                current_z_per_node = z[:, next_slot, :][current_batch]
 
             if debug:
                 print(f"  [MS] After pool[{i}]: {skip_states[-1]['x'].shape[0]} → {h_coarse.shape[0]} nodes")

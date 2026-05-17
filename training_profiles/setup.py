@@ -174,12 +174,18 @@ def build_model_config(config) -> dict:
         'use_vae':           config.get('use_vae', False),
         'vae_latent_dim':    config.get('vae_latent_dim', 32),
         'vae_mp_layers':     config.get('vae_mp_layers', 5),
+        'vae_graph_aware':   config.get('vae_graph_aware', False),
+        'posterior_min_std': config.get('posterior_min_std', 0.1),
+        'num_z':             config.get('num_z',
+                                (config.get('multiscale_levels', 1) + 1)
+                                if config.get('use_multiscale', False) else 1),
         'beta_aux':          config.get('beta_aux', 1.0),
         'use_conditional_prior': config.get('use_conditional_prior', False),
         'prior_mixture_components': config.get('prior_mixture_components', 10),
         'prior_hidden_dim':   config.get('prior_hidden_dim', config.get('latent_dim')),
         'prior_mp_layers':    config.get('prior_mp_layers', 3),
-        'prior_min_std':      config.get('prior_min_std', 1e-3),
+        'prior_min_std':      config.get('prior_min_std', 0.05),
+        'prior_loss_type':    config.get('prior_loss_type', 'analytical_kl'),
     }
 
 

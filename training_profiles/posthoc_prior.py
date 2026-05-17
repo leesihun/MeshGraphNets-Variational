@@ -104,21 +104,28 @@ def _evaluate_prior(prior, simulator, loader, device, config, diagnose=False):
             total_count += bsz
 
             if diagnose:
-                q_sigma = torch.exp(0.5 * q_logvar)
-                prior_sigma = torch.exp(params['log_std'])
+                # q_mu, q_logvar: [B, num_z, D]; params shapes [B, num_z, K(,D)]
+                q_sigma = torch.exp(0.5 * q_logvar)          # [B, num_z, D]
+                prior_sigma = torch.exp(params['log_std'])   # [B, num_z, K, D]
                 log_pi = torch.log_softmax(params['logits'], dim=-1)
-                mix_entropy = -(log_pi.exp() * log_pi).sum(dim=-1)
+                mix_entropy = -(log_pi.exp() * log_pi).sum(dim=-1)  # [B, num_z]
                 sample_ids = getattr(graph, 'sample_id', None)
                 tag = f"sid={sample_ids}" if sample_ids is not None else f"batch={batch_idx}"
-                print(
-                    f"    [diag] {tag}  "
-                    f"q_sigma_mean={q_sigma.mean().item():.4f}  "
-                    f"q_sigma_max={q_sigma.max().item():.4f}  "
-                    f"q_mu_abs_mean={q_mu.abs().mean().item():.4f}  "
-                    f"prior_sigma_mean={prior_sigma.mean().item():.4f}  "
-                    f"prior_sigma_min={prior_sigma.min().item():.4f}  "
-                    f"mix_entropy={mix_entropy.mean().item():.4f}"
-                )
+                num_z = q_sigma.shape[1] if q_sigma.dim() == 3 else 1
+                for zi in range(num_z):
+                    q_s = q_sigma[:, zi, :] if q_sigma.dim() == 3 else q_sigma
+                    q_m = q_mu[:, zi, :] if q_mu.dim() == 3 else q_mu
+                    p_s = prior_sigma[:, zi, :, :] if prior_sigma.dim() == 4 else prior_sigma
+                    h_m = mix_entropy[:, zi] if mix_entropy.dim() == 2 else mix_entropy
+                    print(
+                        f"    [diag z{zi}] {tag}  "
+                        f"q_sigma_mean={q_s.mean().item():.4f}  "
+                        f"q_sigma_max={q_s.max().item():.4f}  "
+                        f"q_mu_abs_mean={q_m.abs().mean().item():.4f}  "
+                        f"prior_sigma_mean={p_s.mean().item():.4f}  "
+                        f"prior_sigma_min={p_s.min().item():.4f}  "
+                        f"mix_entropy={h_m.mean().item():.4f}"
+                    )
     prior.train()
     return total_loss / max(total_count, 1)
 

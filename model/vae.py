@@ -38,10 +38,12 @@ class GNNVariationalEncoder(nn.Module):
 
     def __init__(self, node_output_size, edge_input_size, latent_dim, vae_latent_dim,
                  num_mp_layers=2, node_input_size=None, graph_aware=False,
-                 posterior_min_std=0.1):
+                 posterior_min_std=0.1, num_z=1):
         super().__init__()
         self.graph_aware = bool(graph_aware)
         self.min_logvar = 2.0 * math.log(max(float(posterior_min_std), 1e-6))
+        self.num_z = int(num_z)
+        self.vae_latent_dim = int(vae_latent_dim)
         self.node_encoder = build_mlp(node_output_size, latent_dim, latent_dim)
         if self.graph_aware:
             if node_input_size is None:
@@ -55,8 +57,8 @@ class GNNVariationalEncoder(nn.Module):
             for _ in range(num_mp_layers)
         ])
         self.attention_pool = GlobalAttention(nn.Linear(latent_dim, 1))
-        self.mu_head = nn.Linear(latent_dim, vae_latent_dim)
-        self.logvar_head = nn.Linear(latent_dim, vae_latent_dim)
+        self.mu_head = nn.Linear(latent_dim, self.num_z * self.vae_latent_dim)
+        self.logvar_head = nn.Linear(latent_dim, self.num_z * self.vae_latent_dim)
 
     def forward(self, y, edge_index, edge_attr, batch, x=None):
         """
@@ -85,8 +87,9 @@ class GNNVariationalEncoder(nn.Module):
         for mp in self.mp_layers:
             g = mp(g)
         h_graph = self.attention_pool(g.x, batch)
-        mu = self.mu_head(h_graph)
-        logvar = self.logvar_head(h_graph).clamp(min=self.min_logvar)
+        B = h_graph.shape[0]
+        mu = self.mu_head(h_graph).view(B, self.num_z, self.vae_latent_dim)
+        logvar = self.logvar_head(h_graph).view(B, self.num_z, self.vae_latent_dim).clamp(min=self.min_logvar)
         std = torch.exp(0.5 * logvar)
         z = mu + std * torch.randn_like(std)
         return z, mu, logvar
@@ -120,6 +123,8 @@ class GNNVariationalEncoder(nn.Module):
         if free_bits <= 0.0:
             zero = mu.new_zeros(())
             return zero, zero
+        # mu / logvar accept [B, D] or [B, num_z, D]. Sum over the last (D) dim,
+        # mean over all leading dims so num_z and B are treated identically.
         kl_per_dim = 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar)
         kl_raw = kl_per_dim.sum(dim=-1).mean()
         kl_clamped = torch.clamp(kl_per_dim, min=free_bits).sum(dim=-1).mean()
@@ -144,6 +149,19 @@ class GNNVariationalEncoder(nn.Module):
         Returns:
             Scalar MMD² estimate (biased V-statistic). Non-negative.
         """
+        # Accept either [B, D] (single z) or [B, num_z, D] (per-level z).
+        # For per-level z, compute MMD independently per level and average so
+        # each z slot is regularised against N(0,I) on its own — preventing
+        # cross-level mixing in the kernel computation.
+        if z_posterior.dim() == 3:
+            mmd_acc = z_posterior.new_zeros(())
+            num_z = z_posterior.shape[1]
+            for i in range(num_z):
+                mmd_acc = mmd_acc + GNNVariationalEncoder.mmd_loss(
+                    z_posterior[:, i, :], kernel_sigmas=kernel_sigmas
+                )
+            return mmd_acc / num_z
+
         z_prior = torch.randn_like(z_posterior)
         mmd_total = z_posterior.new_zeros(())
         for sigma in kernel_sigmas:

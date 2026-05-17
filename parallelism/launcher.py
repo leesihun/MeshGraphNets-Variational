@@ -293,9 +293,10 @@ def _forward_step(stage: ModelSplitStage, graph, device, config):
 
         # VAE: encode z on stage 0
         z_per_node = None
+        z_full = None
         vae_sync_loss = torch.zeros((), device=device, dtype=x.dtype)
         if use_vae:
-            z_per_node, vae_losses, aux_loss = stage.encode_vae(graph)
+            z_per_node, z_full, vae_losses, aux_loss = stage.encode_vae(graph)
             vae_sync_loss = (lambda_mmd * vae_losses['mmd'].to(dtype=x.dtype)
                              + lambda_kl  * vae_losses['kl'].to(dtype=x.dtype)
                              + beta_aux   * aux_loss.to(dtype=x.dtype))
@@ -308,17 +309,18 @@ def _forward_step(stage: ModelSplitStage, graph, device, config):
         else:
             x, ea, ei, skip_stack, wea, wei, z_per_node, cur_level = (
                 stage.run_local_blocks_multiscale(
-                    x, ea, ei, [], wea, wei, z_per_node, 0, graph))
+                    x, ea, ei, [], wea, wei, z_per_node, 0, graph,
+                    z_full=z_full))
 
         sentinel = stage.send_to_next(x, ea, ei, skip_stack, wea, wei,
-                                       z_per_node, cur_level)
+                                       z_per_node, cur_level, z_full=z_full)
         sync_loss = sentinel.sum() + vae_sync_loss
         return sync_loss, None, None
 
     # ---------- Last stage ----------
     elif is_last:
         (x, ea, ei, wea, wei, skip_stack,
-         z_per_node, cur_level) = stage.recv_from_prev()
+         z_per_node, z_full, cur_level) = stage.recv_from_prev()
 
         if not use_ms:
             x, ea, ei, wea, wei = stage.run_local_blocks_flat(
@@ -326,7 +328,8 @@ def _forward_step(stage: ModelSplitStage, graph, device, config):
         else:
             x, ea, ei, skip_stack, wea, wei, z_per_node, cur_level = (
                 stage.run_local_blocks_multiscale(
-                    x, ea, ei, list(skip_stack), wea, wei, z_per_node, cur_level, graph))
+                    x, ea, ei, list(skip_stack), wea, wei, z_per_node, cur_level, graph,
+                    z_full=z_full))
 
         predicted = stage.decode(x, ea, ei)
         target    = graph.y
@@ -337,7 +340,7 @@ def _forward_step(stage: ModelSplitStage, graph, device, config):
     # ---------- Middle stage ----------
     else:
         (x, ea, ei, wea, wei, skip_stack,
-         z_per_node, cur_level) = stage.recv_from_prev()
+         z_per_node, z_full, cur_level) = stage.recv_from_prev()
 
         if not use_ms:
             x, ea, ei, wea, wei = stage.run_local_blocks_flat(
@@ -345,10 +348,11 @@ def _forward_step(stage: ModelSplitStage, graph, device, config):
         else:
             x, ea, ei, skip_stack, wea, wei, z_per_node, cur_level = (
                 stage.run_local_blocks_multiscale(
-                    x, ea, ei, list(skip_stack), wea, wei, z_per_node, cur_level, graph))
+                    x, ea, ei, list(skip_stack), wea, wei, z_per_node, cur_level, graph,
+                    z_full=z_full))
 
         sentinel = stage.send_to_next(x, ea, ei, skip_stack, wea, wei,
-                                       z_per_node, cur_level)
+                                       z_per_node, cur_level, z_full=z_full)
         return sentinel.sum(), None, None
 
 

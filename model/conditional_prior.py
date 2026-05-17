@@ -24,6 +24,12 @@ class ConditionalMixturePrior(nn.Module):
         self.hidden_dim = int(config.get('prior_hidden_dim', config.get('latent_dim', 128)))
         self.num_mp_layers = int(config.get('prior_mp_layers', 3))
         self.min_std = float(config.get('prior_min_std', 0.05))
+        # Per-level z slots (matches MeshGraphNets.num_z). Default 1 for back-compat.
+        if config.get('use_multiscale', False):
+            default_num_z = int(config.get('multiscale_levels', 1)) + 1
+        else:
+            default_num_z = 1
+        self.num_z = int(config.get('num_z', default_num_z))
 
         base_input_size = int(config.get('input_var'))
         base_input_size += int(config.get('positional_features', 0))
@@ -45,7 +51,7 @@ class ConditionalMixturePrior(nn.Module):
         self.head = build_mlp(
             self.hidden_dim,
             self.hidden_dim,
-            self.num_components * (1 + 2 * self.z_dim),
+            self.num_z * self.num_components * (1 + 2 * self.z_dim),
             layer_norm=False,
         )
         self.apply(init_weights)
@@ -64,11 +70,12 @@ class ConditionalMixturePrior(nn.Module):
         pooled = self.pool(g.x, batch)
         raw = self.head(pooled)
         bsz = raw.shape[0]
-        raw = raw.view(bsz, self.num_components, 1 + 2 * self.z_dim)
+        # [B, num_z, K, 1 + 2D]
+        raw = raw.view(bsz, self.num_z, self.num_components, 1 + 2 * self.z_dim)
 
-        logits = raw[:, :, 0]
-        mu = raw[:, :, 1:1 + self.z_dim]
-        log_std = raw[:, :, 1 + self.z_dim:]
+        logits = raw[..., 0]                          # [B, num_z, K]
+        mu = raw[..., 1:1 + self.z_dim]               # [B, num_z, K, D]
+        log_std = raw[..., 1 + self.z_dim:]           # [B, num_z, K, D]
         log_std = torch.clamp(log_std, min=math.log(self.min_std), max=5.0)
         return {'logits': logits, 'mu': mu, 'log_std': log_std}
 
@@ -79,8 +86,15 @@ class ConditionalMixturePrior(nn.Module):
 
 
 def mixture_nll(params, target_z):
-    """Negative log likelihood of target_z under a diagonal Gaussian mixture."""
-    if target_z.dim() == 3:
+    """Negative log likelihood of target_z under a diagonal Gaussian mixture.
+
+    Shapes:
+        target_z: [B, num_z, D]              or [MC, B, num_z, D] for MC stacks
+        logits:   [B, num_z, K]
+        mu:       [B, num_z, K, D]
+        log_std:  [B, num_z, K, D]
+    """
+    if target_z.dim() == 4:
         losses = [mixture_nll(params, target_z[i]) for i in range(target_z.shape[0])]
         return torch.stack(losses).mean()
 
@@ -88,13 +102,13 @@ def mixture_nll(params, target_z):
     mu = params['mu']
     log_std = params['log_std']
 
-    z = target_z.unsqueeze(1)
+    z = target_z.unsqueeze(2)  # [B, num_z, 1, D]
     var_term = ((z - mu) / torch.exp(log_std)).pow(2)
     comp_log_prob = -0.5 * (
         var_term.sum(dim=-1)
         + 2.0 * log_std.sum(dim=-1)
         + target_z.shape[-1] * math.log(2.0 * math.pi)
-    )
+    )  # [B, num_z, K]
     log_mix = torch.log_softmax(logits, dim=-1)
     return -torch.logsumexp(log_mix + comp_log_prob, dim=-1).mean()
 
@@ -122,12 +136,16 @@ def analytical_prior_kl_loss(params, q_mu, q_logvar):
     Returns:
         Scalar loss (upper bound on KL(q || p) up to the constant H(q)).
     """
+    # Per-level shapes:
+    #   q_mu, q_logvar: [B, num_z, D]
+    #   logits:         [B, num_z, K]
+    #   mu, log_std:    [B, num_z, K, D]
     logits = params['logits']
     mu = params['mu']
     log_std = params['log_std']
 
-    q_mu_b = q_mu.unsqueeze(1)
-    q_var_b = torch.exp(q_logvar).unsqueeze(1)
+    q_mu_b = q_mu.unsqueeze(2)                # [B, num_z, 1, D]
+    q_var_b = torch.exp(q_logvar).unsqueeze(2)
     D = q_mu.shape[-1]
 
     log_var_k = 2.0 * log_std
@@ -137,33 +155,39 @@ def analytical_prior_kl_loss(params, q_mu, q_logvar):
         D * math.log(2.0 * math.pi)
         + log_var_k.sum(dim=-1)
         + ((q_var_b + (q_mu_b - mu).pow(2)) / var_k).sum(dim=-1)
-    )
+    )  # [B, num_z, K]
 
     log_pi = torch.log_softmax(logits, dim=-1)
     pi = log_pi.exp()
 
-    weighted_term = -(pi * expected_log_pk).sum(dim=-1)
-    entropy_pi = -(pi * log_pi).sum(dim=-1)
+    weighted_term = -(pi * expected_log_pk).sum(dim=-1)   # [B, num_z]
+    entropy_pi = -(pi * log_pi).sum(dim=-1)               # [B, num_z]
 
     return (weighted_term - entropy_pi).mean()
 
 
 def sample_from_mixture(params, temperature=1.0):
-    logits = params['logits']
-    mu = params['mu']
-    log_std = params['log_std']
+    """Sample z of shape [B, num_z, D]."""
+    logits = params['logits']        # [B, num_z, K]
+    mu = params['mu']                # [B, num_z, K, D]
+    log_std = params['log_std']      # [B, num_z, K, D]
 
     temp = max(float(temperature), 1e-6)
     cat = torch.distributions.Categorical(logits=logits / temp)
-    component = cat.sample()
+    component = cat.sample()         # [B, num_z]
 
-    batch_idx = torch.arange(logits.shape[0], device=logits.device)
-    chosen_mu = mu[batch_idx, component]
-    chosen_std = torch.exp(log_std[batch_idx, component]) * math.sqrt(temp)
+    B, num_z = component.shape
+    b_idx = torch.arange(B, device=logits.device).view(B, 1).expand(B, num_z)
+    z_idx = torch.arange(num_z, device=logits.device).view(1, num_z).expand(B, num_z)
+
+    chosen_mu = mu[b_idx, z_idx, component]                              # [B, num_z, D]
+    chosen_std = torch.exp(log_std[b_idx, z_idx, component]) * math.sqrt(temp)
     return chosen_mu + chosen_std * torch.randn_like(chosen_std)
 
 
 def build_prior_config(config):
+    use_multiscale = bool(config.get('use_multiscale', False))
+    default_num_z = (int(config.get('multiscale_levels', 1)) + 1) if use_multiscale else 1
     return {
         'input_var': config.get('input_var'),
         'edge_var': config.get('edge_var'),
@@ -172,6 +196,9 @@ def build_prior_config(config):
         'positional_features': config.get('positional_features', 0),
         'use_node_types': config.get('use_node_types', False),
         'num_node_types': config.get('num_node_types', 0),
+        'use_multiscale': use_multiscale,
+        'multiscale_levels': config.get('multiscale_levels', 1),
+        'num_z': int(config.get('num_z', default_num_z)),
         'prior_mixture_components': config.get('prior_mixture_components', 10),
         'prior_hidden_dim': config.get('prior_hidden_dim', config.get('latent_dim')),
         'prior_mp_layers': config.get('prior_mp_layers', 3),
