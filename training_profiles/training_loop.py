@@ -159,13 +159,13 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
     # VAE config (MMD objective: InfoVAE-style aggregate-posterior matching)
     use_vae = config.get('use_vae', False)
     alpha_recon = float(config.get('alpha_recon', 1.0))
-    lambda_mmd = float(config.get('lambda_mmd', 100.0))
+    lambda_mmd = float(config.get('lambda_mmd', 1.0))
     beta_aux = float(config.get('beta_aux', 1.0))
     # Free-bits floor: when > 0, adds a per-dim KL collapse safeguard (coefficient implicit = 1.0)
     free_bits = float(config.get('free_bits', 0.0))
     # Deterministic auxiliary loss: forces the graph-only pathway (z=0) to predict y.
     # Closes the "posterior shortcut" — prevents z from absorbing deterministic content.
-    lambda_det = float(config.get('lambda_det', 0.5)) if use_vae else 0.0
+    lambda_det = float(config.get('lambda_det', 0.0)) if use_vae else 0.0
 
     # Gradient accumulation: 0 = full epoch (1 step/epoch), 1 = per-batch (default), N = every N batches
     grad_accum_steps = config.get('grad_accum_steps', 1)
