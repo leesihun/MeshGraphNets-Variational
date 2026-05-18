@@ -290,7 +290,7 @@ def _forward_step(stage: ModelSplitStage, graph, device, config,
 
     lambda_mmd = float(config.get('lambda_mmd', 1.0))
     lambda_kl  = float(config.get('lambda_kl', 0.0))
-    beta_aux   = float(config.get('beta_aux', 0.0))
+    beta_aux   = float(config.get('beta_aux', 1.0))
 
     # ---------- First stage ----------
     if is_first:
@@ -383,7 +383,7 @@ def _train_one_epoch(
     use_ms     = stage.use_multiscale
     use_vae    = stage.use_vae
 
-    lambda_det = float(config.get('lambda_det', 0.5)) if use_vae else 0.0
+    lambda_det = float(config.get('lambda_det', 0.01)) if use_vae else 0.0
 
     for graph in loader:
         # All stages move graph when multiscale (pool/unpool need topology) or first/last
