@@ -279,7 +279,12 @@ class EncoderProcessorDecoder(nn.Module):
             z = torch.zeros(B, self.num_z, self.vae_latent_dim, device=device, dtype=dtype)
             return z, empty_losses
         if fixed_z is not None:
-            return fixed_z.to(device=device, dtype=dtype), empty_losses
+            z = fixed_z.to(device=device, dtype=dtype)
+            # External callers (GMM / randn rollout) may pass [B, D]; expand to
+            # [B, num_z, D] by replicating the same z across all per-level slots.
+            if z.dim() == 2:
+                z = z.unsqueeze(1).expand(-1, self.num_z, -1).contiguous()
+            return z, empty_losses
         if use_posterior and original_y is not None:
             batch = (original_batch if original_batch is not None
                      else torch.zeros(N, dtype=torch.long, device=device))
