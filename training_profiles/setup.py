@@ -116,7 +116,7 @@ def build_optimizer_scheduler(config, params, total_epochs: int):
         optimizer, start_factor=0.01, total_iters=warmup_epochs
     )
     cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=cosine_T0, T_mult=2, eta_min=1e-8
+        optimizer, T_0=cosine_T0, T_mult=1, eta_min=1e-8
     )
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs]
