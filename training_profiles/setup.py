@@ -254,6 +254,33 @@ def analyze_debug_files(log_dir: str) -> None:
             print(f"  Error reading {f}: {e}")
 
 
+def cleanup_dataloaders(*loaders) -> None:
+    """Explicitly shut down DataLoader persistent workers before process exit.
+
+    Without this, `persistent_workers=True` keeps worker processes alive until the
+    Python interpreter tears down, at which point `multiprocessing.resource_tracker`
+    reports "There appear to be N leaked semaphore objects to clean up at shutdown"
+    (one semaphore per worker × loader).
+
+    Call this at the end of every training worker function (single, DDP, model_split).
+    """
+    import gc
+    for loader in loaders:
+        if loader is None:
+            continue
+        it = getattr(loader, '_iterator', None)
+        if it is not None and hasattr(it, '_shutdown_workers'):
+            try:
+                it._shutdown_workers()
+            except Exception:
+                pass
+        try:
+            loader._iterator = None
+        except Exception:
+            pass
+    gc.collect()
+
+
 def init_log_file(config, config_filename: str):
     """Create the epoch log file and return (log_file, log_dir), or (None, None)."""
     log_file_dir = config.get('log_file_dir')

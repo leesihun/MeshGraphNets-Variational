@@ -45,6 +45,7 @@ from training_profiles.setup import (
     build_model_config,
     build_normalization_dict,
     build_optimizer_scheduler,
+    cleanup_dataloaders,
 )
 
 
@@ -233,6 +234,8 @@ def _split_worker_inner(rank: int, num_stages: int, config: dict, gpu_ids: list,
 
     if rank == 0:
         print(f"[model_split] training finished. best_train_loss={best_train_loss:.2e}")
+
+    cleanup_dataloaders(train_loader)
 
 
 # ---------------------------------------------------------------------------

@@ -18,6 +18,7 @@ from training_profiles.setup import (
     build_dataset_splits,
     build_model_and_ema,
     build_optimizer_scheduler,
+    cleanup_dataloaders,
     init_log_file,
     log_model_summary,
     save_checkpoint,
@@ -427,6 +428,8 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
     # Analyze debug files if they exist
     if rank == 0:
         analyze_debug_files(log_dir)
+
+    cleanup_dataloaders(train_loader, val_loader, test_loader)
 
 def setup_distributed(rank, world_size, gpu_id, port):
     """Initialize distributed training process group.

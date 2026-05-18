@@ -11,6 +11,7 @@ from training_profiles.setup import (
     build_dataset_splits,
     build_model_and_ema,
     build_optimizer_scheduler,
+    cleanup_dataloaders,
     init_log_file,
     log_model_summary,
     save_checkpoint,
@@ -260,3 +261,5 @@ def single_worker(config, config_filename='config.txt'):
         run_posthoc_gmm_fitting(gmm_model, train_dataset, config, device, modelname)
 
     analyze_debug_files(log_dir)
+
+    cleanup_dataloaders(train_loader, val_loader, test_loader)
