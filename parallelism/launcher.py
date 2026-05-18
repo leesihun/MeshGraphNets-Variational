@@ -383,7 +383,7 @@ def _train_one_epoch(
     use_ms     = stage.use_multiscale
     use_vae    = stage.use_vae
 
-    lambda_det = float(config.get('lambda_det', 0.01)) if use_vae else 0.0
+    lambda_det = float(config.get('lambda_det', 0.0)) if use_vae else 0.0
 
     for graph in loader:
         # All stages move graph when multiscale (pool/unpool need topology) or first/last
