@@ -3,6 +3,34 @@
 Agent-facing notes for this repository. Keep answers and edits grounded in the
 live code, not older prose in historical plan docs.
 
+## Project Objective
+
+Hi-MGN-V is a probabilistic surrogate for **manufacturing spread modeling**.
+The training dataset contains multiple manufactured objects that share the same
+mesh topology but produce different physical outputs (e.g. displacement/warpage)
+due to real production variability. The model must learn the spread of that
+distribution — not just the mean response — and generate realistic samples that
+follow the patterns of the input data. At inference time the number of generated
+samples exceeds the number of training items, so the model must extrapolate
+spread structure, not merely memorize training outputs.
+
+Implications for VAE design:
+
+- **z must encode spread, not be forced toward N(0,I).** Keep `lambda_mmd` low
+  (≈ 0.1). A residual MMD > 0 is acceptable because the true aggregate posterior
+  reflects genuine spread structure, not noise.
+- **beta_aux (≈ 1.0)** anchors z to per-graph output statistics and prevents
+  posterior/mode collapse. Do not reduce it.
+- **lambda_det must be 0.0.** The deterministic auxiliary loss (second forward
+  with z=0) was introduced to fight posterior shortcuts in single-mode problems.
+  It conflicts with the spread-modeling objective and must not be used.
+- **vae_graph_aware True** lets the posterior encoder see graph input features
+  alongside target y, enabling type-conditional spread encoding. Recommended
+  when data contains multiple manufactured part types.
+- **use_conditional_prior True** (with `train_with_prior` or `train_prior`) is
+  the correct architectural fix for type-to-type generalization: the prior
+  `p(z|graph)` maps each part type to its spread distribution at inference time.
+
 ## Run Commands
 
 ```bash
@@ -79,6 +107,16 @@ Training with `use_vae True` uses posterior `q(z | y)` and fuses sampled `z` int
 every processor block. Validation logs both posterior reconstruction and prior
 sampling reconstruction.
 
+For manufacturing spread modeling the recommended training loss weights are:
+
+| Parameter | Value | Reason |
+|-----------|-------|--------|
+| `lambda_mmd` | 0.1 | Low: z must encode structured spread, not collapse to N(0,I) |
+| `beta_aux` | 1.0 | High: anchors z to graph output statistics, prevents collapse |
+| `lambda_det` | 0.0 | Must be zero: det auxiliary loss conflicts with spread objective |
+| `vae_latent_dim` | 32 | Full capacity needed to represent spread across part types |
+| `vae_graph_aware` | True | Enables type-conditional spread encoding |
+
 Post-training priors:
 
 - Conditional prior: `conditional_prior_state_dict`,
@@ -89,6 +127,10 @@ Rollout tries conditional prior, then GMM, then `N(0, I)`. Because rollout appli
 checkpoint `model_config` before reading `use_conditional_prior`, a checkpoint saved
 with that key false can suppress the conditional prior even if the inference config
 sets it true.
+
+For spread modeling, the conditional prior is strongly preferred over GMM or N(0,I):
+it maps each graph (part type + boundary conditions) to its own spread distribution
+at inference time, enabling realistic extrapolation across part variants.
 
 ## Documentation Notes
 

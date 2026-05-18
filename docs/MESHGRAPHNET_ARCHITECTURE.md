@@ -150,6 +150,13 @@ blocks are constructed with `use_world_edges False`.
 
 ## VAE Branch
 
+The VAE branch is the core mechanism for spread modeling. The latent `z` captures
+the part of the output that varies across manufactured samples (the "spread") while
+the graph processor captures the part that is determined by geometry and boundary
+conditions. During inference, sampling different `z` values from the prior
+`p(z|graph)` produces distinct but physically plausible output variants for the
+same input mesh.
+
 When `use_vae True`, the model adds a graph variational encoder and injects a
 global latent `z` into the simulator processor.
 
@@ -230,6 +237,12 @@ deviations by `sqrt(temperature)`.
 
 ## Training Objective
 
+The model's goal is **manufacturing spread modeling**: given multiple manufactured
+objects that share mesh topology but differ in physical outputs due to production
+variability, the VAE must learn the spread of that output distribution and enable
+generation of realistic new samples at inference time (potentially more samples
+than the training set).
+
 The simulator predicts normalized target deltas. Reconstruction loss is Huber
 loss with `delta=1.0`, optionally weighted per output channel by
 `feature_loss_weights` after normalizing those weights to sum to 1.
@@ -244,10 +257,23 @@ With VAE:
 
 ```text
 loss = alpha_recon * reconstruction_loss
-     + lambda_mmd * mmd_loss
-     + beta_aux * auxiliary_loss
+     + lambda_mmd * mmd_loss          # aggregate posterior ↔ N(0,I); keep LOW (≈0.1)
+     + beta_aux * auxiliary_loss      # z → graph output stats anchor; keep HIGH (≈1.0)
      + optional free_bits_kl
 ```
+
+**Spread modeling guidance for loss weights:**
+
+- `lambda_mmd` should remain low (≈ 0.1). A non-zero residual MMD is acceptable
+  and expected: the true aggregate posterior encodes real spread structure that does
+  not match an isotropic Gaussian. Forcing MMD → 0 erases that structure.
+- `beta_aux` should remain high (≈ 1.0). The auxiliary decoder forces `z` to
+  predict per-graph output mean and standard deviation. Without this anchor the
+  encoder collapses all spread into a small z subspace (mode collapse).
+- `lambda_det` must be 0.0. The deterministic auxiliary pass (second forward with
+  z = 0) was designed to prevent posterior shortcuts in single-mode problems. For
+  spread modeling it conflicts directly with the objective by punishing z for
+  carrying information the graph cannot predict alone.
 
 Other training behavior:
 

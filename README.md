@@ -1,10 +1,19 @@
-# MeshGraphNets - Variational
+# MeshGraphNets - Variational (Hi-MGN-V)
 
-This repository trains and runs MeshGraphNets-style graph neural network
-surrogates for FEA mesh data. The live code supports deterministic
-encode-process-decode simulation, optional hierarchical V-cycle processing,
-optional world edges, optional MMD-VAE latent conditioning, legacy GMM latent
-sampling, and a newer mesh-conditioned post-hoc latent prior.
+This repository implements Hi-MGN-V, a probabilistic surrogate for
+**manufacturing spread modeling**. The training dataset contains multiple
+manufactured objects that share the same mesh topology but produce different
+physical outputs (displacement, warpage, stress) due to real production
+variability. Hi-MGN-V learns the spread of that output distribution and
+generates realistic samples that follow the patterns of the training data.
+At inference time the number of generated samples can exceed the training
+set size, enabling extrapolation of spread structure across part variants.
+
+The architecture is a MeshGraphNets-style graph neural network with optional
+hierarchical V-cycle processing, optional world edges, and an MMD-VAE latent
+branch that injects a graph-level stochastic code `z` into every processor
+block. A mesh-conditioned post-hoc prior `p(z|graph)` maps each part type
+to its spread distribution at inference time.
 
 The executable entry point is [MeshGraphNets_main.py](MeshGraphNets_main.py).
 
@@ -93,10 +102,19 @@ fused into each processor block. Training uses reconstruction Huber loss plus MM
 and auxiliary latent losses. Optional `free_bits` adds a KL floor as a collapse
 safeguard.
 
+For manufacturing spread modeling the key tuning levers are:
+- `lambda_mmd 0.1` — keep low; z must retain structured spread, not collapse to N(0,I).
+- `beta_aux 1.0` — anchors z to per-graph output statistics; prevents mode collapse.
+- `lambda_det 0.0` — deterministic auxiliary loss must be disabled for spread modeling.
+- `vae_graph_aware True` — posterior encoder sees graph inputs alongside target y,
+  enabling type-conditional spread encoding across part variants.
+
 The post-hoc conditional prior is [model/conditional_prior.py](model/conditional_prior.py):
 a graph encoder predicts mixture logits, means, and diagonal log-stds for
 `p(z | graph)`. [training_profiles/posthoc_prior.py](training_profiles/posthoc_prior.py)
 trains it from frozen VAE posterior samples and saves it into the same checkpoint.
+For spread modeling this prior is essential: it routes each part type to its own
+spread distribution at inference time rather than sampling from a global N(0,I).
 
 ## Data
 
@@ -177,7 +195,10 @@ For each input scene and each VAE sample draw, rollout writes:
 
 The latent `z` is sampled once per trajectory and held fixed across rollout steps.
 When the conditional prior is active, the first graph is built before sampling so
-`z` is conditioned on that mesh and initial state.
+`z` is conditioned on that mesh and initial state. Set `num_vae_samples` larger
+than the training set size to generate more spread samples than were observed;
+the conditional prior extrapolates within the learned spread distribution for each
+part type.
 
 ## Documentation Map
 

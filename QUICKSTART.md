@@ -4,6 +4,11 @@ This is the short operational guide for this checkout. For details, read
 [README.md](README.md), [CLAUDE.md](CLAUDE.md), and
 [docs/CONFIG_REFERENCE.md](docs/CONFIG_REFERENCE.md).
 
+**Goal**: Hi-MGN-V models manufacturing spread — generating realistic diverse
+samples from a trained VAE surrogate. Use `train_with_prior` to produce a
+checkpoint suitable for spread sampling, and set `num_vae_samples` larger than
+the training set size at inference time.
+
 ## Fast Commands
 
 Historical VAE/GMM training and rollout:
@@ -59,6 +64,21 @@ dir outputs
 | `train_with_prior` | Train simulator, then train mesh-conditioned prior into the checkpoint. |
 | `train_prior` | Train only the mesh-conditioned prior from an existing VAE checkpoint. |
 | `inference` | Autoregressive rollout. |
+
+## Spread Modeling Config Checklist
+
+For manufacturing spread modeling, verify these keys before training:
+
+| Key | Recommended | Why |
+|-----|-------------|-----|
+| `use_vae` | `True` | VAE is required for spread sampling |
+| `vae_graph_aware` | `True` | Type-conditional spread encoding |
+| `lambda_mmd` | `0.1` | Low: preserve structured spread in z |
+| `beta_aux` | `1.0` | High: prevent mode/posterior collapse |
+| `lambda_det` | `0.0` | Zero: det pass conflicts with spread objective |
+| `vae_latent_dim` | `32` | Full capacity for spread representation |
+| `mode` | `train_with_prior` | Trains simulator + conditional prior in one run |
+| `num_vae_samples` | > dataset size | Extrapolates spread at inference time |
 
 ## Active Prior Warning
 

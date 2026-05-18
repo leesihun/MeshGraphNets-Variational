@@ -115,17 +115,24 @@ world edges are normalized with the per-level coarse mesh-edge statistics.
 
 ## VAE And Prior Keys
 
+The VAE branch exists to model manufacturing spread: `z` captures the
+sample-to-sample variation in physical outputs for objects that share the
+same mesh topology. For this objective, keep `lambda_mmd` low (≈ 0.1),
+`beta_aux` high (≈ 1.0), and `lambda_det` at 0.0. See
+[MESHGRAPHNET_ARCHITECTURE.md](MESHGRAPHNET_ARCHITECTURE.md) for guidance.
+
 | Key | Used by | Meaning |
 | --- | --- | --- |
 | `use_vae` | model, training, inference | Enables the graph VAE latent path. |
-| `vae_latent_dim` | model | Global latent `z` dimension. |
+| `vae_latent_dim` | model | Global latent `z` dimension. 32 recommended for spread modeling. |
 | `vae_mp_layers` | VAE encoder | Message-passing layers inside the posterior encoder. Default `5` in model construction. |
-| `vae_graph_aware` | VAE encoder | If true, fuses graph input `x` with target delta `y` in the posterior encoder. |
+| `vae_graph_aware` | VAE encoder | Fuses graph input `x` with target `y` in the posterior encoder. Recommended `True` for multi-type datasets: enables type-conditional spread encoding. |
 | `alpha_recon` | training | Reconstruction-loss weight. |
-| `lambda_mmd` | training | MMD regularizer weight matching aggregate posterior to `N(0,I)`. |
-| `beta_aux` | training | Weight for auxiliary latent decoder loss. |
+| `lambda_mmd` | training | MMD regularizer weight matching aggregate posterior to `N(0,I)`. Keep low (≈ 0.1) for spread modeling; residual MMD > 0 is acceptable and expected. |
+| `beta_aux` | training | Weight for auxiliary latent decoder predicting per-graph output stats from `z`. Keep high (≈ 1.0) to prevent mode collapse. |
+| `lambda_det` | training | Deterministic auxiliary pass weight (second forward with z=0). **Must be 0.0 for spread modeling.** Non-zero values conflict with the spread objective. |
 | `free_bits` | training | Optional per-dimension KL floor. `0.0` disables it. |
-| `num_vae_samples` | inference | Number of rollout samples per scene. |
+| `num_vae_samples` | inference | Number of rollout samples per scene. Can exceed training set size to extrapolate spread. |
 | `fit_latent_gmm` | training | Legacy post-hoc GMM fitting after VAE simulator training. |
 | `gmm_components` | GMM | Number of legacy GMM components. |
 | `gmm_covariance_type` | GMM | Sklearn covariance type, for example `full`. |
@@ -176,7 +183,8 @@ run or run `mode train_prior` against the finished checkpoint.
 | `augment_geometry` | data | Training-only random z rotation and x/y reflection. |
 
 Simulator loss is Huber loss on normalized deltas. VAE training adds MMD and
-auxiliary latent losses according to the configured weights.
+auxiliary latent losses according to the configured weights. For manufacturing
+spread modeling, set `lambda_det 0.0`, `lambda_mmd 0.1`, `beta_aux 1.0`.
 
 ## Inference Keys
 
