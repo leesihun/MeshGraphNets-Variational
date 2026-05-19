@@ -100,8 +100,8 @@ def build_optimizer_scheduler(config, params, total_epochs: int):
 
     Scheduler hyper-parameters:
         warmup_epochs  (config key, default 3)
-        cosine_T0 = (total_epochs - warmup_epochs) // 2
-        cosine_T_mult = 2
+        cosine_T0 = total_epochs - warmup_epochs  (one full cycle over remaining epochs)
+        cosine_T_mult = 1
         eta_min = 1e-8
     """
     learning_rate = config.get('learningr')
@@ -110,7 +110,7 @@ def build_optimizer_scheduler(config, params, total_epochs: int):
 
     warmup_epochs = int(config.get('warmup_epochs', 3))
     remaining_epochs = max(total_epochs - warmup_epochs, 1)
-    cosine_T0 = max(remaining_epochs // 2, 1)
+    cosine_T0 = remaining_epochs
 
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer, start_factor=0.01, total_iters=warmup_epochs
