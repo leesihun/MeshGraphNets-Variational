@@ -45,10 +45,10 @@ python MeshGraphNets_main.py --config _b8_all_warpage_input/config_infer1.txt
 
 | Mode | Code path |
 |------|-----------|
-| `train` | `single_worker` or `train_worker`; may fit legacy GMM at the end. |
-| `train_with_prior` | Launcher sets `mode train` plus `train_conditional_prior True`; then normal training runs and post-hoc prior training runs at the end. |
+| `train` | `single_worker` or `train_worker`; with `use_vae True`, runs post-hoc conditional prior at the end by default (set `train_conditional_prior False` to skip), then fits legacy GMM if `fit_latent_gmm True`. |
+| `train_with_prior` | Backward-compat alias for `train`. Rewritten to `train` at dispatch. |
 | `train_prior` | `training_profiles.posthoc_prior.train_posthoc_prior`. |
-| `inference` | `inference_profiles.rollout.run_rollout`. |
+| `inference` | `inference_profiles.rollout.run_rollout`; loads conditional prior by default if present in the checkpoint (set `use_conditional_prior False` to fall back to GMM/N(0,I)). |
 
 `gpu_ids` length controls single process vs DDP unless `parallel_mode model_split`
 is set. `parallel_mode model_split` routes to `parallelism.launcher`.

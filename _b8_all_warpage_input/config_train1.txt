@@ -63,8 +63,3 @@ alpha_recon         1    # Reconstruction loss weight
 lambda_mmd          0.1    # MMD(q(z), N(0,I)) weight; matches aggregate posterior to prior
 vae_graph_aware     True  # Feed graph.x into VAE encoder so z encodes only y-residual (fixes minority-type spread collapse)
 free_bits           0.25    # Per-dim KL floor (nats). 0.0 = off. Set to 0.25 if collapse persists after vae_graph_aware
-'
-% Post-hoc GMM training
-fit_latent_gmm      True
-gmm_components      10
-gmm_covariance_type full

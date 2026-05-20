@@ -415,7 +415,7 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
         else:
             print(f"\nTraining finished. Best model at epoch {best_epoch} with validation loss {best_valid_loss:.2e}")
 
-    if rank == 0 and config.get('use_vae', False) and config.get('train_conditional_prior', False):
+    if rank == 0 and config.get('use_vae', False) and config.get('train_conditional_prior', True):
         from training_profiles.posthoc_prior import train_posthoc_prior
         train_posthoc_prior(config, config_filename)
 

@@ -25,10 +25,10 @@ python MeshGraphNets_main.py --config path\to\config.txt
 
 Mode behavior:
 
-- `train`: trains the simulator. If `use_vae True` and `fit_latent_gmm True`, the legacy GMM prior is fit after simulator training.
+- `train`: trains the simulator. If `use_vae True`, the post-hoc conditional prior is trained at the end by default (set `train_conditional_prior False` to skip). If `fit_latent_gmm True`, the legacy GMM prior is fit after simulator training.
 - `train_prior`: freezes an existing VAE simulator checkpoint and trains a mesh-conditioned conditional prior into that checkpoint.
-- `train_with_prior`: runs simulator training, then sets `train_conditional_prior True` so post-hoc conditional prior training runs before exit.
-- `inference`: runs autoregressive rollout using the checkpoint and writes rollout HDF5 files.
+- `train_with_prior`: backward-compat alias for `train` (the dispatcher rewrites it). Same behavior since `train_conditional_prior` now defaults to `True`.
+- `inference`: runs autoregressive rollout using the checkpoint and writes rollout HDF5 files. Loads the conditional prior from the checkpoint by default (set `use_conditional_prior False` to fall back to GMM/N(0,I)).
 
 Important caveat: inference loads `checkpoint['model_config']` and overwrites many
 architecture keys from the config file before it checks `use_conditional_prior`.
@@ -137,8 +137,8 @@ same mesh topology. For this objective, keep `lambda_mmd` low (≈ 0.1),
 | `gmm_components` | GMM | Number of legacy GMM components. |
 | `gmm_covariance_type` | GMM | Sklearn covariance type, for example `full`. |
 | `gmm_reg_covar` | GMM | Optional GMM regularization. |
-| `train_conditional_prior` | training | Internal flag used by `train_with_prior`; can also be set directly. |
-| `use_conditional_prior` | inference, prior | Enables conditional-prior construction when a checkpoint contains prior weights. |
+| `train_conditional_prior` | training | When `use_vae True`, runs the post-hoc conditional prior training at the end of simulator training. Default `True`; set `False` to skip. |
+| `use_conditional_prior` | inference, prior | At inference, load the conditional prior from the checkpoint and sample z from it. Default `True`; falls back to GMM/N(0,I) if the checkpoint lacks `conditional_prior_state_dict`. Set `False` to force GMM/N(0,I). |
 | `prior_mixture_components` | prior | Mixture components predicted by the conditional prior. Default `10`. |
 | `prior_hidden_dim` | prior | Prior hidden width. Defaults to `latent_dim`. |
 | `prior_mp_layers` | prior | Prior graph message-passing layers. Default `3`. |

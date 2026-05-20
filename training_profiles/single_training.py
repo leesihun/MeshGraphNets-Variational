@@ -250,7 +250,7 @@ def single_worker(config, config_filename='config.txt'):
     except KeyboardInterrupt:
         print(f"\nTraining interrupted by user. Best model at epoch {best_epoch} with validation loss {best_valid_loss:.2e}")
 
-    if use_vae and config.get('train_conditional_prior', False):
+    if use_vae and config.get('train_conditional_prior', True):
         from training_profiles.posthoc_prior import train_posthoc_prior
         train_posthoc_prior(config, config_filename)
 

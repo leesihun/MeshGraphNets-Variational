@@ -182,7 +182,7 @@ def run_rollout(config, config_filename='config.txt'):
     positional_encoding = str(config.get('positional_encoding', 'rwpe')).lower().strip()
     use_vae = config.get('use_vae', False)
     vae_latent_dim = int(config.get('vae_latent_dim', 8))
-    use_conditional_prior = bool(config.get('use_conditional_prior', False))
+    use_conditional_prior = bool(config.get('use_conditional_prior', True))
     prior_temperature = float(config.get('prior_temperature', 1.0))
 
     num_vae_samples = int(config.get('num_vae_samples', 1)) if use_vae else 1
