@@ -23,6 +23,7 @@ def collect_posterior_means(model, train_dataset, config, device):
 
     # MeshGraphNets wraps EncoderProcessorDecoder as .model; vae_encoder lives there
     inner = getattr(model, 'model', model)
+    graph_aware = getattr(inner.vae_encoder, 'graph_aware', False)
 
     model.eval()
     mus = []
@@ -30,7 +31,10 @@ def collect_posterior_means(model, train_dataset, config, device):
         for data in loader:
             data = data.to(device)
             y = data.y[:, :output_var]
-            _, mu, _ = inner.vae_encoder(y, data.edge_index, data.edge_attr, data.batch)
+            x_in = data.x if graph_aware else None
+            _, mu, _ = inner.vae_encoder(
+                y, data.edge_index, data.edge_attr, data.batch, x=x_in,
+            )
             mus.append(mu.float().cpu().numpy())
 
     return np.concatenate(mus, axis=0)  # [N_train, D]

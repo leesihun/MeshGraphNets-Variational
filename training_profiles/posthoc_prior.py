@@ -66,7 +66,10 @@ def _posterior_params(simulator, graph, output_dim):
     """Return analytical posterior params (mu, logvar). One forward pass."""
     inner = getattr(simulator, 'model', simulator)
     y = graph.y[:, :output_dim]
-    _, mu, logvar = inner.vae_encoder(y, graph.edge_index, graph.edge_attr, graph.batch)
+    x_in = graph.x if getattr(inner.vae_encoder, 'graph_aware', False) else None
+    _, mu, logvar = inner.vae_encoder(
+        y, graph.edge_index, graph.edge_attr, graph.batch, x=x_in,
+    )
     return mu, logvar
 
 
