@@ -38,7 +38,7 @@ class GNNVariationalEncoder(nn.Module):
 
     def __init__(self, node_output_size, edge_input_size, latent_dim, vae_latent_dim,
                  num_mp_layers=2, node_input_size=None, graph_aware=False,
-                 posterior_min_std=0.1, num_z=1):
+                 posterior_min_std=0, num_z=1):
         super().__init__()
         self.graph_aware = bool(graph_aware)
         self.min_logvar = 2.0 * math.log(max(float(posterior_min_std), 1e-6))

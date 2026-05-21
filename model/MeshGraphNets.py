@@ -208,7 +208,7 @@ class EncoderProcessorDecoder(nn.Module):
         vae_mp_layers = int(config.get('vae_mp_layers', 5))
         self.vae_graph_aware = bool(config.get('vae_graph_aware', False))
         self.vae_free_bits = float(config.get('free_bits', 0.0))
-        self.vae_posterior_min_std = float(config.get('posterior_min_std', 0.1))
+        self.vae_posterior_min_std = float(config.get('posterior_min_std', 0))
         # Per-level z: one z per V-cycle level (L coarse-arm + 1 coarsest) for multiscale,
         # else one global z. Allows level-specific stochastic modulation.
         if self.use_multiscale:

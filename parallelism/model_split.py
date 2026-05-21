@@ -598,7 +598,7 @@ class _StageInner(nn.Module):
         else:
             default_num_z = 1
         num_z = int(config.get('num_z', default_num_z))
-        posterior_min_std = float(config.get('posterior_min_std', 0.1))
+        posterior_min_std = float(config.get('posterior_min_std', 0))
 
         if is_first:
             vae_mp_layers = int(config.get('vae_mp_layers', 5))

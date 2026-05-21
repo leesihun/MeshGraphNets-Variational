@@ -175,7 +175,7 @@ def build_model_config(config) -> dict:
         'vae_latent_dim':    config.get('vae_latent_dim', 32),
         'vae_mp_layers':     config.get('vae_mp_layers', 5),
         'vae_graph_aware':   config.get('vae_graph_aware', False),
-        'posterior_min_std': config.get('posterior_min_std', 0.1),
+        'posterior_min_std': config.get('posterior_min_std', 0),
         'num_z':             config.get('num_z',
                                 (config.get('multiscale_levels', 1) + 1)
                                 if config.get('use_multiscale', False) else 1),
