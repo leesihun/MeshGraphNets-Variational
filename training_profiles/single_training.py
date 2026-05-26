@@ -14,6 +14,7 @@ from training_profiles.setup import (
     cleanup_dataloaders,
     init_log_file,
     log_model_summary,
+    resolve_prior_type,
     save_checkpoint,
 )
 from training_profiles.training_loop import (
@@ -30,6 +31,12 @@ def single_worker(config, config_filename='config.txt'):
     """Single GPU/CPU training entry point."""
     gpu_ids = config.get('gpu_ids')
     print("Starting single-process training...")
+
+    # Normalize prior selection BEFORE any model is built. MeshGraphNets reads
+    # `prior_type` in __init__ to decide whether to instantiate self.prior.
+    prior_type = resolve_prior_type(config)
+    if config.get('use_vae', False):
+        print(f"Prior mode: {prior_type}")
 
     if torch.cuda.is_available():
         gpu_id = gpu_ids
@@ -250,12 +257,9 @@ def single_worker(config, config_filename='config.txt'):
     except KeyboardInterrupt:
         print(f"\nTraining interrupted by user. Best model at epoch {best_epoch} with validation loss {best_valid_loss:.2e}")
 
-    if use_vae and config.get('train_conditional_prior', True):
-        from training_profiles.posthoc_prior import train_posthoc_prior
-        train_posthoc_prior(config, config_filename)
-
-    # Legacy post-hoc GMM fitting on VAE latent codes
-    if use_vae and config.get('fit_latent_gmm', False):
+    # Post-hoc step: only the 'gmm' mode trains anything after the main loop.
+    # 'gnn_e2e' is fully joint — its prior was already trained inside train_epoch.
+    if use_vae and prior_type == 'gmm':
         from model.latent_gmm import run_posthoc_gmm_fitting
         gmm_model = ema_model.module if ema_model is not None else model
         run_posthoc_gmm_fitting(gmm_model, train_dataset, config, device, modelname)

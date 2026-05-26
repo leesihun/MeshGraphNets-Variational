@@ -6,6 +6,11 @@ from torch_geometric.utils import scatter
 from general_modules.edge_features import EDGE_FEATURE_DIM
 from model.checkpointing import process_with_checkpointing
 from model.coarsening import pool_features, unpool_features
+from model.conditional_prior import (
+    ConditionalMixturePrior,
+    build_prior_config,
+    sample_from_mixture_reparam,
+)
 from model.encoder_decoder import Decoder, Encoder, GnBlock
 from model.mlp import build_mlp, init_weights
 from model.vae import GNNVariationalEncoder
@@ -28,13 +33,25 @@ class MeshGraphNets(nn.Module):
                 last_layer = self.model.decoder.decode_module[-1]
                 last_layer.weight.mul_(0.01)
 
+        # Optional joint-trained conditional prior (gnn_e2e mode).
+        # Lives on the outer MeshGraphNets so DDP/EMA wrap both VAE and prior together.
+        prior_type = str(config.get('prior_type', '')).lower().strip()
+        self.use_vae = bool(config.get('use_vae', False))
+        self.has_gnn_prior = self.use_vae and prior_type == 'gnn_e2e'
+        if self.has_gnn_prior:
+            self.prior = ConditionalMixturePrior(build_prior_config(config)).to(device)
+            print('MeshGraphNets: joint GNN conditional prior enabled (prior_type=gnn_e2e)')
+        else:
+            self.prior = None
+
         print('MeshGraphNets model created successfully')
 
     def set_checkpointing(self, enabled: bool):
         self.model.set_checkpointing(enabled)
 
     def forward(self, graph, debug=False, add_noise=None, use_posterior=None,
-                fixed_z=None, use_zero_z=False):
+                fixed_z=None, use_zero_z=False, compute_prior_path=False,
+                gumbel_temp=1.0):
         """
         Forward pass of the simulator.
 
@@ -47,9 +64,19 @@ class MeshGraphNets(nn.Module):
             Returns empty vae_losses/aux_loss. Used by the deterministic auxiliary
             loss (forces the graph-only pathway to predict y on its own).
 
+        compute_prior_path: when True and a GNN conditional prior exists,
+            additionally runs (prior → reparam sample → second simulator forward
+            with z_prior). Returns prior outputs in the 5th tuple element.
+
         Returns:
-            predicted: predicted normalized delta [N, output_var]
-            target: normalized target delta [N, output_var]
+            predicted:     [N, output_var] posterior-path prediction
+            target:        [N, output_var] graph.y (possibly noised)
+            vae_losses:    dict from the posterior-path VAE encoder
+            aux_loss:      scalar aux loss (0 if not training)
+            prior_outputs: None, or dict with keys:
+                'predicted_prior': [N, output_var] prior-path prediction
+                'prior_params':    {'logits', 'mu', 'log_std'}
+                'z_prior':         [B, num_z, vae_latent_dim] sampled latent
         """
         if add_noise is None:
             add_noise = self.training
@@ -74,7 +101,24 @@ class MeshGraphNets(nn.Module):
             graph, debug=debug, use_posterior=use_posterior, fixed_z=fixed_z,
             use_zero_z=use_zero_z,
         )
-        return predicted, graph.y, vae_losses, aux_loss
+
+        prior_outputs = None
+        if compute_prior_path and self.prior is not None:
+            # Prior reads raw (post-encoder MLP) graph features, NOT the encoded
+            # latents — graph.x is unchanged across both forwards because the
+            # simulator's encoder builds a fresh Data inside (does not mutate input).
+            prior_params = self.prior(graph)
+            z_prior = sample_from_mixture_reparam(prior_params, temperature=gumbel_temp)
+            predicted_prior, _, _ = self.model(
+                graph, debug=False, use_posterior=False, fixed_z=z_prior, use_zero_z=False,
+            )
+            prior_outputs = {
+                'predicted_prior': predicted_prior,
+                'prior_params':    prior_params,
+                'z_prior':         z_prior,
+            }
+
+        return predicted, graph.y, vae_losses, aux_loss, prior_outputs
 
 
 class EncoderProcessorDecoder(nn.Module):
@@ -272,7 +316,7 @@ class EncoderProcessorDecoder(nn.Module):
                     original_batch, N, device, dtype, use_posterior, fixed_z=None,
                     use_zero_z=False):
         zero = torch.zeros((), device=device, dtype=torch.float32)
-        empty_losses = {'mmd': zero, 'kl': zero, 'kl_raw': zero}
+        empty_losses = {'mmd': zero, 'kl': zero, 'kl_raw': zero, 'mu': None, 'logvar': None}
         if use_zero_z:
             # Deterministic auxiliary path: skip encoder, force z=0.
             B = int(original_batch.max().item()) + 1 if original_batch is not None else 1
@@ -296,7 +340,8 @@ class EncoderProcessorDecoder(nn.Module):
             kl_clamped, kl_raw = GNNVariationalEncoder.kl_loss(
                 mu.float(), logvar.float(), free_bits=self.vae_free_bits,
             )
-            return z, {'mmd': mmd, 'kl': kl_clamped, 'kl_raw': kl_raw}
+            return z, {'mmd': mmd, 'kl': kl_clamped, 'kl_raw': kl_raw,
+                       'mu': mu, 'logvar': logvar}
         B = int(original_batch.max().item()) + 1 if original_batch is not None else 1
         z = torch.randn(B, self.num_z, self.vae_latent_dim, device=device, dtype=dtype)
         return z, empty_losses

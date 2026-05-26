@@ -21,6 +21,7 @@ from training_profiles.setup import (
     cleanup_dataloaders,
     init_log_file,
     log_model_summary,
+    resolve_prior_type,
     save_checkpoint,
 )
 from training_profiles.training_loop import (
@@ -76,6 +77,12 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
     # sets the stop flag instead of killing the process mid-collective.
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
+
+    # Normalize prior selection BEFORE building the model so MeshGraphNets reads
+    # the same `prior_type` on every rank.
+    prior_type = resolve_prior_type(config)
+    if rank == 0 and config.get('use_vae', False):
+        print(f"Prior mode: {prior_type}")
 
     # Enable NCCL flight recorder for debugging collective mismatches
     os.environ.setdefault('TORCH_NCCL_TRACE_BUFFER_SIZE', '1000')
@@ -415,12 +422,9 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
         else:
             print(f"\nTraining finished. Best model at epoch {best_epoch} with validation loss {best_valid_loss:.2e}")
 
-    if rank == 0 and config.get('use_vae', False) and config.get('train_conditional_prior', True):
-        from training_profiles.posthoc_prior import train_posthoc_prior
-        train_posthoc_prior(config, config_filename)
-
-    # Legacy post-hoc GMM fitting on VAE latent codes (rank 0 only)
-    if rank == 0 and config.get('use_vae', False) and config.get('fit_latent_gmm', False):
+    # Post-hoc step: only the 'gmm' mode trains anything after the main loop.
+    # 'gnn_e2e' is fully joint — its prior was already trained inside train_epoch.
+    if rank == 0 and config.get('use_vae', False) and prior_type == 'gmm':
         from model.latent_gmm import run_posthoc_gmm_fitting
         gmm_model = ema_model.module if ema_model is not None else model
         run_posthoc_gmm_fitting(gmm_model, train_dataset, config, device, modelname)

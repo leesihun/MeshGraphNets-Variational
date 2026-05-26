@@ -188,13 +188,21 @@ def run_rollout(config, config_filename='config.txt'):
     num_vae_samples = int(config.get('num_vae_samples', 1)) if use_vae else 1
 
     conditional_prior = None
-    if use_vae and use_conditional_prior and 'conditional_prior_state_dict' in checkpoint:
-        from model.conditional_prior import ConditionalMixturePrior
-        prior_config = dict(config)
-        prior_config.update(checkpoint.get('conditional_prior_config', {}))
-        conditional_prior = ConditionalMixturePrior(prior_config).to(device)
-        conditional_prior.load_state_dict(checkpoint['conditional_prior_state_dict'])
-        conditional_prior.eval()
+    if use_vae and use_conditional_prior:
+        # New: joint-trained GNN prior is a submodule of MeshGraphNets and was
+        # already loaded by model.load_state_dict above. Use it directly.
+        if getattr(model, 'prior', None) is not None:
+            conditional_prior = model.prior
+            conditional_prior.eval()
+        # Legacy back-compat: previously the prior was saved as a separate state
+        # dict by the (now removed) post-hoc training pass.
+        elif 'conditional_prior_state_dict' in checkpoint:
+            from model.conditional_prior import ConditionalMixturePrior
+            prior_config = dict(config)
+            prior_config.update(checkpoint.get('conditional_prior_config', {}))
+            conditional_prior = ConditionalMixturePrior(prior_config).to(device)
+            conditional_prior.load_state_dict(checkpoint['conditional_prior_state_dict'])
+            conditional_prior.eval()
 
     # Load legacy GMM prior if present in checkpoint (falls back to N(0,I) if absent)
     gmm_params = None
@@ -428,7 +436,7 @@ def run_rollout(config, config_filename='config.txt'):
                         ).to(device)
 
                     # --- i. Forward pass ---
-                    predicted_delta_norm, _, _, _ = model(graph, fixed_z=fixed_z)  # [N, output_var]
+                    predicted_delta_norm, _, _, _, _ = model(graph, fixed_z=fixed_z)  # [N, output_var]
 
                     # --- j. Denormalize delta ---
                     predicted_delta_norm_np = predicted_delta_norm.cpu().numpy()

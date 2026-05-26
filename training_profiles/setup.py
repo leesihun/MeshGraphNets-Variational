@@ -149,6 +149,37 @@ def build_normalization_dict(train_dataset) -> dict:
     return norm
 
 
+def resolve_prior_type(config) -> str:
+    """Resolve `prior_type` from config, applying back-compat legacy shim.
+
+    The new design uses a single `prior_type` key with values 'gmm' or 'gnn_e2e'.
+    Legacy configs used `fit_latent_gmm` (bool) and `train_conditional_prior` (bool).
+    For those, we infer:
+      - `gmm`        if fit_latent_gmm=True and train_conditional_prior is False
+      - `gnn_e2e`    otherwise (the default in the new design)
+
+    Writes the resolved value back into `config['prior_type']` so downstream code
+    (including MeshGraphNets.__init__) reads a consistent string.
+    """
+    pt = config.get('prior_type')
+    if pt:
+        pt_norm = str(pt).lower().strip()
+        config['prior_type'] = pt_norm
+        return pt_norm
+
+    # Legacy fallback
+    has_legacy = ('fit_latent_gmm' in config) or ('train_conditional_prior' in config)
+    if has_legacy:
+        print("DEPRECATION: `fit_latent_gmm` / `train_conditional_prior` are legacy "
+              "keys. Use `prior_type` ('gmm' or 'gnn_e2e') instead.")
+    if config.get('fit_latent_gmm', False) and not config.get('train_conditional_prior', True):
+        resolved = 'gmm'
+    else:
+        resolved = 'gnn_e2e'
+    config['prior_type'] = resolved
+    return resolved
+
+
 def build_model_config(config) -> dict:
     """Collect architecture hyper-parameters into a serialisable dict."""
     return {
@@ -180,12 +211,20 @@ def build_model_config(config) -> dict:
                                 (config.get('multiscale_levels', 1) + 1)
                                 if config.get('use_multiscale', False) else 1),
         'beta_aux':          config.get('beta_aux', 1.0),
-        'use_conditional_prior': config.get('use_conditional_prior', False),
+        # Prior selection + joint GNN E2E hyperparams. `prior_type` is what
+        # MeshGraphNets reads at load time to decide whether to instantiate
+        # `self.prior` — must be persisted so inference reconstructs the model
+        # with the same architecture.
+        'prior_type':              config.get('prior_type', ''),
+        'use_conditional_prior':   config.get('use_conditional_prior', False),
         'prior_mixture_components': config.get('prior_mixture_components', 10),
-        'prior_hidden_dim':   config.get('prior_hidden_dim', config.get('latent_dim')),
-        'prior_mp_layers':    config.get('prior_mp_layers', 3),
-        'prior_min_std':      config.get('prior_min_std', 0.05),
-        'prior_loss_type':    config.get('prior_loss_type', 'analytical_kl'),
+        'prior_hidden_dim':         config.get('prior_hidden_dim', config.get('latent_dim')),
+        'prior_mp_layers':          config.get('prior_mp_layers', 3),
+        'prior_min_std':            config.get('prior_min_std', 0.05),
+        'alpha_prior_max':          config.get('alpha_prior_max', 1.0),
+        'alpha_prior_warmup_frac':  config.get('alpha_prior_warmup_frac', 0.2),
+        'prior_kl_reg_weight':      config.get('prior_kl_reg_weight', 0.02),
+        'prior_gumbel_temp':        config.get('prior_gumbel_temp', 1.0),
     }
 
 

@@ -1,5 +1,5 @@
 model   MeshGraphNets-V
-mode    train  # Train VAE-MGN, then train post-hoc conditional prior
+mode    train  # Train VAE-MGN, then fit post-hoc GMM prior
 gpu_ids 1    # -1 for CPU, GPU ids for multi-GPU training (DDP with both H200s)
 log_file_dir    b8_all/train2.log
 modelpath   ./outputs/b8_all/warpage2.pth
@@ -64,7 +64,8 @@ lambda_mmd          1    # MMD(q(z), N(0,I)) weight; matches aggregate posterior
 vae_graph_aware     True  # Feed graph.x into VAE encoder so z encodes only y-residual (fixes minority-type spread collapse)
 free_bits           0.    # Per-dim KL floor (nats). 0.0 = off. Set to 0.25 if collapse persists after vae_graph_aware
 '
+% Prior selection: 'gmm' (post-hoc, unconditional) or 'gnn_e2e' (joint, graph-conditional)
+prior_type                  gmm
 % Post-hoc GMM training
-fit_latent_gmm      True
-gmm_components      10
-gmm_covariance_type full
+gmm_components              10
+gmm_covariance_type         full

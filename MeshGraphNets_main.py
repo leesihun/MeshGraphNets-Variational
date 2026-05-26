@@ -79,8 +79,18 @@ def main():
     print(f"Current absolute path: {os.path.abspath('.')}")
 
     if run_mode == 'train_prior':
-        from training_profiles.posthoc_prior import train_posthoc_prior
-        train_posthoc_prior(config, args.config)
+        from training_profiles.setup import resolve_prior_type
+        prior_type = resolve_prior_type(config)
+        if prior_type == 'gmm':
+            from model.latent_gmm import train_posthoc_gmm
+            train_posthoc_gmm(config, args.config)
+        else:
+            print(
+                f"`mode train_prior` is only valid for `prior_type=gmm`. "
+                f"For `prior_type={prior_type}` the prior is trained jointly with "
+                f"the VAE — use `mode train` instead."
+            )
+            return
 
     elif run_mode == 'inference':
         # Inference mode: autoregressive rollout

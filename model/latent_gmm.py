@@ -97,6 +97,75 @@ def fit_gmm(mu_data, n_components=10, covariance_type='full', random_state=0,
     raise RuntimeError(f"GMM fitting failed after all fallbacks; last error: {last_err}")
 
 
+def train_posthoc_gmm(config, config_filename='config.txt'):
+    """Standalone entry point for `mode train_prior` with `prior_type=gmm`.
+
+    Loads an already-trained VAE checkpoint, rebuilds the model + train dataset,
+    fits the GMM on posterior means, and appends it to the checkpoint. Does not
+    train any neural net.
+    """
+    import os
+    from model.MeshGraphNets import MeshGraphNets
+    from training_profiles.setup import build_dataset_splits, resolve_prior_type
+
+    resolve_prior_type(config)  # normalize config['prior_type']
+
+    if not config.get('use_vae', False):
+        raise ValueError("GMM fitting requires use_vae=True")
+
+    model_path = config.get('modelpath')
+    if not model_path or not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
+
+    gpu_ids = config.get('gpu_ids')
+    if not isinstance(gpu_ids, list):
+        gpu_ids = [gpu_ids]
+    if torch.cuda.is_available() and gpu_ids[0] >= 0:
+        torch.cuda.set_device(gpu_ids[0])
+        device = torch.device(f'cuda:{gpu_ids[0]}')
+    else:
+        device = torch.device('cpu')
+
+    print(f"[GMM] Loading checkpoint: {model_path}")
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+    if 'normalization' not in checkpoint:
+        raise KeyError("Checkpoint is missing normalization stats")
+
+    # Apply persisted model_config so dataset/model shapes match training
+    for key, value in checkpoint.get('model_config', {}).items():
+        config[key] = value
+
+    split_seed = int(config.get('split_seed', 42))
+    train_dataset, _, _ = build_dataset_splits(config, split_seed)
+    norm = checkpoint['normalization']
+    train_dataset.node_mean = norm['node_mean']
+    train_dataset.node_std = norm['node_std']
+    train_dataset.edge_mean = norm['edge_mean']
+    train_dataset.edge_std = norm['edge_std']
+    train_dataset.delta_mean = norm['delta_mean']
+    train_dataset.delta_std = norm['delta_std']
+    train_dataset.node_type_to_idx = norm.get('node_type_to_idx')
+    train_dataset.num_node_types = norm.get('num_node_types')
+    train_dataset.world_edge_radius = norm.get('world_edge_radius')
+    train_dataset.coarse_edge_means = [m.copy() for m in norm.get('coarse_edge_means', [])]
+    train_dataset.coarse_edge_stds = [s.copy() for s in norm.get('coarse_edge_stds', [])]
+
+    model = MeshGraphNets(config, str(device)).to(device)
+    if 'ema_state_dict' in checkpoint:
+        ema_sd = checkpoint['ema_state_dict']
+        model_sd = {k[len('module.'):]: v for k, v in ema_sd.items() if k.startswith('module.')}
+        model.load_state_dict(model_sd)
+        print("[GMM] Loaded frozen EMA simulator weights")
+    else:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print("[GMM] Loaded frozen simulator weights")
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    run_posthoc_gmm_fitting(model, train_dataset, config, device, model_path)
+
+
 def run_posthoc_gmm_fitting(model, train_dataset, config, device, checkpoint_path):
     """Collect posterior means, fit GMM, append to checkpoint.
 

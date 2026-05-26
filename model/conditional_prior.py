@@ -185,6 +185,49 @@ def sample_from_mixture(params, temperature=1.0):
     return chosen_mu + chosen_std * torch.randn_like(chosen_std)
 
 
+def sample_from_mixture_reparam(params, temperature=1.0, hard=False):
+    """Differentiable mixture sample for joint training.
+
+    Gumbel-Softmax over components + reparameterized Gaussian. Returns z of
+    shape [B, num_z, D] with gradients flowing to logits, mu, and log_std.
+
+    Args:
+        params: dict with 'logits' [B, num_z, K], 'mu' [B, num_z, K, D],
+                'log_std' [B, num_z, K, D].
+        temperature: Gumbel-Softmax temperature. Lower → harder selection,
+                     higher variance gradient. 1.0 is a reasonable default.
+        hard: if True, use straight-through estimator (forward = one-hot,
+              backward = soft). Forward draws are then exact mixture samples.
+    """
+    logits = params['logits']        # [B, num_z, K]
+    mu = params['mu']                # [B, num_z, K, D]
+    log_std = params['log_std']      # [B, num_z, K, D]
+
+    temp = max(float(temperature), 1e-6)
+
+    # Gumbel noise: u ~ Uniform(0,1), g = -log(-log(u + eps) + eps)
+    u = torch.rand_like(logits).clamp_(1e-9, 1.0 - 1e-9)
+    gumbel = -torch.log(-torch.log(u))
+    soft = torch.softmax((logits + gumbel) / temp, dim=-1)   # [B, num_z, K]
+
+    if hard:
+        # Straight-through: forward uses one-hot, backward uses soft
+        index = soft.argmax(dim=-1, keepdim=True)
+        hard_oh = torch.zeros_like(soft).scatter_(-1, index, 1.0)
+        weights = (hard_oh - soft).detach() + soft
+    else:
+        weights = soft
+
+    # Mix component parameters: [B, num_z, K, D] → [B, num_z, D]
+    w = weights.unsqueeze(-1)                                # [B, num_z, K, 1]
+    mu_mixed = (w * mu).sum(dim=-2)                          # [B, num_z, D]
+    log_std_mixed = (w * log_std).sum(dim=-2)                # [B, num_z, D]
+
+    eps = torch.randn_like(mu_mixed)
+    z = mu_mixed + torch.exp(log_std_mixed) * eps
+    return z
+
+
 def build_prior_config(config):
     use_multiscale = bool(config.get('use_multiscale', False))
     default_num_z = (int(config.get('multiscale_levels', 1)) + 1) if use_multiscale else 1

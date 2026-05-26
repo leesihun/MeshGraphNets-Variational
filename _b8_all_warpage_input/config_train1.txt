@@ -1,5 +1,5 @@
 model   MeshGraphNets-V
-mode    train  # Train VAE-MGN, then train post-hoc conditional prior
+mode    train  # Train VAE-MGN with joint GNN E2E prior (selected by prior_type below)
 gpu_ids 0,1    # -1 for CPU, GPU ids for multi-GPU training (DDP with both H200s)
 log_file_dir    b8_all/train32.log
 modelpath   ./outputs/b8_all/warpage32.pth
@@ -62,3 +62,16 @@ vae_latent_dim      32      # Global latent z dimension
 alpha_recon         1    # Reconstruction loss weight
 lambda_mmd          0.1    # MMD(q(z), N(0,I)) weight; matches aggregate posterior to prior
 vae_graph_aware     True  # Feed graph.x into VAE encoder so z encodes only y-residual (fixes minority-type spread collapse)
+'
+% Prior selection: 'gmm' (post-hoc, unconditional) or 'gnn_e2e' (joint, graph-conditional)
+prior_type                  gnn_e2e
+% GNN E2E prior — joint training (alpha_prior ramped 0→1.0 over the warmup fraction)
+alpha_prior_max             1.0
+alpha_prior_warmup_frac     0.2
+prior_kl_reg_weight         0.02    # small KL anchor to q(z|y) for stability; 0.0 disables
+prior_gumbel_temp           1.0     # Gumbel-Softmax temperature for differentiable mixture sample
+prior_mixture_components    30      # number of Gaussian components in p(z|graph)
+prior_mp_layers             5       # GnBlocks inside the prior network
+prior_hidden_dim            192
+prior_min_std               0.1     # floor on per-component std; prevents collapse to point masses
+prior_temperature           1.0     # inference temperature (rollout)

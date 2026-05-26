@@ -10,6 +10,37 @@ from general_modules.mesh_utils_fast import (
     edges_to_triangles_gpu,
     edges_to_triangles_optimized,
 )
+from model.conditional_prior import (
+    analytical_prior_kl_loss,
+    sample_from_mixture,
+)
+
+
+def _alpha_prior(epoch, total_epochs, warmup_frac, max_val):
+    """Linear ramp from 0 to max_val over the first `warmup_frac` of training.
+
+    Used to schedule alpha_prior in the joint GNN E2E objective: pure VAE training
+    early on (decoder + posterior stabilize), then the prior-path loss kicks in.
+    """
+    if max_val <= 0.0 or total_epochs is None or total_epochs <= 0:
+        return 0.0
+    warmup_epochs = max(1.0, float(warmup_frac) * float(total_epochs))
+    return float(min(float(max_val), float(epoch) / warmup_epochs))
+
+
+def _unwrap_for_submodule(model):
+    """Return the underlying MeshGraphNets module, peeling DDP / EMA / compile wrappers.
+
+    The joint GNN E2E objective needs access to `model.prior` (a submodule on
+    `MeshGraphNets`). DDP wraps it under `.module`; AveragedModel under `.module`;
+    `torch.compile` under `._orig_mod`. Try each.
+    """
+    m = model
+    for attr in ('module', '_orig_mod'):
+        inner = getattr(m, attr, None)
+        if inner is not None:
+            m = inner
+    return m
 
 
 def build_ema_model(model, config):
@@ -167,6 +198,29 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
     # Closes the "posterior shortcut" — prevents z from absorbing deterministic content.
     lambda_det = float(config.get('lambda_det', 0.0)) if use_vae else 0.0
 
+    # Joint GNN E2E prior config — only active when prior_type='gnn_e2e' and the
+    # model carries a prior submodule. The prior-recon weight is ramped linearly.
+    prior_type = str(config.get('prior_type', '')).lower().strip()
+    inner_model = _unwrap_for_submodule(model)
+    has_gnn_prior = (
+        use_vae and prior_type == 'gnn_e2e'
+        and getattr(inner_model, 'prior', None) is not None
+    )
+    total_epochs = int(config.get('training_epochs', 1))
+    alpha_prior_max = float(config.get('alpha_prior_max', 1.0))
+    alpha_prior_warmup_frac = float(config.get('alpha_prior_warmup_frac', 0.2))
+    alpha_prior_now = (
+        _alpha_prior(epoch, total_epochs, alpha_prior_warmup_frac, alpha_prior_max)
+        if has_gnn_prior else 0.0
+    )
+    prior_kl_reg_weight = float(config.get('prior_kl_reg_weight', 0.02))
+    prior_gumbel_temp = float(config.get('prior_gumbel_temp', 1.0))
+    # Skip the (expensive) second simulator forward when alpha_prior is still zero
+    # and there's no KL anchor — saves compute during the pure-VAE warmup phase.
+    compute_prior_path = has_gnn_prior and (alpha_prior_now > 0.0 or prior_kl_reg_weight > 0.0)
+    total_recon_prior_sum = 0.0
+    total_kl_anchor_sum = 0.0
+
     # Gradient accumulation: 0 = full epoch (1 step/epoch), 1 = per-batch (default), N = every N batches
     grad_accum_steps = config.get('grad_accum_steps', 1)
     total_batches = len(dataloader)
@@ -184,7 +238,11 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
         graph = _move_graph_to_device(graph, device, config)
 
         with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
-            predicted_acc, target_acc, vae_losses, aux_loss_val = model(graph, debug=debug_internal)
+            predicted_acc, target_acc, vae_losses, aux_loss_val, prior_outputs = model(
+                graph, debug=debug_internal,
+                compute_prior_path=compute_prior_path,
+                gumbel_temp=prior_gumbel_temp,
+            )
             mmd_loss_val = vae_losses['mmd']
             kl_loss_val = vae_losses['kl']
             kl_raw_val = vae_losses['kl_raw']
@@ -194,10 +252,35 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
             # add_noise=False: the first forward already injected noise into graph in-place.
             det_loss_val = predicted_acc.new_zeros(())
             if use_vae and lambda_det > 0.0:
-                predicted_det, _, _, _ = model(graph, add_noise=False, use_zero_z=True)
+                predicted_det, _, _, _, _ = model(graph, add_noise=False, use_zero_z=True)
                 errors_det = torch.nn.functional.huber_loss(
                     predicted_det, target_acc, reduction='none', delta=1.0)
                 det_loss_val, _, _ = _loss_from_errors(errors_det, loss_weights)
+
+            # Joint GNN E2E prior loss terms (only when prior path was computed)
+            recon_prior_val = predicted_acc.new_zeros(())
+            if prior_outputs is not None:
+                errors_prior = torch.nn.functional.huber_loss(
+                    prior_outputs['predicted_prior'], target_acc,
+                    reduction='none', delta=1.0,
+                )
+                recon_prior_val, _, _ = _loss_from_errors(errors_prior, loss_weights)
+
+        # KL anchor for the prior. Computed in fp32 outside the autocast region
+        # because analytical_prior_kl_loss does exp(log_var_k) and 1/var_k which
+        # underflow in bfloat16. .detach() on μ, logvar so the encoder isn't
+        # dragged by the anchor — only the prior is constrained.
+        kl_anchor_val = torch.zeros((), device=predicted_acc.device, dtype=torch.float32)
+        if (prior_outputs is not None
+                and prior_kl_reg_weight > 0.0
+                and vae_losses.get('mu') is not None):
+            kl_anchor_val = analytical_prior_kl_loss(
+                {k: v.float() for k, v in prior_outputs['prior_params'].items()},
+                vae_losses['mu'].detach().float(),
+                vae_losses['logvar'].detach().float(),
+            )
+
+        with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
 
             if batch_idx == 0 and verbose:
                 tqdm.tqdm.write(f"\n=== DEBUG Epoch {epoch} Batch 0 ===")
@@ -217,6 +300,11 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
                     loss = loss + lambda_det * det_loss_val
                 if free_bits > 0.0:
                     loss = loss + kl_loss_val
+                # Joint GNN E2E prior contribution (alpha_prior is ramped, KL anchor small).
+                if prior_outputs is not None and alpha_prior_now > 0.0:
+                    loss = loss + alpha_prior_now * recon_prior_val
+                if prior_outputs is not None and prior_kl_reg_weight > 0.0:
+                    loss = loss + prior_kl_reg_weight * kl_anchor_val
             else:
                 loss = recon_loss
             # Scale loss so accumulated gradients equal the mean within each accumulation window.
@@ -252,6 +340,9 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
             total_kl_raw_sum += kl_raw_scalar
             total_det_sum += det_scalar
             mmd_count += 1
+            if prior_outputs is not None:
+                total_recon_prior_sum += float(recon_prior_val.item())
+                total_kl_anchor_sum += float(kl_anchor_val.item())
 
         # Step optimizer at end of accumulation window or final batch
         is_last_batch = (batch_idx == total_batches - 1)
@@ -302,6 +393,10 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
                     kl_raw_v = kl_raw_val.item() if hasattr(kl_raw_val, 'item') else float(kl_raw_val)
                     postfix['kl'] = f'{kl_val:.2e}'
                     postfix['kl_raw'] = f'{kl_raw_v:.2e}'
+                if prior_outputs is not None:
+                    postfix['rec_p'] = f'{recon_prior_val.item():.2e}'
+                    postfix['kl_a']  = f'{kl_anchor_val.item():.2e}'
+                    postfix['α_p']   = f'{alpha_prior_now:.2f}'
                 postfix['total'] = f'{loss.item():.2e}'
             if monitor_gradients:
                 postfix['grad'] = f'{grad_norm.item():.2e}'
@@ -331,11 +426,15 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
         if free_bits > 0.0:
             result['kl_mean'] = total_kl_sum / mmd_count
             result['kl_raw_mean'] = total_kl_raw_sum / mmd_count
+        if has_gnn_prior:
+            result['recon_prior_mean'] = total_recon_prior_sum / mmd_count
+            result['kl_anchor_mean']   = total_kl_anchor_sum / mmd_count
+            result['alpha_prior']      = alpha_prior_now
     return result
 
 def _eval_forward_errors(model, graph, use_amp, amp_dtype, use_posterior):
     with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
-        predicted, target, vae_losses, _ = model(
+        predicted, target, vae_losses, _, _ = model(
             graph,
             add_noise=False,
             use_posterior=use_posterior,
@@ -501,6 +600,56 @@ def evaluate_vae_prior_epoch(model, dataloader, device, config, epoch=0, *,
     )
 
 
+def evaluate_vae_learned_prior_epoch(model, dataloader, device, config, epoch=0,
+                                     progress_name='ValidationLearnedPrior'):
+    """Evaluate reconstruction quality using the joint-trained GNN prior.
+
+    Mirrors inference: sample z from p(z|graph) with the hard (non-reparameterized)
+    sampler, then run the simulator with that z. This is the most informative
+    validation signal for spread modeling — it answers "if I sampled the way I
+    sample at inference, how good would the reconstruction be?".
+
+    No-op when there is no learned prior (returns None).
+    """
+    inner = _unwrap_for_submodule(model)
+    if getattr(inner, 'prior', None) is None:
+        return None
+
+    model.eval()
+    loss_weights = _build_loss_weights(config, device)
+    use_amp = config.get('use_amp', True)
+    amp_dtype = torch.bfloat16
+    prior_temperature = float(config.get('prior_temperature', 1.0))
+
+    total_loss_sum = 0.0
+    total_loss_count = 0
+
+    with torch.no_grad():
+        pbar = tqdm.tqdm(dataloader, desc=progress_name)
+        for graph in pbar:
+            graph = _move_graph_to_device(graph, device, config)
+            with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
+                z_prior = inner.prior.sample(graph, temperature=prior_temperature)
+                predicted, target, _, _, _ = model(
+                    graph, add_noise=False, use_posterior=False, fixed_z=z_prior,
+                )
+                errors = torch.nn.functional.huber_loss(
+                    predicted, target, reduction='none', delta=1.0,
+                )
+            _, batch_loss_sum, batch_loss_count = _loss_from_errors(errors, loss_weights)
+            total_loss_sum += batch_loss_sum
+            total_loss_count += batch_loss_count
+            mem_gb = torch.cuda.memory_allocated() / 1e9
+            pbar.set_postfix({'rec': f'{batch_loss_sum / max(batch_loss_count, 1):.2e}',
+                              'mem': f'{mem_gb:.1f}GB'})
+
+    return {
+        'mean': total_loss_sum / max(total_loss_count, 1),
+        'sum': total_loss_sum,
+        'count': total_loss_count,
+    }
+
+
 def test_model(model, dataloader, device, config, epoch, dataset=None, output_prefix='test'):
     model.eval()
 
@@ -554,7 +703,7 @@ def test_model(model, dataloader, device, config, epoch, dataset=None, output_pr
 
             graph = _move_graph_to_device(graph, device, config)
             with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
-                predicted, target, _, _ = model(graph, use_posterior=True)
+                predicted, target, _, _, _ = model(graph, use_posterior=True)
                 errors = torch.nn.functional.huber_loss(predicted, target, reduction='none', delta=1.0)
                 loss, batch_loss_sum, batch_loss_count = _loss_from_errors(errors, loss_weights)
 
