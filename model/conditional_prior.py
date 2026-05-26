@@ -199,10 +199,10 @@ def build_prior_config(config):
         'use_multiscale': use_multiscale,
         'multiscale_levels': config.get('multiscale_levels', 1),
         'num_z': int(config.get('num_z', default_num_z)),
-        'prior_mixture_components': config.get('prior_mixture_components', 10),
+        'prior_mixture_components': config.get('prior_mixture_components', 50),
         'prior_hidden_dim': config.get('prior_hidden_dim', config.get('latent_dim')),
-        'prior_mp_layers': config.get('prior_mp_layers', 3),
-        'prior_min_std': config.get('prior_min_std', 0.05),
+        'prior_mp_layers': config.get('prior_mp_layers', 10),
+        'prior_min_std': config.get('prior_min_std', 0.1),
         'prior_loss_type': config.get('prior_loss_type', 'analytical_kl'),
         'residual_scale': config.get('residual_scale', 1.0),
     }
