@@ -88,6 +88,12 @@ is set. `parallel_mode model_split` routes to `parallelism.launcher`.
   aggregates mesh and world messages separately.
 - Multiscale V-cycle has no global gated encoder skip in the live code. It uses
   per-level skip states merged by `Linear(2 * latent_dim, latent_dim)`.
+- `coarsening_type` accepts `bfs`, `voronoi_centroid`, and `voronoi_inherit` as
+  canonical per-level values. `voronoi` is a back-compat alias for
+  `voronoi_centroid`. Inherit mode pools by gathering the FPS seed feature
+  (coarse node *is* the seed); centroid mode pools by scatter mean. Mixing
+  modes per level is supported. Stats are mode-specific, so a checkpoint
+  trained in one mode cannot be loaded into the other.
 
 ## Data Facts
 

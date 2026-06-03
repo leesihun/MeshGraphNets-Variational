@@ -356,12 +356,26 @@ class MeshGraphDataset(Dataset):
         self._coarse_cache: Dict = {}  # {sample_id: list[dict]} — list from build_multiscale_hierarchy
         self._static_cache: Dict = {}  # per-worker topology and positional features
 
-        # Per-level coarsening method ('bfs' or 'voronoi')
+        # Per-level coarsening method.
+        # Accepted: 'bfs', 'voronoi', 'voronoi_centroid', 'voronoi_inherit'.
+        # 'voronoi' is normalised to 'voronoi_centroid' so downstream code sees
+        # only canonical values.
+        _accepted_methods = ('bfs', 'voronoi_centroid', 'voronoi_inherit')
         raw_ct = config.get('coarsening_type', 'bfs')
         if isinstance(raw_ct, list):
             self.coarsening_types = [str(t).strip().lower() for t in raw_ct]
         else:
             self.coarsening_types = [str(raw_ct).strip().lower()]
+        self.coarsening_types = [
+            'voronoi_centroid' if t == 'voronoi' else t for t in self.coarsening_types
+        ]
+        for t in self.coarsening_types:
+            if t not in _accepted_methods:
+                raise ValueError(
+                    f"Unknown coarsening method '{t}' in coarsening_type. "
+                    f"Accepted: 'bfs', 'voronoi' (alias for 'voronoi_centroid'), "
+                    f"'voronoi_centroid', 'voronoi_inherit'."
+                )
         # Expand single value to all levels
         if len(self.coarsening_types) == 1 and self.multiscale_levels > 1:
             self.coarsening_types = self.coarsening_types * self.multiscale_levels
@@ -387,7 +401,7 @@ class MeshGraphDataset(Dataset):
         print(f"  use_multiscale: {self.use_multiscale}" + (f" (levels={self.multiscale_levels})" if self.use_multiscale else ""))
         if self.use_multiscale:
             print(f"  coarsening_types: {self.coarsening_types}")
-            if any(t == 'voronoi' for t in self.coarsening_types):
+            if any(t.startswith('voronoi') for t in self.coarsening_types):
                 print(f"  voronoi_clusters: {self.voronoi_clusters}")
         if self.use_world_edges:
             print(f"  world_radius_multiplier: {self.world_radius_multiplier}")
@@ -891,9 +905,15 @@ class MeshGraphDataset(Dataset):
                         ftc_l = entry['ftc']
                         c_ei_l = entry['c_ei']
                         n_c_l = entry['n_c']
+                        mode_l = entry.get('mode', 'centroid')
+                        seeds_l = entry.get('seeds')
 
-                        coarse_ref = compute_coarse_centroids(cur_ref, ftc_l, n_c_l)
-                        coarse_def = compute_coarse_centroids(cur_def, ftc_l, n_c_l)
+                        if mode_l == 'inherit':
+                            coarse_ref = cur_ref[seeds_l]
+                            coarse_def = cur_def[seeds_l]
+                        else:
+                            coarse_ref = compute_coarse_centroids(cur_ref, ftc_l, n_c_l)
+                            coarse_def = compute_coarse_centroids(cur_def, ftc_l, n_c_l)
 
                         if c_ei_l.shape[1] > 0:
                             c_edge_attr = compute_edge_attr(

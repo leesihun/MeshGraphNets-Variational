@@ -17,7 +17,7 @@ more coarsened graph levels.
 | --- | --- |
 | `use_multiscale` | Enables multiscale graph data and the V-cycle processor. |
 | `multiscale_levels` | Number of coarse levels. |
-| `coarsening_type` | `bfs`, `voronoi`, or a comma list with one method per level. |
+| `coarsening_type` | `bfs`, `voronoi`, `voronoi_centroid`, `voronoi_inherit`, or a comma list with one method per level. |
 | `voronoi_clusters` | Cluster count for Voronoi levels; scalar or comma list. |
 | `mp_per_level` | Processor block counts. Must have `2 * multiscale_levels + 1` entries. |
 | `bipartite_unpool` | Enables learned coarse-to-fine unpooling. |
@@ -87,6 +87,28 @@ coarse graph size through `voronoi_clusters`.
 
 Use it when the model must fit a fixed or aggressive coarse resolution, for
 example the `_b8_all_warpage_input` configs with `voronoi_clusters 200`.
+
+## Coarsening Modes
+
+`coarsening_type` accepts these canonical values per level:
+
+| Value | Behavior |
+| --- | --- |
+| `bfs` | BFS bi-stride coarsening. Pool = scatter mean over BFS clusters. Coarse position = cluster centroid. |
+| `voronoi` | Back-compat alias for `voronoi_centroid`. |
+| `voronoi_centroid` | FPS-Voronoi. Coarse position = cluster centroid; pool = scatter mean over members. Default voronoi behavior. |
+| `voronoi_inherit` | FPS-Voronoi. Coarse node *is* the FPS seed: coarse position = seed position (a real mesh node), pool degenerates to a gather `x[seeds]`. Coarse edges are still the boundary edges between Voronoi cells. |
+
+Mixing modes per level is supported. For example,
+`coarsening_type voronoi_centroid, voronoi_inherit` (with `multiscale_levels 2`)
+uses centroid coarsening at level 0 and seed-inherit coarsening at level 1.
+
+Inherit mode adds an optional graph attribute `coarse_seed_idx_{i}` for each
+level that uses it; the model branches its pool step on the presence of this
+attribute. Levels not in inherit mode do not set the attribute and use the
+existing centroid path. Inherit-mode coarse edge stats differ from
+centroid-mode stats — a checkpoint trained in one mode cannot be reused in the
+other.
 
 ## Iterative Hierarchy
 

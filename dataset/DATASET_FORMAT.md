@@ -217,7 +217,13 @@ coarse_edge_attr_i
 num_coarse_i
 optional unpool_edge_index_i
 optional coarse_centroid_i
+optional coarse_seed_idx_i
 ```
+
+`coarse_seed_idx_i` is set only when level `i` uses
+`coarsening_type voronoi_inherit`. Its values index into the previous level's
+node space (or the fine-node space at `i = 0`), the same semantics as row 1 of
+`unpool_edge_index_i`. `MultiscaleData` batches it with that increment.
 
 Coarse edge normalizers are saved into checkpoints as:
 

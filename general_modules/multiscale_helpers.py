@@ -24,6 +24,15 @@ from model.coarsening import (
 )
 
 
+def _coarsening_mode(method: str) -> str:
+    """Map a coarsening method string to its per-level usage mode.
+
+    'voronoi_inherit' → 'inherit'; every other accepted method → 'centroid'.
+    The mode controls how coarse positions / pool / coarse_seed_idx are produced.
+    """
+    return 'inherit' if method.strip().lower() == 'voronoi_inherit' else 'centroid'
+
+
 def build_multiscale_hierarchy(
     edge_index: np.ndarray,
     num_nodes: int,
@@ -40,10 +49,13 @@ def build_multiscale_hierarchy(
     `multiscale_levels` when the coarsening saturates (n_c <= 1 or empty edges).
 
     Each entry has:
-        'ftc':   [N_level]       fine-to-coarse mapping (np.int64)
-        'c_ei':  [2, E_coarse]   coarse edge index (np.int64)
-        'n_c':   int             number of coarse nodes
-        'up_ei': [2, E_up]       bipartite unpool edges (only if bipartite_unpool)
+        'ftc':    [N_level]      fine-to-coarse mapping (np.int64)
+        'c_ei':   [2, E_coarse]  coarse edge index (np.int64)
+        'n_c':    int            number of coarse nodes
+        'seeds':  [n_c]          fine-node id chosen as cluster representative
+                                 (BFS even-depth ids; FPS-Voronoi seeds)
+        'mode':   'inherit' | 'centroid'  per-level pool/position mode
+        'up_ei':  [2, E_up]      bipartite unpool edges (only if bipartite_unpool)
     """
     hierarchy: List[dict] = []
     current_ei, current_n = edge_index, num_nodes
@@ -52,11 +64,12 @@ def build_multiscale_hierarchy(
     for level in range(multiscale_levels):
         method = coarsening_types[level] if level < len(coarsening_types) else 'bfs'
         n_clusters = voronoi_clusters[level] if level < len(voronoi_clusters) else 0
-        ftc, c_ei, n_c = coarsen_graph(
+        ftc, c_ei, n_c, seeds = coarsen_graph(
             current_ei, current_n, method=method,
             num_clusters=n_clusters, ref_pos=level_ref_pos,
         )
-        entry = {'ftc': ftc, 'c_ei': c_ei, 'n_c': n_c}
+        mode = _coarsening_mode(method)
+        entry = {'ftc': ftc, 'c_ei': c_ei, 'n_c': n_c, 'seeds': seeds, 'mode': mode}
         if bipartite_unpool:
             entry['up_ei'] = build_unpool_edges(ftc, c_ei, n_c)
         hierarchy.append(entry)
@@ -64,7 +77,11 @@ def build_multiscale_hierarchy(
         if n_c <= 1 or c_ei.shape[1] == 0:
             break
 
-        level_ref_pos = compute_coarse_centroids(level_ref_pos, ftc, n_c).astype(np.float32)
+        if mode == 'inherit':
+            # Coarse node "is" the seed: positions are gathered, not averaged.
+            level_ref_pos = level_ref_pos[seeds].astype(np.float32)
+        else:
+            level_ref_pos = compute_coarse_centroids(level_ref_pos, ftc, n_c).astype(np.float32)
         current_ei, current_n = c_ei, n_c
 
     return hierarchy
@@ -102,7 +119,12 @@ def attach_coarse_levels_to_graph(
     Mutates `graph` in place, setting for each level `i` in `hierarchy`:
         fine_to_coarse_{i}, coarse_edge_index_{i}, coarse_edge_attr_{i},
         num_coarse_{i}, coarse_centroid_{i},
-        unpool_edge_index_{i} (only if the entry carries 'up_ei')
+        unpool_edge_index_{i} (only if the entry carries 'up_ei'),
+        coarse_seed_idx_{i}   (only if the entry's mode == 'inherit')
+
+    In ``inherit`` mode, ``coarse_centroid_{i}`` is the seed-anchor position (not
+    a centroid); the legacy attribute name is retained for backward-compat with
+    reader code that uses it for ``rel_pos``.
 
     If `device` is provided, tensors are moved to that device; otherwise they
     stay on CPU (the DataLoader / .to() will handle the transfer).
@@ -114,9 +136,15 @@ def attach_coarse_levels_to_graph(
         ftc = entry['ftc']
         c_ei = entry['c_ei']
         n_c = entry['n_c']
+        mode = entry.get('mode', 'centroid')
+        seeds = entry.get('seeds')
 
-        coarse_ref = compute_coarse_centroids(cur_ref, ftc, n_c)
-        coarse_def = compute_coarse_centroids(cur_def, ftc, n_c)
+        if mode == 'inherit':
+            coarse_ref = cur_ref[seeds]
+            coarse_def = cur_def[seeds]
+        else:
+            coarse_ref = compute_coarse_centroids(cur_ref, ftc, n_c)
+            coarse_def = compute_coarse_centroids(cur_def, ftc, n_c)
 
         if c_ei.shape[1] > 0:
             c_ea_raw = compute_edge_attr(
@@ -150,6 +178,12 @@ def attach_coarse_levels_to_graph(
         graph[f'coarse_edge_attr_{level}']  = c_ea_t
         graph[f'num_coarse_{level}']        = n_c_t
         graph[f'coarse_centroid_{level}']   = cent_t
+
+        if mode == 'inherit' and seeds is not None:
+            seed_idx_t = torch.from_numpy(np.asarray(seeds, dtype=np.int64))
+            if device is not None:
+                seed_idx_t = seed_idx_t.to(device)
+            graph[f'coarse_seed_idx_{level}'] = seed_idx_t
 
         if 'up_ei' in entry:
             up_t = torch.from_numpy(entry['up_ei'])

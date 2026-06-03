@@ -489,7 +489,11 @@ class EncoderProcessorDecoder(nn.Module):
             })
 
             ld = level_data[i]
-            h_coarse = pool_features(current_graph.x, ld['ftc'], ld['n_c'])
+            if 'seeds' in ld:
+                # Inherit mode: coarse node IS the seed → pool is a gather.
+                h_coarse = current_graph.x[ld['seeds']]
+            else:
+                h_coarse = pool_features(current_graph.x, ld['ftc'], ld['n_c'])
             e_coarse = self.coarse_eb_encoders[i](ld['c_ea'])
             current_graph = Data(x=h_coarse, edge_attr=e_coarse, edge_index=ld['c_ei'])
             if self.use_coarse_world_edges and ld['c_we_idx'] is not None and ld['c_we_idx'].shape[1] > 0:
@@ -564,6 +568,9 @@ class EncoderProcessorDecoder(nn.Module):
                 'c_we_idx': getattr(graph, f'coarse_world_edge_index_{i}', None),
                 'c_we_attr': getattr(graph, f'coarse_world_edge_attr_{i}', None),
             }
+            seed_key = f'coarse_seed_idx_{i}'
+            if hasattr(graph, seed_key) and graph[seed_key] is not None:
+                ld['seeds'] = graph[seed_key]
             if self.use_multiscale and getattr(self, 'bipartite_unpool', False):
                 ld['up_ei'] = graph[f'unpool_edge_index_{i}']
                 ld['coarse_centroid'] = graph[f'coarse_centroid_{i}']

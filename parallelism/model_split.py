@@ -938,6 +938,9 @@ class ModelSplitStage(nn.Module):
             'c_we_idx':  getattr(graph, f'coarse_world_edge_index_{level}', None),
             'c_we_attr': getattr(graph, f'coarse_world_edge_attr_{level}', None),
         }
+        seed_idx = getattr(graph, f'coarse_seed_idx_{level}', None)
+        if seed_idx is not None:
+            ld['seeds'] = seed_idx
         if bool(self.config.get('bipartite_unpool', False)):
             up_ei = getattr(graph, f'unpool_edge_index_{level}', None)
             if up_ei is not None:
@@ -1020,7 +1023,11 @@ class ModelSplitStage(nn.Module):
                     'z_per_node': z_per_node,
                 })
                 # Pool
-                h_coarse = pool_features(current_graph.x, ld['ftc'], ld['n_c'])
+                if 'seeds' in ld:
+                    # Inherit mode: coarse node IS the seed → pool is a gather.
+                    h_coarse = current_graph.x[ld['seeds']]
+                else:
+                    h_coarse = pool_features(current_graph.x, ld['ftc'], ld['n_c'])
                 e_coarse = self.model.coarse_eb_encoders[str(pool_level)](ld['c_ea'])
                 current_graph = Data(x=h_coarse, edge_attr=e_coarse, edge_index=ld['c_ei'])
                 if self.use_coarse_world_edges:
