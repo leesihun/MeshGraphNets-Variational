@@ -5,9 +5,12 @@
 #
 # Assumes the trained checkpoints exist at:
 #   ./outputs/b8_all/warpage32_{1,2,3,4}.pth
-# and the inference datasets exist at:
+# the inference *initial condition* datasets exist at:
 #   ./dataset/infer_b8_main.h5
 #   ./dataset/infer_b8_secondary.h5
+# and the ground-truth *eval* datasets (used for histogram comparison) at:
+#   ./dataset/eval_b8_main.h5
+#   ./dataset/eval_b8_sec.h5
 #
 # Each inference's stdout is tee'd to ${LOG_ROOT}/infer_<tag>.log and the
 # histogram step to ${LOG_ROOT}/hist_<tag>.log. The trained-model log files
@@ -42,10 +45,10 @@ cd "$REPO_ROOT"
 LOG_ROOT="${LOG_ROOT:-outputs/b8_all/run_logs}"
 mkdir -p "$LOG_ROOT"
 
-ds_h5() {
+eval_h5() {
     case "$1" in
-        main) echo "dataset/infer_b8_main.h5" ;;
-        sec)  echo "dataset/infer_b8_secondary.h5" ;;
+        main) echo "dataset/eval_b8_main.h5" ;;
+        sec)  echo "dataset/eval_b8_sec.h5" ;;
         *) echo "ERROR: unknown dataset tag '$1'" >&2; exit 2 ;;
     esac
 }
@@ -56,8 +59,8 @@ run_one() {
     local tag="${idx}_${ds}"
     local cfg="_b8_all_warpage_input/config_infer${idx}_${ds}.txt"
     local rollout_dir="outputs/b8_all/infer32_${idx}_${ds}"
-    local infer_ds
-    infer_ds="$(ds_h5 "$ds")"
+    local eval_ds
+    eval_ds="$(eval_h5 "$ds")"
 
     if [ ! -f "$cfg" ]; then
         echo "[$tag] SKIP: config not found ($cfg)" >&2
@@ -80,9 +83,9 @@ run_one() {
         echo ""
         echo "[$tag] HISTOGRAM  rollout_dir=$rollout_dir"
         if ! "$PYTHON" _b8_all_warpage_input/compare_histograms.py \
-                --infer_dataset "$infer_ds" \
-                --rollout_dir   "$rollout_dir" \
-                --output        "$rollout_dir/histogram_compare.png" 2>&1 \
+                --eval_dataset "$eval_ds" \
+                --rollout_dir  "$rollout_dir" \
+                --output       "$rollout_dir/histogram_compare.png" 2>&1 \
                 | tee "$LOG_ROOT/hist_${tag}.log"; then
             echo "[$tag] histogram comparison FAILED — see $LOG_ROOT/hist_${tag}.log" >&2
             return 1
