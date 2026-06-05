@@ -198,8 +198,8 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
     if rank == 0:
         log_model_summary(ddp_model, config, ema_model)
 
-    best_valid_loss = float('inf')
-    best_epoch = -1
+    last_valid_loss = float('inf')
+    last_saved_epoch = -1
 
     # ---- Optimizer / Scheduler ----
     if rank == 0:
@@ -358,9 +358,9 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
                 )
 
         # Only rank 0 saves checkpoints
-        if valid_loss < best_valid_loss and rank == 0:
-            best_valid_loss = valid_loss
-            best_epoch = epoch
+        if rank == 0:
+            last_valid_loss = valid_loss
+            last_saved_epoch = epoch
             save_checkpoint(
                 epoch, ddp_model.module, ema_model, optimizer, scheduler,
                 train_loss, valid_loss, config, train_dataset, modelname,
@@ -368,7 +368,7 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
                 valid_prior_loss=valid_prior_loss if use_vae else None,
                 vae_valid_prior_samples=vae_valid_prior_samples if use_vae else None,
             )
-            print(f"  -> New best model saved at epoch {epoch} with valid loss {valid_loss:.2e}")
+            print(f"  -> Model saved at epoch {epoch} with valid loss {valid_loss:.2e}")
 
         if log_file and rank == 0: 
             with open(log_file, 'a') as f:
@@ -418,9 +418,9 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
 
     if rank == 0:
         if interrupted:
-            print(f"\nTraining interrupted. Best model at epoch {best_epoch} with validation loss {best_valid_loss:.2e}")
+            print(f"\nTraining interrupted. Last model saved at epoch {last_saved_epoch} with validation loss {last_valid_loss:.2e}")
         else:
-            print(f"\nTraining finished. Best model at epoch {best_epoch} with validation loss {best_valid_loss:.2e}")
+            print(f"\nTraining finished. Last model saved at epoch {last_saved_epoch} with validation loss {last_valid_loss:.2e}")
 
     # Post-hoc step: only the 'gmm' mode trains anything after the main loop.
     # 'gnn_e2e' is fully joint — its prior was already trained inside train_epoch.

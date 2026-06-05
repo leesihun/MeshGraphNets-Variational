@@ -200,7 +200,8 @@ def _split_worker_inner(rank: int, num_stages: int, config: dict, gpu_ids: list,
     modelpath = config.get('modelpath')
 
     start_time     = time.time()
-    best_train_loss = float('inf')
+    last_train_loss = float('inf')
+    last_saved_epoch = -1
 
     for epoch in range(total_epochs):
         train_loss = _train_one_epoch(
@@ -221,19 +222,19 @@ def _split_worker_inner(rank: int, num_stages: int, config: dict, gpu_ids: list,
                   f"train_loss={train_loss:.2e} lr={current_lr:.2e} "
                   f"elapsed={time.time()-start_time:.1f}s")
 
-        if train_loss < best_train_loss:
-            best_train_loss = train_loss
-            _save_checkpoint(
-                stage=stage, ema_model=ema_model,
-                optimizer=optimizer, scheduler=scheduler,
-                assignment=assignment, num_stages=num_stages,
-                epoch=epoch, train_loss=train_loss,
-                config=config, train_dataset=train_dataset,
-                modelpath=modelpath, rank=rank,
-            )
+        last_train_loss = train_loss
+        last_saved_epoch = epoch
+        _save_checkpoint(
+            stage=stage, ema_model=ema_model,
+            optimizer=optimizer, scheduler=scheduler,
+            assignment=assignment, num_stages=num_stages,
+            epoch=epoch, train_loss=train_loss,
+            config=config, train_dataset=train_dataset,
+            modelpath=modelpath, rank=rank,
+        )
 
     if rank == 0:
-        print(f"[model_split] training finished. best_train_loss={best_train_loss:.2e}")
+        print(f"[model_split] training finished. last model saved at epoch {last_saved_epoch} with train_loss={last_train_loss:.2e}")
 
     cleanup_dataloaders(train_loader)
 

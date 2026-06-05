@@ -124,8 +124,8 @@ def single_worker(config, config_filename='config.txt'):
     if vae_valid_prior_samples < 1:
         raise ValueError("vae_valid_prior_samples must be >= 1")
 
-    best_valid_loss = float('inf')
-    best_epoch = -1
+    last_valid_loss = float('inf')
+    last_saved_epoch = -1
     val_interval = int(config.get('val_interval', 1))
 
     try:
@@ -156,7 +156,7 @@ def single_worker(config, config_filename='config.txt'):
                     valid_prior_metrics = None
                 valid_loss = valid_metrics['mean']
             else:
-                valid_loss = best_valid_loss  # reuse last known for checkpoint gating
+                valid_loss = last_valid_loss  # reuse last known for checkpoint metadata
                 valid_metrics = {}
                 valid_prior_metrics = None
 
@@ -195,17 +195,17 @@ def single_worker(config, config_filename='config.txt'):
                         f"TrainOpt: {train_loss:.2e} LR: {current_lr:.2e}"
                     )
 
-            if do_val and valid_loss < best_valid_loss:
-                best_valid_loss = valid_loss
-                best_epoch = epoch
-                save_checkpoint(
-                    epoch, model, ema_model, optimizer, scheduler,
-                    train_loss, valid_loss, config, train_dataset, modelname,
-                    use_vae=use_vae,
-                    valid_prior_loss=valid_prior_loss if use_vae else None,
-                    vae_valid_prior_samples=vae_valid_prior_samples if use_vae else None,
-                )
-                print(f"  -> New best model saved at epoch {epoch} with valid loss {valid_loss:.2e}")
+            if do_val:
+                last_valid_loss = valid_loss
+            last_saved_epoch = epoch
+            save_checkpoint(
+                epoch, model, ema_model, optimizer, scheduler,
+                train_loss, valid_loss, config, train_dataset, modelname,
+                use_vae=use_vae,
+                valid_prior_loss=valid_prior_loss if use_vae else None,
+                vae_valid_prior_samples=vae_valid_prior_samples if use_vae else None,
+            )
+            print(f"  -> Model saved at epoch {epoch} with valid loss {valid_loss:.2e}")
 
             if log_file:
                 with open(log_file, 'a') as f:
@@ -253,9 +253,9 @@ def single_worker(config, config_filename='config.txt'):
                         )
                         print(f"  Train reconstruction loss: {train_viz_loss:.2e}")
 
-        print(f"\nTraining finished. Best model at epoch {best_epoch} with validation loss {best_valid_loss:.2e}")
+        print(f"\nTraining finished. Last model saved at epoch {last_saved_epoch} with validation loss {last_valid_loss:.2e}")
     except KeyboardInterrupt:
-        print(f"\nTraining interrupted by user. Best model at epoch {best_epoch} with validation loss {best_valid_loss:.2e}")
+        print(f"\nTraining interrupted by user. Last model saved at epoch {last_saved_epoch} with validation loss {last_valid_loss:.2e}")
 
     # Post-hoc step: only the 'gmm' mode trains anything after the main loop.
     # 'gnn_e2e' is fully joint — its prior was already trained inside train_epoch.
