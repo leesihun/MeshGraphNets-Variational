@@ -45,7 +45,13 @@ Both coarsening algorithms return:
 fine_to_coarse:    [N] cluster id for each fine node
 coarse_edge_index: [2, E_c] directed coarse graph edges
 num_coarse:        number of coarse nodes
+seeds:             [num_coarse] fine-node id chosen as the representative
+                   of each cluster (BFS even-depth ids; FPS-Voronoi seeds)
 ```
+
+The `seeds` array is only consumed downstream when a level runs in
+`voronoi_inherit` mode; in centroid and BFS modes it is returned for API
+uniformity and ignored.
 
 `build_multiscale_hierarchy` extends that base contract with data needed by the
 model and DataLoader, including:

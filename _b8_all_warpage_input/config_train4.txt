@@ -1,11 +1,11 @@
 model   MeshGraphNets-V
 mode    train
-gpu_ids 0,1
-log_file_dir    b8_all/train32_1.log
-modelpath       ./outputs/b8_all/warpage32_1.pth
+gpu_ids 6,7
+log_file_dir    b8_all/train32_4.log
+modelpath       ./outputs/b8_all/warpage32_4.pth
 
 % Datasets
-dataset_dir     ./dataset/b8_main_sec_dataset_train.h5
+dataset_dir     ./dataset/b8_main_sec_dataset_traincopy.h5
 infer_dataset   ./dataset/b8_main_sec_dataset_infer.h5
 infer_timesteps 1
 num_vae_samples 10000
@@ -22,7 +22,7 @@ message_passing_num  15
 Training_epochs      1000
 Batch_size           8
 LearningR            0.0001
-Latent_dim           128
+Latent_dim           256
 num_workers          4
 std_noise            0.01    # without noise the model ignores z and memorises x→y
 residual_scale       1
@@ -50,7 +50,7 @@ plot_feature_idx -1
 % Multiscale (2-level Voronoi V-cycle)
 use_multiscale      True
 coarsening_type     voronoi
-voronoi_clusters    2000, 500
+voronoi_clusters    5000, 1000
 multiscale_levels   2
 mp_per_level        4, 8, 12, 8, 4
 bipartite_unpool    True
@@ -58,7 +58,7 @@ bipartite_unpool    True
 % VAE (MMD-InfoVAE)
 use_vae          True
 vae_latent_dim   32
-alpha_recon      10
+alpha_recon      100
 lambda_mmd       0.1     # low: z encodes structured spread, not collapsed to N(0,I)
 vae_graph_aware  True    # z encodes only y-residual unexplained by x
 

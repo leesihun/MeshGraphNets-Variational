@@ -1,14 +1,15 @@
 model   MeshGraphNets-V
-mode    train
-gpu_ids 0,1
-log_file_dir    b8_all/train32_1.log
-modelpath       ./outputs/b8_all/warpage32_1.pth
+mode    inference
+gpu_ids 6
+log_file_dir         b8_all/infer32_4_sec.log
+modelpath            ./outputs/b8_all/warpage32_4.pth
+inference_output_dir outputs/b8_all/infer32_4_sec
 
 % Datasets
-dataset_dir     ./dataset/b8_main_sec_dataset_train.h5
-infer_dataset   ./dataset/b8_main_sec_dataset_infer.h5
+dataset_dir     ./dataset/b8_main_sec_dataset_traincopy.h5
+infer_dataset   ./dataset/infer_b8_secondary.h5
 infer_timesteps 1
-num_vae_samples 10000
+num_vae_samples 5000
 
 % Common params
 input_var            3
@@ -19,23 +20,18 @@ positional_features  4
 
 % Network parameters
 message_passing_num  15
-Training_epochs      1000
 Batch_size           8
 LearningR            0.0001
-Latent_dim           128
+Latent_dim           256
 num_workers          4
-std_noise            0.01    # without noise the model ignores z and memorises x→y
+std_noise            0.01
 residual_scale       1
-augment_geometry     True
-grad_accum_steps     1
 
 % Memory / performance
 use_checkpointing    True
 use_amp              True
 use_ema              True
 ema_decay            0.99
-test_interval        100
-val_interval         1
 
 % Node types
 use_node_types  False
@@ -50,7 +46,7 @@ plot_feature_idx -1
 % Multiscale (2-level Voronoi V-cycle)
 use_multiscale      True
 coarsening_type     voronoi
-voronoi_clusters    2000, 500
+voronoi_clusters    5000, 1000
 multiscale_levels   2
 mp_per_level        4, 8, 12, 8, 4
 bipartite_unpool    True
@@ -58,9 +54,9 @@ bipartite_unpool    True
 % VAE (MMD-InfoVAE)
 use_vae          True
 vae_latent_dim   32
-alpha_recon      10
-lambda_mmd       0.1     # low: z encodes structured spread, not collapsed to N(0,I)
-vae_graph_aware  True    # z encodes only y-residual unexplained by x
+alpha_recon      100
+lambda_mmd       0.1
+vae_graph_aware  True
 
 % Prior — gnn_e2e: joint training, graph-conditional
 prior_type               gnn_e2e
