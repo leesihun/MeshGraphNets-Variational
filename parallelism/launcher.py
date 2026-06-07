@@ -291,7 +291,7 @@ def _forward_step(stage: ModelSplitStage, graph, device, config,
 
     lambda_mmd = float(config.get('lambda_mmd', 1.0))
     lambda_kl  = float(config.get('lambda_kl', 0.0))
-    beta_aux   = float(config.get('beta_aux', 1.0))
+    beta_aux   = float(config.get('beta_aux', 0.0))
 
     # ---------- First stage ----------
     if is_first:
