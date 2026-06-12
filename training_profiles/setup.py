@@ -217,10 +217,14 @@ def build_model_config(config) -> dict:
         # with the same architecture.
         'prior_type':              config.get('prior_type', ''),
         'use_conditional_prior':   config.get('use_conditional_prior', False),
-        'prior_mixture_components': config.get('prior_mixture_components', 10),
+        # Defaults below MUST match build_prior_config (model/conditional_prior.py),
+        # which is what actually sizes the prior at construction. A mismatch makes
+        # the saved model_config rebuild a differently-shaped prior at inference
+        # and load_state_dict fails.
+        'prior_mixture_components': config.get('prior_mixture_components', 50),
         'prior_hidden_dim':         config.get('prior_hidden_dim', config.get('latent_dim')),
-        'prior_mp_layers':          config.get('prior_mp_layers', 3),
-        'prior_min_std':            config.get('prior_min_std', 0.05),
+        'prior_mp_layers':          config.get('prior_mp_layers', 10),
+        'prior_min_std':            config.get('prior_min_std', 0.1),
         # alpha_prior (single-sample prior reconstruction) is variance-collapsing
         # for spread modeling — default 0. The prior is trained by density
         # matching instead (mc_nll + small analytical-KL anchor).
