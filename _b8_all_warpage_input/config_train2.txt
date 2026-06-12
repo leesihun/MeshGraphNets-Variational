@@ -49,7 +49,7 @@ plot_feature_idx -1
 
 % Multiscale (2-level Voronoi V-cycle)
 use_multiscale      True
-coarsening_type     voronoi
+coarsening_type     voronoi_seedmean
 voronoi_clusters    2000, 500
 multiscale_levels   2
 mp_per_level        4, 8, 12, 8, 4

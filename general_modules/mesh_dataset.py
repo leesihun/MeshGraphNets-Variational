@@ -697,8 +697,9 @@ class MeshGraphDataset(Dataset):
 
         # Determine number of workers
         if use_parallel and num_samples >= min_samples_for_parallel:
-            # Use 80% of available cores, minimum 1, maximum 8
-            num_workers = max(1, min(64, int(mp.cpu_count() * 0.45)))
+            # Cap at 8: spawn-context pool workers each re-import torch, so a
+            # large pool risks OOM-killed workers and a permanent starmap hang.
+            num_workers = max(1, min(8, int(mp.cpu_count() * 0.45)))
         else:
             num_workers = 1
 
