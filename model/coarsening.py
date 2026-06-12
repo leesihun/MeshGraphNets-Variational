@@ -336,7 +336,7 @@ def fps_voronoi_coarsen(
 # ---------------------------------------------------------------------------
 
 _ACCEPTED_COARSEN_METHODS = (
-    'bfs', 'voronoi', 'voronoi_centroid', 'voronoi_inherit',
+    'bfs', 'voronoi', 'voronoi_centroid', 'voronoi_inherit', 'voronoi_seedmean',
 )
 
 
@@ -353,11 +353,11 @@ def coarsen_graph(
     Args:
         edge_index_np: [2, E] int numpy array — bidirectional mesh edges.
         num_nodes:     N — total number of fine nodes.
-        method:        'bfs', 'voronoi', 'voronoi_centroid', or 'voronoi_inherit'.
-                       'voronoi' is a back-compat alias for 'voronoi_centroid'.
-                       All voronoi spellings dispatch to the same coarsener; the
-                       suffix only affects how the result is used downstream
-                       (centroid pool vs. seed-inherit pool).
+        method:        'bfs', 'voronoi', 'voronoi_centroid', 'voronoi_inherit', or
+                       'voronoi_seedmean'.  'voronoi' is a back-compat alias for
+                       'voronoi_centroid'.  All voronoi spellings dispatch to the same
+                       coarsener; the suffix only affects downstream usage:
+                       centroid pool, seed-gather pool, or seed-anchor + scatter-mean pool.
         num_clusters:  Required for voronoi — number of coarse nodes.
         ref_pos:       [N, 3] positions — optional, used by voronoi for Euclidean FPS.
 
@@ -370,7 +370,7 @@ def coarsen_graph(
     method = method.strip().lower()
     if method == 'bfs':
         return bfs_bistride_coarsen(edge_index_np, num_nodes)
-    elif method in ('voronoi', 'voronoi_centroid', 'voronoi_inherit'):
+    elif method in ('voronoi', 'voronoi_centroid', 'voronoi_inherit', 'voronoi_seedmean'):
         if num_clusters is None:
             raise ValueError(f"num_clusters is required for '{method}' coarsening")
         return fps_voronoi_coarsen(edge_index_np, num_nodes, num_clusters, ref_pos)

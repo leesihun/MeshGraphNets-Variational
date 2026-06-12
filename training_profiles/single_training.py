@@ -18,6 +18,7 @@ from training_profiles.setup import (
     save_checkpoint,
 )
 from training_profiles.training_loop import (
+    evaluate_vae_learned_prior_epoch,
     evaluate_vae_posterior_epoch,
     evaluate_vae_prior_epoch,
     log_training_config,
@@ -151,14 +152,23 @@ def single_worker(config, config_filename='config.txt'):
                         num_prior_samples=vae_valid_prior_samples,
                         progress_name=f'ValidPrior@{vae_valid_prior_samples}'
                     )
+                    # Inference-mirroring eval: z from the learned p(z|graph),
+                    # plus the prior-vs-posterior spread diagnostic.
+                    # None when the model has no learned prior.
+                    valid_learned_prior_metrics = evaluate_vae_learned_prior_epoch(
+                        eval_model, val_loader, device, config, epoch,
+                        progress_name='ValidLearnedPrior'
+                    )
                 else:
                     valid_metrics      = validate_epoch(eval_model, val_loader, device, config, epoch)
                     valid_prior_metrics = None
+                    valid_learned_prior_metrics = None
                 valid_loss = valid_metrics['mean']
             else:
                 valid_loss = last_valid_loss  # reuse last known for checkpoint metadata
                 valid_metrics = {}
                 valid_prior_metrics = None
+                valid_learned_prior_metrics = None
 
             if use_vae:
                 train_mmd   = train_metrics.get('mmd_mean', 0.0)
@@ -169,11 +179,21 @@ def single_worker(config, config_filename='config.txt'):
                     valid_total = valid_metrics.get('total_mean', valid_loss)
                     valid_prior_loss = valid_prior_metrics['mean']
                     prior_gap = valid_prior_loss - valid_loss
+                    learned_prior_str = ''
+                    if valid_learned_prior_metrics is not None:
+                        learned_prior_str = (
+                            f" | ValidLearnedPrior recon={valid_learned_prior_metrics['mean']:.2e}"
+                        )
+                        if 'spread_ratio' in valid_learned_prior_metrics:
+                            learned_prior_str += (
+                                f" spread_ratio={valid_learned_prior_metrics['spread_ratio']}"
+                            )
                     print(
                         f"Epoch {epoch}/{total_epochs} LR: {current_lr:.2e} | "
                         f"TrainOpt  recon={train_loss:.2e} mmd={train_mmd:.2e} aux={train_aux:.2e} total={train_total:.2e} | "
                         f"ValidQ    recon={valid_loss:.2e} mmd={valid_mmd:.2e} total={valid_total:.2e} | "
                         f"ValidPrior@{vae_valid_prior_samples} recon={valid_prior_loss:.2e} gap={prior_gap:.2e}"
+                        f"{learned_prior_str}"
                     )
                 else:
                     valid_prior_loss = None
@@ -217,6 +237,14 @@ def single_worker(config, config_filename='config.txt'):
                             f"ValidPrior@{vae_valid_prior_samples} recon={valid_prior_loss:.4e} "
                             f"gap={prior_gap:.4e}"
                         ) if do_val else "ValidQ skipped"
+                        if do_val and valid_learned_prior_metrics is not None:
+                            val_str += (
+                                f" | ValidLearnedPrior recon={valid_learned_prior_metrics['mean']:.4e}"
+                            )
+                            if 'spread_ratio' in valid_learned_prior_metrics:
+                                val_str += (
+                                    f" spread_ratio={valid_learned_prior_metrics['spread_ratio']}"
+                                )
                         f.write(
                             f"Elapsed: {elapsed:.2f}s Epoch {epoch} LR: {current_lr:.4e} | "
                             f"TrainOpt recon={train_loss:.4e} mmd={train_metrics.get('mmd_mean',0):.4e} "

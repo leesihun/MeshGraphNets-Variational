@@ -27,10 +27,29 @@ from model.coarsening import (
 def _coarsening_mode(method: str) -> str:
     """Map a coarsening method string to its per-level usage mode.
 
-    'voronoi_inherit' → 'inherit'; every other accepted method → 'centroid'.
-    The mode controls how coarse positions / pool / coarse_seed_idx are produced.
+    'voronoi_inherit'  → 'inherit'
+    'voronoi_seedmean' → 'seedmean'
+    everything else    → 'centroid'
+
+    The mode controls how coarse positions, pool op, and coarse_seed_idx are produced.
     """
-    return 'inherit' if method.strip().lower() == 'voronoi_inherit' else 'centroid'
+    m = method.strip().lower()
+    if m == 'voronoi_inherit':
+        return 'inherit'
+    if m == 'voronoi_seedmean':
+        return 'seedmean'
+    return 'centroid'
+
+
+def _uses_seed_anchor(mode: str) -> bool:
+    """Return True for modes that use FPS seed positions as coarse anchors.
+
+    Both 'inherit' and 'seedmean' anchor coarse positions to real fine-mesh seed
+    nodes (keeping coarse geometry on-manifold).  Only 'inherit' also writes
+    coarse_seed_idx_{i} and switches the pool step to a gather; 'seedmean' keeps
+    scatter-mean pool and does not write that attribute.
+    """
+    return mode in ('inherit', 'seedmean')
 
 
 def build_multiscale_hierarchy(
@@ -54,7 +73,7 @@ def build_multiscale_hierarchy(
         'n_c':    int            number of coarse nodes
         'seeds':  [n_c]          fine-node id chosen as cluster representative
                                  (BFS even-depth ids; FPS-Voronoi seeds)
-        'mode':   'inherit' | 'centroid'  per-level pool/position mode
+        'mode':   'inherit' | 'centroid' | 'seedmean'  per-level pool/position mode
         'up_ei':  [2, E_up]      bipartite unpool edges (only if bipartite_unpool)
     """
     hierarchy: List[dict] = []
@@ -77,8 +96,9 @@ def build_multiscale_hierarchy(
         if n_c <= 1 or c_ei.shape[1] == 0:
             break
 
-        if mode == 'inherit':
-            # Coarse node "is" the seed: positions are gathered, not averaged.
+        if _uses_seed_anchor(mode):
+            # Coarse anchor is the FPS seed node (on-manifold position).
+            # inherit: gather pool (writes coarse_seed_idx); seedmean: scatter-mean pool.
             level_ref_pos = level_ref_pos[seeds].astype(np.float32)
         else:
             level_ref_pos = compute_coarse_centroids(level_ref_pos, ftc, n_c).astype(np.float32)
@@ -139,7 +159,7 @@ def attach_coarse_levels_to_graph(
         mode = entry.get('mode', 'centroid')
         seeds = entry.get('seeds')
 
-        if mode == 'inherit':
+        if _uses_seed_anchor(mode):
             coarse_ref = cur_ref[seeds]
             coarse_def = cur_def[seeds]
         else:

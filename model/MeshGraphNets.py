@@ -51,7 +51,7 @@ class MeshGraphNets(nn.Module):
 
     def forward(self, graph, debug=False, add_noise=None, use_posterior=None,
                 fixed_z=None, use_zero_z=False, compute_prior_path=False,
-                gumbel_temp=1.0):
+                compute_prior_recon=False, gumbel_temp=1.0):
         """
         Forward pass of the simulator.
 
@@ -65,8 +65,15 @@ class MeshGraphNets(nn.Module):
             loss (forces the graph-only pathway to predict y on its own).
 
         compute_prior_path: when True and a GNN conditional prior exists,
-            additionally runs (prior → reparam sample → second simulator forward
-            with z_prior). Returns prior outputs in the 5th tuple element.
+            runs the prior network on the graph and returns its mixture
+            parameters in the 5th tuple element. Density-matching prior losses
+            (mixture NLL / analytical KL) only need these parameters.
+
+        compute_prior_recon: when True (and compute_prior_path is True),
+            additionally draws a reparameterized z from the prior and runs a
+            second simulator forward with it. Only needed for the legacy
+            alpha_prior reconstruction term — that objective is variance-
+            collapsing for spread modeling and is off by default.
 
         Returns:
             predicted:     [N, output_var] posterior-path prediction
@@ -74,9 +81,11 @@ class MeshGraphNets(nn.Module):
             vae_losses:    dict from the posterior-path VAE encoder
             aux_loss:      scalar aux loss (0 if not training)
             prior_outputs: None, or dict with keys:
-                'predicted_prior': [N, output_var] prior-path prediction
                 'prior_params':    {'logits', 'mu', 'log_std'}
+                'predicted_prior': [N, output_var] prior-path prediction
+                                   (only when compute_prior_recon)
                 'z_prior':         [B, num_z, vae_latent_dim] sampled latent
+                                   (only when compute_prior_recon)
         """
         if add_noise is None:
             add_noise = self.training
@@ -108,15 +117,14 @@ class MeshGraphNets(nn.Module):
             # latents — graph.x is unchanged across both forwards because the
             # simulator's encoder builds a fresh Data inside (does not mutate input).
             prior_params = self.prior(graph)
-            z_prior = sample_from_mixture_reparam(prior_params, temperature=gumbel_temp)
-            predicted_prior, _, _ = self.model(
-                graph, debug=False, use_posterior=False, fixed_z=z_prior, use_zero_z=False,
-            )
-            prior_outputs = {
-                'predicted_prior': predicted_prior,
-                'prior_params':    prior_params,
-                'z_prior':         z_prior,
-            }
+            prior_outputs = {'prior_params': prior_params}
+            if compute_prior_recon:
+                z_prior = sample_from_mixture_reparam(prior_params, temperature=gumbel_temp)
+                predicted_prior, _, _ = self.model(
+                    graph, debug=False, use_posterior=False, fixed_z=z_prior, use_zero_z=False,
+                )
+                prior_outputs['predicted_prior'] = predicted_prior
+                prior_outputs['z_prior'] = z_prior
 
         return predicted, graph.y, vae_losses, aux_loss, prior_outputs
 

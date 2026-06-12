@@ -357,10 +357,10 @@ class MeshGraphDataset(Dataset):
         self._static_cache: Dict = {}  # per-worker topology and positional features
 
         # Per-level coarsening method.
-        # Accepted: 'bfs', 'voronoi', 'voronoi_centroid', 'voronoi_inherit'.
+        # Accepted: 'bfs', 'voronoi', 'voronoi_centroid', 'voronoi_inherit', 'voronoi_seedmean'.
         # 'voronoi' is normalised to 'voronoi_centroid' so downstream code sees
         # only canonical values.
-        _accepted_methods = ('bfs', 'voronoi_centroid', 'voronoi_inherit')
+        _accepted_methods = ('bfs', 'voronoi_centroid', 'voronoi_inherit', 'voronoi_seedmean')
         raw_ct = config.get('coarsening_type', 'bfs')
         if isinstance(raw_ct, list):
             self.coarsening_types = [str(t).strip().lower() for t in raw_ct]
@@ -374,7 +374,7 @@ class MeshGraphDataset(Dataset):
                 raise ValueError(
                     f"Unknown coarsening method '{t}' in coarsening_type. "
                     f"Accepted: 'bfs', 'voronoi' (alias for 'voronoi_centroid'), "
-                    f"'voronoi_centroid', 'voronoi_inherit'."
+                    f"'voronoi_centroid', 'voronoi_inherit', 'voronoi_seedmean'."
                 )
         # Expand single value to all levels
         if len(self.coarsening_types) == 1 and self.multiscale_levels > 1:

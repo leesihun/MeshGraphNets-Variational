@@ -25,6 +25,7 @@ from training_profiles.setup import (
     save_checkpoint,
 )
 from training_profiles.training_loop import (
+    evaluate_vae_learned_prior_epoch,
     evaluate_vae_posterior_epoch,
     evaluate_vae_prior_epoch,
     log_training_config,
@@ -306,10 +307,18 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
                     num_prior_samples=vae_valid_prior_samples,
                     progress_name=f'ValidPrior@{vae_valid_prior_samples}'
                 )
+                # Inference-mirroring eval: z from the learned p(z|graph),
+                # plus the prior-vs-posterior spread diagnostic.
+                # None when the model has no learned prior.
+                valid_learned_prior_metrics = evaluate_vae_learned_prior_epoch(
+                    eval_model, val_loader, device, config, epoch,
+                    progress_name='ValidLearnedPrior'
+                )
             else:
                 train_eval_metrics = validate_epoch(model, train_eval_loader, device, config, epoch)
                 valid_metrics = validate_epoch(eval_model, val_loader, device, config, epoch)
                 valid_prior_metrics = None
+                valid_learned_prior_metrics = None
             train_eval_loss = train_eval_metrics['mean']
             valid_loss = valid_metrics['mean']
         else:
@@ -341,12 +350,22 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
                 train_eval_total = train_eval_metrics.get('total_mean', train_eval_loss)
                 valid_prior_loss = valid_prior_metrics['mean']
                 prior_gap = valid_prior_loss - valid_loss
+                learned_prior_str = ''
+                if valid_learned_prior_metrics is not None:
+                    learned_prior_str = (
+                        f" | ValidLearnedPrior recon={valid_learned_prior_metrics['mean']:.2e}"
+                    )
+                    if 'spread_ratio' in valid_learned_prior_metrics:
+                        learned_prior_str += (
+                            f" spread_ratio={valid_learned_prior_metrics['spread_ratio']}"
+                        )
                 print(
                     f"Epoch {epoch}/{config['training_epochs']} LR: {current_lr:.2e} | "
                     f"TrainOpt  recon={train_loss:.2e} mmd={train_metrics.get('mmd_mean', 0.0):.2e} total={train_metrics.get('total_mean', train_loss):.2e} | "
                     f"TrainEvalQ recon={train_eval_loss:.2e} mmd={train_eval_mmd:.2e} total={train_eval_total:.2e} | "
                     f"ValidQ    recon={valid_loss:.2e} mmd={valid_metrics.get('mmd_mean', 0.0):.2e} total={valid_metrics.get('total_mean', valid_loss):.2e} | "
                     f"ValidPrior@{vae_valid_prior_samples} recon={valid_prior_loss:.2e} gap={prior_gap:.2e}"
+                    f"{learned_prior_str}"
                 )
             else:
                 print(
@@ -379,7 +398,8 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
                         f"TrainOpt recon={train_loss:.4e} mmd={train_metrics.get('mmd_mean', 0.0):.4e} total={train_metrics.get('total_mean', train_loss):.4e} | "
                         f"TrainEvalQ recon={train_eval_loss:.4e} mmd={train_eval_metrics.get('mmd_mean', 0.0):.4e} total={train_eval_metrics.get('total_mean', train_eval_loss):.4e} | "
                         f"ValidQ recon={valid_loss:.4e} mmd={valid_metrics.get('mmd_mean', 0.0):.4e} total={valid_metrics.get('total_mean', valid_loss):.4e} | "
-                        f"ValidPrior@{vae_valid_prior_samples} recon={valid_prior_loss:.4e} gap={prior_gap:.4e}\n"
+                        f"ValidPrior@{vae_valid_prior_samples} recon={valid_prior_loss:.4e} gap={prior_gap:.4e}"
+                        f"{learned_prior_str}\n"
                     )
                 else:
                     f.write(

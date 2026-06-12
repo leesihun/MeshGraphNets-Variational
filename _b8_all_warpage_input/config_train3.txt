@@ -62,11 +62,14 @@ alpha_recon      100
 lambda_mmd       0.1     # low: z encodes structured spread, not collapsed to N(0,I)
 vae_graph_aware  True    # z encodes only y-residual unexplained by x
 
-% Prior — gnn_e2e: joint training, graph-conditional
+% Prior — gnn_e2e: joint training, graph-conditional.
+% Density matching only: the alpha_prior recon term is variance-collapsing
+% (it shrinks generated spread toward a point) and must stay 0.
 prior_type               gnn_e2e
-alpha_prior_max          1.0
-alpha_prior_warmup_frac  0.2
-prior_kl_reg_weight      0.02
+alpha_prior_max          0.0     # MUST be 0 for spread modeling
+prior_loss_type          mc_nll  # mixture NLL on fresh posterior samples
+prior_nll_weight         1.0
+prior_kl_reg_weight      0.05    # small analytical-KL stability anchor
 prior_gumbel_temp        1.0
 prior_mixture_components 30
 prior_mp_layers          5

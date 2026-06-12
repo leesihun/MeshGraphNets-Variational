@@ -30,6 +30,13 @@ Implications for VAE design:
 - **use_conditional_prior True** (with `train_with_prior` or `train_prior`) is
   the correct architectural fix for type-to-type generalization: the prior
   `p(z|graph)` maps each part type to its spread distribution at inference time.
+- **alpha_prior_max must be 0.0.** Training the gnn_e2e prior by single-sample
+  reconstruction (`alpha_prior * recon_prior`) is variance-collapsing: the prior
+  cannot know which paired target it will be graded against, so its optimum is a
+  point mass — the same failure mode as `lambda_det`, routed through the prior.
+  The prior is trained by density matching instead: `prior_loss_type mc_nll`
+  (mixture NLL on a fresh detached posterior sample each step) plus a small
+  `prior_kl_reg_weight` analytical-KL anchor.
 
 ## Run Commands
 
@@ -88,12 +95,15 @@ is set. `parallel_mode model_split` routes to `parallelism.launcher`.
   aggregates mesh and world messages separately.
 - Multiscale V-cycle has no global gated encoder skip in the live code. It uses
   per-level skip states merged by `Linear(2 * latent_dim, latent_dim)`.
-- `coarsening_type` accepts `bfs`, `voronoi_centroid`, and `voronoi_inherit` as
-  canonical per-level values. `voronoi` is a back-compat alias for
-  `voronoi_centroid`. Inherit mode pools by gathering the FPS seed feature
-  (coarse node *is* the seed); centroid mode pools by scatter mean. Mixing
-  modes per level is supported. Stats are mode-specific, so a checkpoint
-  trained in one mode cannot be loaded into the other.
+- `coarsening_type` accepts `bfs`, `voronoi_centroid`, `voronoi_inherit`, and
+  `voronoi_seedmean` as canonical per-level values. `voronoi` is a back-compat
+  alias for `voronoi_centroid`. Inherit mode pools by gathering the FPS seed
+  feature (coarse node *is* the seed); centroid mode pools by scatter mean;
+  seedmean uses FPS seed positions as coarse anchors (on-manifold geometry) but
+  scatter-mean pool — it does **not** write `coarse_seed_idx_{i}` and uses the
+  existing centroid pool path in the model. Mixing modes per level is supported.
+  Stats are mode-specific, so a checkpoint trained in one mode cannot be loaded
+  into the other.
 
 ## Data Facts
 
@@ -122,6 +132,17 @@ For manufacturing spread modeling the recommended training loss weights are:
 | `lambda_det` | 0.0 | Must be zero: det auxiliary loss conflicts with spread objective |
 | `vae_latent_dim` | 32 | Full capacity needed to represent spread across part types |
 | `vae_graph_aware` | True | Enables type-conditional spread encoding |
+| `alpha_prior_max` | 0.0 | Must be zero: single-sample prior recon collapses prior variance |
+| `prior_loss_type` | `mc_nll` | Fits the mixture prior to fresh posterior samples (density matching) |
+| `prior_nll_weight` | 1.0 | Weight of the mixture-NLL prior objective |
+| `prior_kl_reg_weight` | 0.05 | Small analytical-KL stability anchor for the prior |
+
+Validation prints a per-slot `[PriorDiag]` line (posterior cloud std vs prior
+std). A `spread_ratio` near 1 is healthy; near 0 means the prior collapsed and
+generated samples will have far too little spread. The `ValidLearnedPrior`
+metric mirrors inference (z sampled from the learned `p(z|graph)`); the older
+`ValidPrior@K` metric samples z from N(0,I) and is NOT representative when a
+learned prior exists.
 
 Post-training priors:
 

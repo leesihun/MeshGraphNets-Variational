@@ -90,7 +90,7 @@ ref_dx, ref_dy, ref_dz, ref_dist
 | `fine_mp_pre` | model | Fallback pre-block count when `mp_per_level` is absent. |
 | `coarse_mp_num` | model | Fallback coarsest block count when `mp_per_level` is absent. |
 | `fine_mp_post` | model | Fallback post-block count when `mp_per_level` is absent. |
-| `coarsening_type` | data | `bfs`, `voronoi`, or a comma list per level. |
+| `coarsening_type` | data | `bfs`, `voronoi`, `voronoi_centroid`, `voronoi_inherit`, `voronoi_seedmean`, or a comma list per level. |
 | `voronoi_clusters` | data | Required for Voronoi levels; scalar or comma list. |
 | `bipartite_unpool` | data, model | `True` uses learned coarse-to-fine bipartite message passing; `False` broadcasts by cluster id. |
 | `coarse_cache_per_worker` | data | Per-worker LRU cache size for hierarchy data. |

@@ -17,7 +17,7 @@ more coarsened graph levels.
 | --- | --- |
 | `use_multiscale` | Enables multiscale graph data and the V-cycle processor. |
 | `multiscale_levels` | Number of coarse levels. |
-| `coarsening_type` | `bfs`, `voronoi`, `voronoi_centroid`, `voronoi_inherit`, or a comma list with one method per level. |
+| `coarsening_type` | `bfs`, `voronoi`, `voronoi_centroid`, `voronoi_inherit`, `voronoi_seedmean`, or a comma list with one method per level. |
 | `voronoi_clusters` | Cluster count for Voronoi levels; scalar or comma list. |
 | `mp_per_level` | Processor block counts. Must have `2 * multiscale_levels + 1` entries. |
 | `bipartite_unpool` | Enables learned coarse-to-fine unpooling. |
@@ -104,6 +104,7 @@ example the `_b8_all_warpage_input` configs with `voronoi_clusters 200`.
 | `voronoi` | Back-compat alias for `voronoi_centroid`. |
 | `voronoi_centroid` | FPS-Voronoi. Coarse position = cluster centroid; pool = scatter mean over members. Default voronoi behavior. |
 | `voronoi_inherit` | FPS-Voronoi. Coarse node *is* the FPS seed: coarse position = seed position (a real mesh node), pool degenerates to a gather `x[seeds]`. Coarse edges are still the boundary edges between Voronoi cells. |
+| `voronoi_seedmean` | FPS-Voronoi. Coarse position = FPS seed position (real mesh node, on-manifold); pool = scatter mean over cluster members. Combines seed-anchored geometry with full-weighting pool. Does **not** write `coarse_seed_idx_{i}`; uses the existing centroid (scatter-mean) pool path in the model. |
 
 Mixing modes per level is supported. For example,
 `coarsening_type voronoi_centroid, voronoi_inherit` (with `multiscale_levels 2`)
@@ -111,10 +112,12 @@ uses centroid coarsening at level 0 and seed-inherit coarsening at level 1.
 
 Inherit mode adds an optional graph attribute `coarse_seed_idx_{i}` for each
 level that uses it; the model branches its pool step on the presence of this
-attribute. Levels not in inherit mode do not set the attribute and use the
-existing centroid path. Inherit-mode coarse edge stats differ from
-centroid-mode stats — a checkpoint trained in one mode cannot be reused in the
-other.
+attribute.  `voronoi_seedmean` uses seed-anchored positions but does **not** write
+`coarse_seed_idx_{i}`, so the model takes the existing scatter-mean pool path.
+Levels not in inherit or seedmean mode do not set the attribute and use the
+centroid path.  Coarse edge stats differ between seed-anchored modes
+(inherit/seedmean) and centroid mode — a checkpoint trained in one cannot be
+reused in the other.
 
 ## Iterative Hierarchy
 

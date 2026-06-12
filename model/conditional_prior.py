@@ -246,6 +246,6 @@ def build_prior_config(config):
         'prior_hidden_dim': config.get('prior_hidden_dim', config.get('latent_dim')),
         'prior_mp_layers': config.get('prior_mp_layers', 10),
         'prior_min_std': config.get('prior_min_std', 0.1),
-        'prior_loss_type': config.get('prior_loss_type', 'analytical_kl'),
+        'prior_loss_type': config.get('prior_loss_type', 'mc_nll'),
         'residual_scale': config.get('residual_scale', 1.0),
     }
