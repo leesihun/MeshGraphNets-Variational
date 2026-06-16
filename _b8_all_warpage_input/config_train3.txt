@@ -1,11 +1,18 @@
+% ============================================================
+% SWEEP cell: posterior_min_std=0.30, alpha_recon=25
+% Fix for narrow generated spread. Baseline = config_train2.txt
+% (posterior_min_std=0 -> sigma_q collapse -> narrow prior).
+% Only posterior_min_std and alpha_recon differ from baseline.
+% Single GPU per run; 8 cells fill GPUs 0-7 and run concurrently.
+% ============================================================
 model   MeshGraphNets-V
 mode    train
-gpu_ids 4,5
-log_file_dir    b8_all/train32_3.log
-modelpath       ./outputs/b8_all/warpage32_3.pth
+gpu_ids 2
+log_file_dir    b8_all/train3_p030_a025.log
+modelpath       ./outputs/b8_all/warpage_train3_p030_a025.pth
 
 % Datasets
-dataset_dir     ./dataset/b8_main_sec_dataset_train.h5
+dataset_dir     ./dataset/b8_main_sec_dataset_traincopy.h5
 infer_dataset   ./dataset/b8_main_sec_dataset_infer.h5
 infer_timesteps 1
 num_vae_samples 10000
@@ -20,11 +27,11 @@ positional_features  4
 % Network parameters
 message_passing_num  15
 Training_epochs      1000
-Batch_size           4
+Batch_size           8
 LearningR            0.0001
-Latent_dim           256
+Latent_dim           128
 num_workers          4
-std_noise            0.01    # without noise the model ignores z and memorises x→y
+std_noise            0.01    # without noise the model ignores z and memorises x->y
 residual_scale       1
 augment_geometry     True
 grad_accum_steps     1
@@ -58,14 +65,17 @@ bipartite_unpool    True
 % VAE (MMD-InfoVAE)
 use_vae          True
 vae_latent_dim   32
-alpha_recon      100
-lambda_mmd       0.1     # low: z encodes structured spread, not collapsed to N(0,I)
-vae_graph_aware  True    # z encodes only y-residual unexplained by x
+alpha_recon      25     # SWEPT (baseline 100); lower = less pressure to memorise
+lambda_mmd       0.1    # low: z encodes structured spread, not collapsed to N(0,I)
+vae_graph_aware  True   # z encodes only y-residual unexplained by x
+beta_aux         1.0    # anchors z to per-graph [y_mean, y_std]; teaches z to encode spread
+posterior_min_std 0.30  # SWEPT (baseline 0): hard floor on sigma_q -> posterior is a real cloud
 
-% Prior — gnn_e2e: joint training, graph-conditional.
+% Prior - gnn_e2e: joint training, graph-conditional.
 % Density matching only: the alpha_prior recon term is variance-collapsing
 % (it shrinks generated spread toward a point) and must stay 0.
 prior_type               gnn_e2e
+use_conditional_prior    True    # CRITICAL: persist True so rollout uses the learned prior (setup default False)
 alpha_prior_max          0.0     # MUST be 0 for spread modeling
 prior_loss_type          mc_nll  # mixture NLL on fresh posterior samples
 prior_nll_weight         1.0

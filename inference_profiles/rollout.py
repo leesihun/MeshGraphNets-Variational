@@ -23,6 +23,119 @@ except ImportError:
     HAS_COARSENING = False
 
 
+# ---------------------------------------------------------------------------
+# z_disp spread-histogram (generated vs ground-truth eval dataset)
+#
+# Spread metric (one scalar per realization):
+#     spread = max(z_disp_at_nodes) - min(z_disp_at_nodes)   at the final timestep.
+#
+# nodal_data layout is [x, y, z, x_disp, y_disp, z_disp, ...], so the z_disp
+# channel is index 5 for both the ground-truth eval datasets and the rollout
+# output (whose layout is [x, y, z, <output channels>, part_number]). This keeps
+# the inline plot identical to the standalone compare_histograms.py script.
+# ---------------------------------------------------------------------------
+Z_DISP_CHANNEL = 5
+
+
+def _spread_max_minus_min(field_1d):
+    """max - min of a 1-D node field (the spread of a single realization)."""
+    v = np.asarray(field_1d, dtype=np.float64)
+    if v.size == 0:
+        return float('nan')
+    return float(v.max() - v.min())
+
+
+def _eval_dataset_spreads(h5_path, channel=Z_DISP_CHANNEL):
+    """One ground-truth spread value per sample in the eval HDF5."""
+    spreads = []
+    with h5py.File(h5_path, 'r') as f:
+        if 'data' not in f:
+            raise RuntimeError(f"No /data group in {h5_path}")
+        for sample_id in f['data'].keys():
+            spreads.append(
+                _spread_max_minus_min(f[f'data/{sample_id}/nodal_data'][channel, -1, :])
+            )
+    return np.asarray(spreads, dtype=np.float64)
+
+
+def _open_in_viewer(path):
+    """Best-effort: open a saved image in the OS default viewer (for display)."""
+    import sys
+    try:
+        if sys.platform.startswith('win'):
+            os.startfile(path)  # type: ignore[attr-defined]
+        elif sys.platform == 'darwin':
+            import subprocess
+            subprocess.Popen(['open', path])
+        else:
+            import subprocess
+            subprocess.Popen(['xdg-open', path])
+        return True
+    except Exception as exc:  # headless box / no viewer — never fatal
+        print(f"  (could not open image viewer: {exc})")
+        return False
+
+
+def _plot_spread_histogram(gt, gen, out_path, eval_path=None, rollout_dir=None,
+                           bins=60, clip_quantile=0.0, show=False, dpi=150):
+    """Overlay GT vs generated spread histograms; save PNG, optionally display.
+
+    Renders headlessly (Agg) so it works on a display-less box; when show=True
+    the saved PNG is additionally opened in the OS default viewer.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    gt = np.asarray(gt, dtype=np.float64)
+    gen = np.asarray(gen, dtype=np.float64)
+
+    if clip_quantile > 0:
+        q = clip_quantile
+        lo = float(min(np.quantile(gt, q), np.quantile(gen, q)))
+        hi = float(max(np.quantile(gt, 1 - q), np.quantile(gen, 1 - q)))
+    else:
+        lo = float(min(gt.min(), gen.min()))
+        hi = float(max(gt.max(), gen.max()))
+    if not np.isfinite(lo) or not np.isfinite(hi) or lo == hi:
+        hi = lo + 1e-8
+    bin_edges = np.linspace(lo, hi, bins + 1)
+
+    def _stats(col):
+        return (float(col.mean()), float(col.std()), float(col.min()), float(col.max()))
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.hist(gt, bins=bin_edges, density=True, alpha=0.55,
+            label=f"eval dataset (n={gt.size:,})", color="steelblue")
+    ax.hist(gen, bins=bin_edges, density=True, alpha=0.55,
+            label=f"generated (n={gen.size:,})", color="darkorange")
+    g_mu, g_sd, g_lo, g_hi = _stats(gt)
+    p_mu, p_sd, p_lo, p_hi = _stats(gen)
+    ax.set_title(
+        "z_disp spread (max - min) per realization, final timestep\n"
+        f"GT  mu={g_mu:.3e}  sigma={g_sd:.3e}  [{g_lo:.3e}, {g_hi:.3e}]\n"
+        f"Gen mu={p_mu:.3e}  sigma={p_sd:.3e}  [{p_lo:.3e}, {p_hi:.3e}]"
+    )
+    ax.set_xlabel("max(z_disp) - min(z_disp)")
+    ax.set_ylabel("density")
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+    if eval_path is not None or rollout_dir is not None:
+        fig.suptitle(f"eval:     {eval_path}\nrollouts: {rollout_dir}", fontsize=9)
+        fig.tight_layout(rect=(0, 0, 1, 0.93))
+    else:
+        fig.tight_layout()
+
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+    print(f"  Saved histogram figure: {os.path.abspath(out_path)}")
+    if show:
+        _open_in_viewer(os.path.abspath(out_path))
+    return out_path
+
+
 def run_rollout(config, config_filename='config.txt'):
     """
     Perform autoregressive time-transient rollout inference.
@@ -186,6 +299,17 @@ def run_rollout(config, config_filename='config.txt'):
     prior_temperature = float(config.get('prior_temperature', 1.0))
 
     num_vae_samples = int(config.get('num_vae_samples', 1)) if use_vae else 1
+
+    # Inline z_disp spread-histogram (generated vs ground-truth eval dataset).
+    # Enabled when an `eval_dataset` is given in the config (no GT -> no compare).
+    output_dir = config.get('inference_output_dir', 'outputs/rollout')
+    eval_dataset = config.get('eval_dataset')
+    make_histogram = bool(config.get('make_histogram', use_vae and eval_dataset is not None))
+    histogram_bins = int(config.get('histogram_bins', 60))
+    histogram_clip_quantile = float(config.get('histogram_clip_quantile', 0.0))
+    show_histogram = bool(config.get('show_histogram', True))
+    z_gen_idx = Z_DISP_CHANNEL - 3  # z_disp is the 3rd output channel (index 2)
+    generated_spreads = []  # one spread scalar per generated rollout trajectory
 
     conditional_prior = None
     if use_vae and use_conditional_prior:
@@ -463,6 +587,13 @@ def run_rollout(config, config_filename='config.txt'):
             else:
                 print(f"\nRollout completed in {total_rollout_time:.2f}s (no steps executed)")
 
+            # Record this trajectory's z_disp spread for the histogram compare.
+            # Computed from the same field that gets written to the .h5 (channel 5).
+            if make_histogram and output_dim > z_gen_idx:
+                generated_spreads.append(
+                    _spread_max_minus_min(all_states[-1, :, z_gen_idx])
+                )
+
             # -------------------------------------------------------------------------
             # 6. Save results to HDF5 (DATASET_FORMAT.md structure)
             # -------------------------------------------------------------------------
@@ -576,5 +707,36 @@ def run_rollout(config, config_filename='config.txt'):
 
     total_outputs = len(sample_ids) * num_vae_samples
     print(f"\nRollout inference complete. Processed {len(sample_ids)} scene(s) × {num_vae_samples} VAE sample(s) = {total_outputs} output file(s).")
+
+    # -------------------------------------------------------------------------
+    # 7. z_disp spread histogram: generated rollouts vs ground-truth eval set
+    # -------------------------------------------------------------------------
+    if make_histogram:
+        print("\n" + "=" * 60)
+        print("HISTOGRAM COMPARE (z_disp spread, final timestep)")
+        print("=" * 60)
+        if not eval_dataset:
+            print("  Skipped: no `eval_dataset` set in config "
+                  "(needed for the ground-truth comparison).")
+        elif not os.path.exists(str(eval_dataset)):
+            print(f"  Skipped: eval_dataset not found: {eval_dataset}")
+        elif not generated_spreads:
+            print("  Skipped: no generated spread values were collected "
+                  f"(output_var={output_dim} has no z_disp channel).")
+        else:
+            try:
+                gt = _eval_dataset_spreads(str(eval_dataset))
+                gen = np.asarray(generated_spreads, dtype=np.float64)
+                print(f"  GT spread values  (1 per eval sample): {gt.size:,}")
+                print(f"  Gen spread values (1 per rollout):     {gen.size:,}")
+                hist_path = os.path.join(output_dir, 'histogram_compare.png')
+                _plot_spread_histogram(
+                    gt, gen, hist_path,
+                    eval_path=str(eval_dataset), rollout_dir=output_dir,
+                    bins=histogram_bins, clip_quantile=histogram_clip_quantile,
+                    show=show_histogram,
+                )
+            except Exception as exc:  # never let plotting break a finished rollout
+                print(f"  Histogram generation failed: {exc}")
 
 

@@ -1,10 +1,10 @@
-% Inference for sweep cell train4: posterior_min_std=0.40, alpha_recon=25
+% Inference for sweep cell train6: posterior_min_std=0.20, alpha_recon=50
 model   MeshGraphNets-V
 mode    inference
-gpu_ids 3
-log_file_dir         b8_all/infer_train4_sec.log
-modelpath            ./outputs/b8_all/warpage_train4_p040_a025.pth
-inference_output_dir outputs/b8_all/infer_train4_sec
+gpu_ids 5
+log_file_dir         b8_all/infer_train6_sec.log
+modelpath            ./outputs/b8_all/warpage_train6_p020_a050.pth
+inference_output_dir outputs/b8_all/infer_train6_sec
 
 % Datasets
 dataset_dir     ./dataset/b8_main_sec_dataset_traincopy.h5
@@ -55,7 +55,7 @@ bipartite_unpool    True
 % VAE (MMD-InfoVAE)
 use_vae          True
 vae_latent_dim   32
-alpha_recon      25
+alpha_recon      50
 lambda_mmd       0.1
 vae_graph_aware  True
 
