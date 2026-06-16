@@ -27,7 +27,7 @@ positional_features  4
 % Network parameters
 message_passing_num  15
 Training_epochs      1000
-Batch_size           8
+Batch_size           16
 LearningR            0.0001
 Latent_dim           128
 num_workers          4
@@ -37,7 +37,7 @@ augment_geometry     True
 grad_accum_steps     1
 
 % Memory / performance
-use_checkpointing    True
+use_checkpointing    False
 use_amp              True
 use_ema              True
 ema_decay            0.99

@@ -72,7 +72,7 @@ def single_worker(config, config_filename='config.txt'):
         train_dataset, batch_size=config['batch_size'], shuffle=True,
         num_workers=num_workers, pin_memory=pin_memory,
         persistent_workers=num_workers > 0,
-        prefetch_factor=1 if num_workers > 0 else None,
+        prefetch_factor=4 if num_workers > 0 else None,
         multiprocessing_context=mp_context,
     )
     val_loader = DataLoader(

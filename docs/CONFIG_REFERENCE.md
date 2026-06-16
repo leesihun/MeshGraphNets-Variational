@@ -194,6 +194,11 @@ spread modeling, set `lambda_det 0.0`, `lambda_mmd 0.1`, `beta_aux 1.0`.
 | `infer_timesteps` | inference | Rollout steps per selected scene. |
 | `num_vae_samples` | inference | Number of stochastic samples per scene when VAE is enabled. |
 | `prior_temperature` | inference | Conditional-prior sampling spread control. |
+| `eval_dataset` | inference | Ground-truth eval HDF5 used for the inline z_disp spread-histogram comparison. When set (and VAE enabled), rollout writes `histogram_compare.png` next to the `.h5` outputs. No GT path → comparison skipped. |
+| `make_histogram` | inference | Force the spread histogram on/off. Defaults to `True` when `use_vae` and `eval_dataset` are both set. |
+| `show_histogram` | inference | Open the saved `histogram_compare.png` in the OS default viewer after rollout. Default `True`; best-effort (silently degrades on a headless box). |
+| `histogram_bins` | inference | Histogram bin count (default `60`). |
+| `histogram_clip_quantile` | inference | Symmetric quantile clip for the binning range, e.g. `0.001` trims the 0.1% tails (default `0` = no clip). |
 
 Inference output files are named like:
 
@@ -201,6 +206,11 @@ Inference output files are named like:
 rollout_sample{sample_id}_steps{steps}.h5
 rollout_sample{sample_id}_vaesample{idx}_steps{steps}.h5
 ```
+
+When `eval_dataset` is set, rollout also writes `histogram_compare.png` in
+`inference_output_dir` — the same z_disp spread (max − min, final timestep)
+comparison produced by the standalone `_b8_all_warpage_input/compare_histograms.py`,
+now generated automatically as part of the rollout.
 
 ## Checkpoint Contents
 
