@@ -353,8 +353,14 @@ class MeshGraphDataset(Dataset):
         self.coarse_edge_means: List = []   # per-level: [mean_level_0, mean_level_1, ...]
         self.coarse_edge_stds: List = []    # per-level: [std_level_0, std_level_1, ...]
         self._coarse_cache_max = int(config.get('coarse_cache_per_worker', 500))
-        self._coarse_cache: Dict = {}  # {sample_id: list[dict]} — list from build_multiscale_hierarchy
-        self._static_cache: Dict = {}  # per-worker topology and positional features
+        self._coarse_cache: Dict = {}  # {sample_id: list[dict]} — fallback when disk cache off
+        # Static cache (positional features) has its OWN small cap, decoupled from
+        # _coarse_cache_max: tying it to a large hierarchy cap blew up RAM on big meshes.
+        self._static_cache_max = int(config.get('static_cache_per_worker', 64))
+        self._static_cache: Dict = {}  # {sample_id: x_pos} — fallback when disk cache off
+        # On-disk hierarchy/positional cache (built once, streamed by all workers).
+        self._ms_cache_path = None
+        self._ms_reader = None
 
         # Per-level coarsening method.
         # Accepted: 'bfs', 'voronoi', 'voronoi_centroid', 'voronoi_inherit', 'voronoi_seedmean'.
@@ -435,6 +441,16 @@ class MeshGraphDataset(Dataset):
         print(f"  num_timesteps: {self.num_timesteps}")
 
         self._sanity_check_mesh_topology()
+
+        # Build (or locate) the shared on-disk hierarchy cache for ALL samples.
+        # Hierarchies are pure functions of mesh topology + reference geometry, so
+        # one shared file serves every split, worker, and concurrent job — keeping
+        # FPS off the hot path and per-worker RAM flat.
+        if self.use_multiscale and config.get('use_hierarchy_disk_cache', True):
+            if not HAS_COARSENING:
+                raise ImportError("use_multiscale=True requires model/coarsening.py (import failed)")
+            from general_modules.multiscale_cache import ensure_cache
+            self._ms_cache_path = ensure_cache(self.h5_file, self.sample_ids, config)
 
     def _sanity_check_mesh_topology(self) -> None:
         """Validate mesh topology across all samples.
@@ -666,6 +682,11 @@ class MeshGraphDataset(Dataset):
         subset._coarse_cache = {}
         subset._static_cache = {}
         subset._coarse_cache_max = self._coarse_cache_max
+        subset._static_cache_max = self._static_cache_max
+        # Share the parent's on-disk cache (covers all sample_ids); reader is
+        # process-local and opened lazily per worker.
+        subset._ms_cache_path = self._ms_cache_path
+        subset._ms_reader = None
         subset._h5_handle = None
         subset.is_training = is_training
         subset.augment_geometry = self.config.get('augment_geometry', False) and is_training
@@ -882,11 +903,17 @@ class MeshGraphDataset(Dataset):
                 first_pos_data = data_h5[:3, 0, :]  # [3, nodes] — ref xyz
                 level_ref_pos = first_pos_data.T     # [N, 3]
 
-                hierarchy = build_multiscale_hierarchy(
-                    edge_idx, num_nodes, level_ref_pos,
-                    L, self.coarsening_types, self.voronoi_clusters,
-                    bipartite_unpool=self.bipartite_unpool,
-                )
+                # Reuse the shared on-disk cache when present (avoids re-running
+                # FPS for every train sample during this stats pass).
+                reader = self._get_ms_reader()
+                if reader is not None and reader.has(sid):
+                    hierarchy = reader.get_hierarchy(sid)
+                else:
+                    hierarchy = build_multiscale_hierarchy(
+                        edge_idx, num_nodes, level_ref_pos,
+                        L, self.coarsening_types, self.voronoi_clusters,
+                        bipartite_unpool=self.bipartite_unpool,
+                    )
                 actual_levels = len(hierarchy)
 
                 # Collect coarse edge stats per level — 10 timesteps is sufficient
@@ -1004,19 +1031,23 @@ class MeshGraphDataset(Dataset):
             self._h5_handle = h5py.File(self.h5_file, 'r', swmr=True)
         return self._h5_handle
 
+    def _get_ms_reader(self):
+        """Lazily open the per-process on-disk hierarchy cache reader (or None)."""
+        if getattr(self, '_ms_cache_path', None) is None:
+            return None
+        if getattr(self, '_ms_reader', None) is None:
+            from general_modules.multiscale_cache import HierarchyCacheReader
+            self._ms_reader = HierarchyCacheReader(self._ms_cache_path)
+        return self._ms_reader
+
     def _get_static_sample_data(self, sample_id: int, h5_handle, data: np.ndarray):
-        """Cache sample topology and positional features inside each worker."""
-        cache = getattr(self, '_static_cache', None)
-        if cache is None:
-            cache = {}
-            self._static_cache = cache
+        """Return (edge_index, x_pos, node_types) for a sample.
 
-        cached = cache.get(sample_id)
-        if cached is not None:
-            cache.pop(sample_id)
-            cache[sample_id] = cached
-            return cached
-
+        edge_index is cheap (read + mirror), so it is recomputed each call rather
+        than cached — caching it cost ~10-20 MB/sample × workers. Positional
+        features come from the shared on-disk cache when available, else are
+        computed and held in a small bounded per-worker cache.
+        """
         mesh_edge = h5_handle[f'data/{sample_id}/mesh_edge'][:]  # [2, M]
         edge_index = np.concatenate([mesh_edge, mesh_edge[[1, 0], :]], axis=1)  # [2, 2M]
 
@@ -1024,22 +1055,40 @@ class MeshGraphDataset(Dataset):
 
         x_pos = None
         if self.num_pos_features > 0:
-            ref_pos_0 = data[:3, 0, :].T
-            x_pos = _compute_positional_features(
-                ref_pos_0, edge_index, self.num_pos_features, self.positional_encoding
-            )
+            x_pos = self._get_positional_features(sample_id, data, edge_index)
 
-        cached = (edge_index, x_pos, node_types)
-        if self._coarse_cache_max > 0:
-            if len(cache) >= self._coarse_cache_max:
+        return edge_index, x_pos, node_types
+
+    def _get_positional_features(self, sample_id: int, data: np.ndarray, edge_index):
+        """Positional features from the on-disk cache, else compute (bounded RAM)."""
+        reader = self._get_ms_reader()
+        if reader is not None:
+            xp = reader.get_pos(sample_id)
+            if xp is not None:
+                return xp
+
+        cache = self._static_cache
+        cached = cache.get(sample_id)
+        if cached is not None:
+            cache.pop(sample_id)
+            cache[sample_id] = cached  # LRU bump
+            return cached
+
+        ref_pos_0 = data[:3, 0, :].T
+        xp = _compute_positional_features(
+            ref_pos_0, edge_index, self.num_pos_features, self.positional_encoding
+        )
+        if self._static_cache_max > 0:
+            if len(cache) >= self._static_cache_max:
                 cache.pop(next(iter(cache)))
-            cache[sample_id] = cached
-        return cached
+            cache[sample_id] = xp
+        return xp
 
     def __getstate__(self):
         """Exclude unpicklable HDF5 handle when pickling (for DataLoader workers)."""
         state = self.__dict__.copy()
         state['_h5_handle'] = None
+        state['_ms_reader'] = None      # h5 handle is not picklable; workers reopen lazily
         state['_coarse_cache'] = {}    # workers start with empty cache; they build lazily
         state['_static_cache'] = {}
         return state
@@ -1048,13 +1097,17 @@ class MeshGraphDataset(Dataset):
         self.__dict__.update(state)
 
     def __del__(self):
-        """Close persistent HDF5 handle on cleanup."""
+        """Close persistent HDF5 handles on cleanup."""
         if hasattr(self, '_h5_handle') and self._h5_handle is not None:
             try:
                 self._h5_handle.close()
             except Exception:
                 pass
             self._h5_handle = None
+        reader = getattr(self, '_ms_reader', None)
+        if reader is not None:
+            reader.close()
+            self._ms_reader = None
 
     def _random_augmentation_matrix(self) -> np.ndarray:
         """Generate a random Z-axis rotation + optional x/y reflection matrix [3, 3].
@@ -1230,21 +1283,26 @@ class MeshGraphDataset(Dataset):
 
         # Attach per-level coarsening data (only when use_multiscale=True)
         if self.use_multiscale:
-            # Retrieve from cache (or compute on-demand for split subsets)
-            if sample_id not in self._coarse_cache:
-                raw_edge_idx = edge_index.numpy()  # already bidirectional [2, 2M]
-                level_ref_pos = pos.numpy()         # [N, 3] for Euclidean FPS
-                hierarchy = build_multiscale_hierarchy(
-                    raw_edge_idx, pos.shape[0], level_ref_pos,
-                    self.multiscale_levels, self.coarsening_types, self.voronoi_clusters,
-                    bipartite_unpool=self.bipartite_unpool,
-                )
-                # LRU-style eviction: evict oldest entry if over capacity
-                if len(self._coarse_cache) >= self._coarse_cache_max:
-                    self._coarse_cache.pop(next(iter(self._coarse_cache)))
-                self._coarse_cache[sample_id] = hierarchy
+            # Prefer the shared on-disk cache (built once, streamed by every worker).
+            # Fall back to on-the-fly build + bounded RAM cache when disabled.
+            reader = self._get_ms_reader()
+            if reader is not None:
+                hierarchy = reader.get_hierarchy(sample_id)
+            else:
+                if sample_id not in self._coarse_cache:
+                    raw_edge_idx = edge_index.numpy()  # already bidirectional [2, 2M]
+                    level_ref_pos = pos.numpy()         # [N, 3] for Euclidean FPS
+                    hierarchy = build_multiscale_hierarchy(
+                        raw_edge_idx, pos.shape[0], level_ref_pos,
+                        self.multiscale_levels, self.coarsening_types, self.voronoi_clusters,
+                        bipartite_unpool=self.bipartite_unpool,
+                    )
+                    # LRU-style eviction: evict oldest entry if over capacity
+                    if len(self._coarse_cache) >= self._coarse_cache_max:
+                        self._coarse_cache.pop(next(iter(self._coarse_cache)))
+                    self._coarse_cache[sample_id] = hierarchy
+                hierarchy = self._coarse_cache[sample_id]
 
-            hierarchy = self._coarse_cache[sample_id]
             world_ei_for_coarse = (
                 graph_data.world_edge_index.numpy()
                 if self.use_world_edges and self.coarse_world_edges else None

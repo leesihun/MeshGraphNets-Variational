@@ -31,6 +31,7 @@ Batch_size           16
 LearningR            0.0001
 Latent_dim           128
 num_workers          4
+use_hierarchy_disk_cache  True     # build per-sample FPS hierarchies + positional feats once to a shared on-disk cache; workers stream from disk (flat RAM, no per-epoch FPS)
 std_noise            0.01    # without noise the model ignores z and memorises x->y
 residual_scale       1
 augment_geometry     True
