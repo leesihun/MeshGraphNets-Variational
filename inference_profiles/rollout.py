@@ -4,7 +4,7 @@ import time
 import h5py
 import numpy as np
 import torch
-from torch_geometric.data import Data
+from torch_geometric.data import Batch, Data
 
 from general_modules.edge_features import EDGE_FEATURE_DIM, compute_edge_attr
 from general_modules.mesh_dataset import _compute_positional_features
@@ -299,6 +299,7 @@ def run_rollout(config, config_filename='config.txt'):
     prior_temperature = float(config.get('prior_temperature', 1.0))
 
     num_vae_samples = int(config.get('num_vae_samples', 1)) if use_vae else 1
+    vae_batch_size = max(1, int(config.get('vae_batch_size', 1))) if use_vae else 1
 
     # Inline z_disp spread-histogram (generated vs ground-truth eval dataset).
     # Enabled when an `eval_dataset` is given in the config (no GT -> no compare).
@@ -348,7 +349,7 @@ def run_rollout(config, config_filename='config.txt'):
                             f"{gmm_params['covariance_type']} cov)"
                             if gmm_params is not None else "N(0, I)")
         print(f"  VAE sampling: {num_vae_samples} sample(s) per scene "
-              f"(z_dim={vae_latent_dim}, prior={sampler_desc})")
+              f"(z_dim={vae_latent_dim}, batch_size={vae_batch_size}, prior={sampler_desc})")
 
     # We need to infer all samples in the dataset
     # Gather sample IDs (may not be sequential 0..N-1)
@@ -455,7 +456,222 @@ def run_rollout(config, config_filename='config.txt'):
         # -------------------------------------------------------------------------
         # 5. Autoregressive rollout  (looped over VAE samples when use_vae=True)
         # -------------------------------------------------------------------------
-        for vae_sample_idx in range(num_vae_samples):
+        _done_vae = False
+
+        # ── Batched VAE path (vae_batch_size > 1) ────────────────────────────────
+        if use_vae and vae_batch_size > 1:
+            _done_vae = True
+
+            # Node type one-hot is static (same for all steps / z-samples)
+            _node_type_onehot = None
+            if use_node_types and part_ids is not None and node_type_to_idx is not None:
+                _nti = np.array([node_type_to_idx[int(t)] for t in part_ids], dtype=np.int32)
+                _node_type_onehot = np.zeros((num_nodes, num_node_types), dtype=np.float32)
+                _node_type_onehot[np.arange(num_nodes), _nti] = 1.0
+
+            DataClass = MultiscaleData if use_multiscale else Data
+            _num_batches = (num_vae_samples + vae_batch_size - 1) // vae_batch_size
+            _report_every = max(1, _num_batches // 10)
+            _use_cwe = bool(config.get('coarse_world_edges', False))
+
+            print(f"\nBatched VAE inference: {num_vae_samples} samples × "
+                  f"{steps_this_sample} step(s), batch_size={vae_batch_size} "
+                  f"→ {_num_batches} batches")
+
+            for batch_start in range(0, num_vae_samples, vae_batch_size):
+                B = min(vae_batch_size, num_vae_samples - batch_start)
+                _bidx = batch_start // vae_batch_size
+
+                if _bidx % _report_every == 0 or _bidx == _num_batches - 1:
+                    print(f"  batch {_bidx + 1}/{_num_batches}  "
+                          f"(z-samples {batch_start}–{batch_start + B - 1})")
+
+                # B separate states, all starting from initial_state
+                _cur = [initial_state.copy() for _ in range(B)]
+                _ast = [np.zeros((steps_this_sample + 1, num_nodes, output_dim), dtype=np.float32)
+                        for _ in range(B)]
+                for _b in range(B):
+                    _ast[_b][0] = initial_state[:, :output_dim]
+
+                _z_batch = None   # sampled once from prior at step 0
+                rollout_start_time = time.time()
+
+                with torch.no_grad():
+                    for step in range(steps_this_sample):
+
+                        # Step 0: all B states identical → build one graph, then replicate.
+                        # Step 1+: states have diverged → build B separate graphs.
+                        if step == 0:
+                            _cs = _cur[0]
+                            _xr = np.concatenate([_cs, pos_features], axis=1) if pos_features is not None else _cs
+                            _xn = (_xr - node_mean) / node_std
+                            if _node_type_onehot is not None:
+                                _xn = np.concatenate([_xn, _node_type_onehot], axis=1)
+                            _dp = ref_pos + _cs[:, :3]
+                            _ea = (compute_edge_attr(ref_pos, _dp, edge_index) - edge_mean) / edge_std
+                            _g0 = DataClass(
+                                x=torch.from_numpy(_xn.astype(np.float32)).to(device),
+                                edge_index=torch.from_numpy(edge_index).long().to(device),
+                                edge_attr=torch.from_numpy(_ea.astype(np.float32)).to(device),
+                                pos=torch.from_numpy(ref_pos.astype(np.float32)).to(device),
+                            )
+                            if use_world_edges and world_edge_radius is not None:
+                                _wei, _wea = compute_world_edges(
+                                    ref_pos, _dp, edge_index,
+                                    radius=world_edge_radius,
+                                    max_num_neighbors=world_max_num_neighbors,
+                                    backend=world_edge_backend,
+                                    device=device,
+                                    edge_mean=edge_mean, edge_std=edge_std,
+                                )
+                                _g0.world_edge_index = torch.from_numpy(_wei).long().to(device)
+                                _g0.world_edge_attr = torch.from_numpy(_wea.astype(np.float32)).to(device)
+                            else:
+                                _g0.world_edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
+                                _g0.world_edge_attr = torch.zeros((0, EDGE_FEATURE_DIM), dtype=torch.float32, device=device)
+                            if use_multiscale and coarse_hierarchy is not None:
+                                _wc = _g0.world_edge_index.cpu().numpy() if use_world_edges and _use_cwe else None
+                                attach_coarse_levels_to_graph(
+                                    _g0, coarse_hierarchy, ref_pos, _dp,
+                                    coarse_edge_means, coarse_edge_stds,
+                                    device=device, world_edge_index=_wc,
+                                )
+
+                            # Sample B z vectors via one batched prior GNN call
+                            if conditional_prior is not None:
+                                _pb = Batch.from_data_list([_g0] * B)
+                                _z_batch = conditional_prior.sample(
+                                    _pb, temperature=prior_temperature
+                                ).to(device)
+                            elif gmm_params is not None:
+                                from model.latent_gmm import sample_from_gmm
+                                _z_batch = sample_from_gmm(gmm_params, B, device)
+                            else:
+                                _z_batch = torch.randn(B, vae_latent_dim, device=device)
+
+                            _graphs = [_g0] * B
+
+                        else:
+                            # step > 0: each trajectory has its own deformed state
+                            _graphs = []
+                            for _b in range(B):
+                                _cs = _cur[_b]
+                                _xr = np.concatenate([_cs, pos_features], axis=1) if pos_features is not None else _cs
+                                _xn = (_xr - node_mean) / node_std
+                                if _node_type_onehot is not None:
+                                    _xn = np.concatenate([_xn, _node_type_onehot], axis=1)
+                                _dp = ref_pos + _cs[:, :3]
+                                _ea = (compute_edge_attr(ref_pos, _dp, edge_index) - edge_mean) / edge_std
+                                _gb = DataClass(
+                                    x=torch.from_numpy(_xn.astype(np.float32)).to(device),
+                                    edge_index=torch.from_numpy(edge_index).long().to(device),
+                                    edge_attr=torch.from_numpy(_ea.astype(np.float32)).to(device),
+                                    pos=torch.from_numpy(ref_pos.astype(np.float32)).to(device),
+                                )
+                                if use_world_edges and world_edge_radius is not None:
+                                    _wei, _wea = compute_world_edges(
+                                        ref_pos, _dp, edge_index,
+                                        radius=world_edge_radius,
+                                        max_num_neighbors=world_max_num_neighbors,
+                                        backend=world_edge_backend,
+                                        device=device,
+                                        edge_mean=edge_mean, edge_std=edge_std,
+                                    )
+                                    _gb.world_edge_index = torch.from_numpy(_wei).long().to(device)
+                                    _gb.world_edge_attr = torch.from_numpy(_wea.astype(np.float32)).to(device)
+                                else:
+                                    _gb.world_edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
+                                    _gb.world_edge_attr = torch.zeros((0, EDGE_FEATURE_DIM), dtype=torch.float32, device=device)
+                                if use_multiscale and coarse_hierarchy is not None:
+                                    _wc = _gb.world_edge_index.cpu().numpy() if use_world_edges and _use_cwe else None
+                                    attach_coarse_levels_to_graph(
+                                        _gb, coarse_hierarchy, ref_pos, _dp,
+                                        coarse_edge_means, coarse_edge_stds,
+                                        device=device, world_edge_index=_wc,
+                                    )
+                                _graphs.append(_gb)
+
+                        # Batched forward pass: [N×B, output_var]
+                        _bg = Batch.from_data_list(_graphs)
+                        _pred, _, _, _, _ = model(_bg, fixed_z=_z_batch)
+                        _pred_np = _pred.view(B, num_nodes, output_dim).cpu().numpy()
+
+                        # Update B states
+                        for _b in range(B):
+                            _delta = _pred_np[_b] * delta_std + delta_mean
+                            _cur[_b][:, :output_dim] += _delta
+                            _ast[_b][step + 1] = _cur[_b][:, :output_dim]
+
+                total_rollout_time = time.time() - rollout_start_time
+
+                # Save B HDF5 files
+                for _b in range(B):
+                    _vi = batch_start + _b
+
+                    if make_histogram and output_dim > z_gen_idx:
+                        generated_spreads.append(
+                            _spread_max_minus_min(_ast[_b][-1, :, z_gen_idx])
+                        )
+
+                    os.makedirs(output_dir, exist_ok=True)
+                    _fname = (
+                        f"rollout_sample{sample_id}_vaesample{_vi}_steps{steps_this_sample}.h5"
+                        if num_vae_samples > 1 else
+                        f"rollout_sample{sample_id}_steps{steps_this_sample}.h5"
+                    )
+                    _opath = os.path.join(output_dir, _fname)
+
+                    _nsf = 3 + output_dim + 1
+                    _nd = np.zeros((_nsf, steps_this_sample + 1, num_nodes), dtype=np.float32)
+                    _nd[0, :, :] = ref_pos[:, 0]
+                    _nd[1, :, :] = ref_pos[:, 1]
+                    _nd[2, :, :] = ref_pos[:, 2]
+                    for _ch in range(output_dim):
+                        _nd[3 + _ch, :, :] = _ast[_b][:, :, _ch]
+                    if part_ids is not None:
+                        _nd[3 + output_dim, :, :] = part_ids[np.newaxis, :]
+
+                    with h5py.File(_opath, 'w') as _f:
+                        _f.attrs['num_samples'] = 1
+                        _f.attrs['num_features'] = _nsf
+                        _f.attrs['num_timesteps'] = steps_this_sample + 1
+                        _dg = _f.create_group('data')
+                        _sg = _dg.create_group(str(sample_id))
+                        _sg.create_dataset('nodal_data', data=_nd, compression='gzip', compression_opts=4)
+                        _sg.create_dataset('mesh_edge', data=mesh_edge)
+                        _mg = _sg.create_group('metadata')
+                        _mg.attrs['sample_id'] = sample_id
+                        _mg.attrs['num_nodes'] = num_nodes
+                        _mg.attrs['num_edges'] = mesh_edge.shape[1]
+                        _mg.attrs['num_timesteps'] = steps_this_sample + 1
+                        _mg.attrs['model_path'] = model_path
+                        _mg.attrs['config_file'] = config_filename
+                        _mg.attrs['total_rollout_time_s'] = total_rollout_time
+                        _mg.attrs['vae_sample_idx'] = _vi
+                        _fn_list = [b'x_coord', b'y_coord', b'z_coord',
+                                    b'x_disp(mm)', b'y_disp(mm)', b'z_disp(mm)',
+                                    b'stress(MPa)', b'Part No.']
+                        _mg.create_dataset('feature_min',  data=np.array([_nd[i].min()  for i in range(_nsf)], dtype=np.float32))
+                        _mg.create_dataset('feature_max',  data=np.array([_nd[i].max()  for i in range(_nsf)], dtype=np.float32))
+                        _mg.create_dataset('feature_mean', data=np.array([_nd[i].mean() for i in range(_nsf)], dtype=np.float32))
+                        _mg.create_dataset('feature_std',  data=np.array([_nd[i].std()  for i in range(_nsf)], dtype=np.float32))
+                        _gm = _f.create_group('metadata')
+                        _gm.create_dataset('feature_names', data=np.array(_fn_list[:3 + output_dim] + [b'Part No.']))
+                        _nr = _gm.create_group('normalization_params')
+                        _nr.create_dataset('node_mean',  data=node_mean)
+                        _nr.create_dataset('node_std',   data=node_std)
+                        _nr.create_dataset('edge_mean',  data=edge_mean)
+                        _nr.create_dataset('edge_std',   data=edge_std)
+                        _nr.create_dataset('delta_mean', data=delta_mean)
+                        _nr.create_dataset('delta_std',  data=delta_std)
+                        _f.flush()
+
+                    _sz = os.path.getsize(_opath) / (1024 * 1024)
+                    if _b == B - 1 or B <= 4:
+                        print(f"  Saved {_fname}  ({_sz:.1f} MB)")
+
+        # ── Sequential VAE path (vae_batch_size == 1, unchanged) ─────────────────
+        for vae_sample_idx in range(num_vae_samples if not _done_vae else 0):
 
             if use_vae and num_vae_samples > 1:
                 print(f"\n{'=' * 60}")
