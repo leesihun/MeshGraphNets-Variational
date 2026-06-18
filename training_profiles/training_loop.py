@@ -742,6 +742,9 @@ def evaluate_vae_learned_prior_epoch(model, dataloader, device, config, epoch=0,
                 pi = torch.softmax(prior_params['logits'].float(), dim=-1).unsqueeze(-1)
                 mu_p = prior_params['mu'].float()
                 var_p = (2.0 * prior_params['log_std'].float()).exp()
+                if prior_params.get('cov_factor') is not None:
+                    # per-dim marginal variance: diag(L L^T) + diag part
+                    var_p = var_p + prior_params['cov_factor'].float().pow(2).sum(dim=-1)
                 mean_mix = (pi * mu_p).sum(dim=-2)
                 var_mix = (pi * (var_p + mu_p.pow(2))).sum(dim=-2) - mean_mix.pow(2)
                 prior_var_all.append(var_mix.clamp(min=0).cpu())

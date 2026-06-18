@@ -22,9 +22,14 @@
 # Environment overrides:
 #   PYTHON           = python interpreter (default: python)
 #   LOG_ROOT         = directory for tee logs (default: outputs/b8_all/run_logs)
-#   ONLY             = restrict to "infer" or "hist" only (default: both)
+#   ONLY             = "infer" | "hist" | "diag" | "both" (default: both = infer+hist)
+#   DIAG             = 1 to also run diag_prior_spread.py after infer/hist (default: 0)
 #   BASELINES        = space-separated baseline indices (default: "1 2 3 4 5 6 7 8")
 #   DATASETS         = space-separated dataset tags (default: "main sec")
+#
+# diag_prior_spread.py reports, per checkpoint+type, the warpage-amplitude spread
+# under posterior / prior / full-cov z-sources + the mu_q eigen-spectrum — i.e.
+# whether under-dispersion is a prior problem (fixable) or a decoder ceiling.
 #
 # Parallel run across GPUs (configs use gpu_ids 0-7 — non-overlapping):
 #   BASELINES=1 bash _b8_all_warpage_input/run_all.sh &
@@ -41,6 +46,7 @@ set -euo pipefail
 
 PYTHON="${PYTHON:-python}"
 ONLY="${ONLY:-both}"
+DIAG="${DIAG:-0}"
 BASELINES="${BASELINES:-1 2 3 4 5 6 7 8}"
 DATASETS="${DATASETS:-main sec}"
 
@@ -59,6 +65,38 @@ eval_h5() {
     esac
 }
 
+# Ground-truth amplitude (max-min z_disp) mu/sigma per type, for the diag verdict
+# line. Measured from the eval datasets; override here if the datasets change.
+gt_stats() {
+    case "$1" in
+        main) echo "701 280" ;;
+        sec)  echo "749 360" ;;
+        *)    echo "0 1" ;;
+    esac
+}
+
+diag_one() {
+    local idx=$1
+    local ds=$2
+    local tag="${idx}_${ds}"
+    local cfg="_b8_all_warpage_input/config_infer${idx}_${ds}.txt"
+    local eval_ds gt
+    eval_ds="$(eval_h5 "$ds")"
+    gt="$(gt_stats "$ds")"
+
+    if [ ! -f "$cfg" ]; then
+        echo "[$tag] SKIP diag: config not found ($cfg)" >&2
+        return 0
+    fi
+    echo ""
+    echo "[$tag] DIAGNOSTIC  (posterior / prior / fullcov + mu_q eigen-spectrum)"
+    "$PYTHON" diag_prior_spread.py \
+        --config "$cfg" --gt_dataset "$eval_ds" \
+        --gt_mu "${gt% *}" --gt_sigma "${gt#* }" 2>&1 \
+        | tee "$LOG_ROOT/diag_${tag}.log" \
+        || echo "[$tag] diagnostic FAILED — see $LOG_ROOT/diag_${tag}.log" >&2
+}
+
 run_one() {
     local idx=$1
     local ds=$2
@@ -73,7 +111,7 @@ run_one() {
         return 0
     fi
 
-    if [ "$ONLY" != "hist" ]; then
+    if [ "$ONLY" = "both" ] || [ "$ONLY" = "infer" ]; then
         echo ""
         echo "=========================================="
         echo "[$tag] INFERENCE  cfg=$cfg"
@@ -85,7 +123,7 @@ run_one() {
         fi
     fi
 
-    if [ "$ONLY" != "infer" ]; then
+    if [ "$ONLY" = "both" ] || [ "$ONLY" = "hist" ]; then
         echo ""
         echo "[$tag] HISTOGRAM  rollout_dir=$rollout_dir"
         if ! "$PYTHON" _b8_all_warpage_input/compare_histograms.py \
@@ -96,6 +134,10 @@ run_one() {
             echo "[$tag] histogram comparison FAILED — see $LOG_ROOT/hist_${tag}.log" >&2
             return 1
         fi
+    fi
+
+    if [ "$ONLY" = "diag" ] || [ "$DIAG" = "1" ]; then
+        diag_one "$idx" "$ds"
     fi
 }
 
@@ -120,7 +162,7 @@ echo "Tee logs:        $LOG_ROOT/"
 echo "Histogram PNGs:  outputs/b8_all/infer_train<i>_<ds>/histogram_compare.png"
 
 # ── mu / sigma summary ──────────────────────────────────────────────────────
-if [ "$ONLY" != "infer" ]; then
+if [ "$ONLY" = "both" ] || [ "$ONLY" = "hist" ]; then
     SUMMARY="$LOG_ROOT/summary_stats.txt"
     {
         printf "# Spread mu/sigma summary — %s\n" "$(date)"

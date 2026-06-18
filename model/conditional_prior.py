@@ -24,6 +24,13 @@ class ConditionalMixturePrior(nn.Module):
         self.hidden_dim = int(config.get('prior_hidden_dim', config.get('latent_dim', 128)))
         self.num_mp_layers = int(config.get('prior_mp_layers', 3))
         self.min_std = float(config.get('prior_min_std', 0.05))
+        # Low-rank covariance per mixture component: Sigma_k = L_k L_k^T + diag(psi_k).
+        # 0 (default) = diagonal components (back-compat, no cov_factor emitted).
+        # r > 0 lets a component capture correlated latent directions — the
+        # manufacturing-spread axis a diagonal prior misses (see diag_prior_spread).
+        self.cov_rank = int(config.get('prior_cov_rank', 0))
+        # Start near-diagonal (weak correlations) and let training grow them.
+        self.cov_factor_scale = 0.1
         # Per-level z slots (matches MeshGraphNets.num_z). Default 1 for back-compat.
         if config.get('use_multiscale', False):
             default_num_z = int(config.get('multiscale_levels', 1)) + 1
@@ -48,10 +55,12 @@ class ConditionalMixturePrior(nn.Module):
             for _ in range(self.num_mp_layers)
         ])
         self.pool = GlobalAttention(nn.Linear(self.hidden_dim, 1))
+        # Per component: 1 logit + D mean + D diagonal log-std (+ D*rank cov factor).
+        self.params_per_comp = 1 + (2 + self.cov_rank) * self.z_dim
         self.head = build_mlp(
             self.hidden_dim,
             self.hidden_dim,
-            self.num_z * self.num_components * (1 + 2 * self.z_dim),
+            self.num_z * self.num_components * self.params_per_comp,
             layer_norm=False,
         )
         self.apply(init_weights)
@@ -70,14 +79,21 @@ class ConditionalMixturePrior(nn.Module):
         pooled = self.pool(g.x, batch)
         raw = self.head(pooled)
         bsz = raw.shape[0]
-        # [B, num_z, K, 1 + 2D]
-        raw = raw.view(bsz, self.num_z, self.num_components, 1 + 2 * self.z_dim)
+        D = self.z_dim
+        # [B, num_z, K, params_per_comp]
+        raw = raw.view(bsz, self.num_z, self.num_components, self.params_per_comp)
 
         logits = raw[..., 0]                          # [B, num_z, K]
-        mu = raw[..., 1:1 + self.z_dim]               # [B, num_z, K, D]
-        log_std = raw[..., 1 + self.z_dim:]           # [B, num_z, K, D]
+        mu = raw[..., 1:1 + D]                        # [B, num_z, K, D]
+        log_std = raw[..., 1 + D:1 + 2 * D]           # [B, num_z, K, D]
         log_std = torch.clamp(log_std, min=math.log(self.min_std), max=5.0)
-        return {'logits': logits, 'mu': mu, 'log_std': log_std}
+        out = {'logits': logits, 'mu': mu, 'log_std': log_std}
+        if self.cov_rank > 0:
+            # Low-rank covariance factor L_k: [B, num_z, K, D, rank]
+            factor = raw[..., 1 + 2 * D:].view(
+                bsz, self.num_z, self.num_components, D, self.cov_rank)
+            out['cov_factor'] = factor * self.cov_factor_scale
+        return out
 
     @torch.no_grad()
     def sample(self, graph, temperature=1.0):
@@ -85,14 +101,32 @@ class ConditionalMixturePrior(nn.Module):
         return sample_from_mixture(params, temperature=temperature)
 
 
+def _lowrank_mvn(mu, log_std, cov_factor):
+    """Batched low-rank-plus-diagonal Gaussian: Sigma = L L^T + diag(exp(2*log_std)).
+
+    Done in float32 for numerical stability (the capacitance Cholesky underflows
+    in bfloat16). Batch dims are everything before the last (D) dim of `mu`.
+    """
+    return torch.distributions.LowRankMultivariateNormal(
+        loc=mu.float(),
+        cov_factor=cov_factor.float(),
+        cov_diag=torch.exp(2.0 * log_std.float()),
+        validate_args=False,
+    )
+
+
 def mixture_nll(params, target_z):
-    """Negative log likelihood of target_z under a diagonal Gaussian mixture.
+    """Negative log likelihood of target_z under a Gaussian mixture.
+
+    Components are diagonal, or low-rank-plus-diagonal when params has
+    'cov_factor' (Sigma_k = L_k L_k^T + diag(exp(2*log_std_k))).
 
     Shapes:
-        target_z: [B, num_z, D]              or [MC, B, num_z, D] for MC stacks
-        logits:   [B, num_z, K]
-        mu:       [B, num_z, K, D]
-        log_std:  [B, num_z, K, D]
+        target_z:  [B, num_z, D]            or [MC, B, num_z, D] for MC stacks
+        logits:    [B, num_z, K]
+        mu:        [B, num_z, K, D]
+        log_std:   [B, num_z, K, D]
+        cov_factor:[B, num_z, K, D, rank]   (optional)
     """
     if target_z.dim() == 4:
         losses = [mixture_nll(params, target_z[i]) for i in range(target_z.shape[0])]
@@ -101,14 +135,19 @@ def mixture_nll(params, target_z):
     logits = params['logits']
     mu = params['mu']
     log_std = params['log_std']
+    cov_factor = params.get('cov_factor')
 
     z = target_z.unsqueeze(2)  # [B, num_z, 1, D]
-    var_term = ((z - mu) / torch.exp(log_std)).pow(2)
-    comp_log_prob = -0.5 * (
-        var_term.sum(dim=-1)
-        + 2.0 * log_std.sum(dim=-1)
-        + target_z.shape[-1] * math.log(2.0 * math.pi)
-    )  # [B, num_z, K]
+    if cov_factor is not None:
+        mvn = _lowrank_mvn(mu, log_std, cov_factor)        # batch [B, num_z, K]
+        comp_log_prob = mvn.log_prob(z.float())            # [B, num_z, K]
+    else:
+        var_term = ((z - mu) / torch.exp(log_std)).pow(2)
+        comp_log_prob = -0.5 * (
+            var_term.sum(dim=-1)
+            + 2.0 * log_std.sum(dim=-1)
+            + target_z.shape[-1] * math.log(2.0 * math.pi)
+        )  # [B, num_z, K]
     log_mix = torch.log_softmax(logits, dim=-1)
     return -torch.logsumexp(log_mix + comp_log_prob, dim=-1).mean()
 
@@ -148,8 +187,13 @@ def analytical_prior_kl_loss(params, q_mu, q_logvar):
     q_var_b = torch.exp(q_logvar).unsqueeze(2)
     D = q_mu.shape[-1]
 
-    log_var_k = 2.0 * log_std
-    var_k = torch.exp(log_var_k)
+    var_k = torch.exp(2.0 * log_std)
+    cov_factor = params.get('cov_factor')
+    if cov_factor is not None:
+        # Small stability anchor: match the prior's per-dim MARGINAL variance
+        # (diagonal of L L^T + diag); cross-correlations are left to mc_nll.
+        var_k = var_k + cov_factor.pow(2).sum(dim=-1)
+    log_var_k = torch.log(var_k.clamp_min(1e-8))
 
     expected_log_pk = -0.5 * (
         D * math.log(2.0 * math.pi)
@@ -180,8 +224,22 @@ def sample_from_mixture(params, temperature=1.0):
     b_idx = torch.arange(B, device=logits.device).view(B, 1).expand(B, num_z)
     z_idx = torch.arange(num_z, device=logits.device).view(1, num_z).expand(B, num_z)
 
-    chosen_mu = mu[b_idx, z_idx, component]                              # [B, num_z, D]
-    chosen_std = torch.exp(log_std[b_idx, z_idx, component]) * math.sqrt(temp)
+    chosen_mu = mu[b_idx, z_idx, component]                  # [B, num_z, D]
+    chosen_log_std = log_std[b_idx, z_idx, component]        # [B, num_z, D]
+
+    cov_factor = params.get('cov_factor')
+    if cov_factor is not None:
+        chosen_factor = cov_factor[b_idx, z_idx, component]  # [B, num_z, D, rank]
+        # Temperature scales the covariance by `temp` (std by sqrt(temp)).
+        mvn = torch.distributions.LowRankMultivariateNormal(
+            loc=chosen_mu.float(),
+            cov_factor=chosen_factor.float() * math.sqrt(temp),
+            cov_diag=torch.exp(2.0 * chosen_log_std.float()) * temp,
+            validate_args=False,
+        )
+        return mvn.sample().to(chosen_mu.dtype)
+
+    chosen_std = torch.exp(chosen_log_std) * math.sqrt(temp)
     return chosen_mu + chosen_std * torch.randn_like(chosen_std)
 
 
@@ -223,6 +281,18 @@ def sample_from_mixture_reparam(params, temperature=1.0, hard=False):
     mu_mixed = (w * mu).sum(dim=-2)                          # [B, num_z, D]
     log_std_mixed = (w * log_std).sum(dim=-2)                # [B, num_z, D]
 
+    cov_factor = params.get('cov_factor')
+    if cov_factor is not None:
+        # [B,num_z,K,1,1] * [B,num_z,K,D,rank] → sum over K → [B,num_z,D,rank]
+        factor_mixed = (weights[..., None, None] * cov_factor).sum(dim=2)
+        mvn = torch.distributions.LowRankMultivariateNormal(
+            loc=mu_mixed.float(),
+            cov_factor=factor_mixed.float(),
+            cov_diag=torch.exp(2.0 * log_std_mixed.float()),
+            validate_args=False,
+        )
+        return mvn.rsample().to(mu_mixed.dtype)
+
     eps = torch.randn_like(mu_mixed)
     z = mu_mixed + torch.exp(log_std_mixed) * eps
     return z
@@ -246,6 +316,7 @@ def build_prior_config(config):
         'prior_hidden_dim': config.get('prior_hidden_dim', config.get('latent_dim')),
         'prior_mp_layers': config.get('prior_mp_layers', 10),
         'prior_min_std': config.get('prior_min_std', 0.1),
+        'prior_cov_rank': config.get('prior_cov_rank', 0),
         'prior_loss_type': config.get('prior_loss_type', 'mc_nll'),
         'residual_scale': config.get('residual_scale', 1.0),
     }

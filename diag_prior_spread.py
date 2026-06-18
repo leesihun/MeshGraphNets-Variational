@@ -175,8 +175,20 @@ def main():
     print(f"\n[c] fullcov pass: {args.n_samples} samples from full-cov Gaussian over mu_q ...")
     flat = mus.reshape(M, -1).astype(np.float64)        # [M, num_z*D]
     mean_v = flat.mean(axis=0)
-    cov = np.cov(flat, rowvar=False)
-    cov = np.atleast_2d(cov) + 1e-4 * np.eye(flat.shape[1])  # ridge for PD
+    cov_raw = np.atleast_2d(np.cov(flat, rowvar=False))
+
+    # Eigen-spectrum of the mu_q covariance: how many latent directions carry the
+    # spread. This sizes prior_cov_rank for the low-rank-covariance prior.
+    evals = np.clip(np.sort(np.linalg.eigvalsh(cov_raw))[::-1], 0, None)
+    cum = np.cumsum(evals) / max(evals.sum(), 1e-12)
+    rank_for = lambda frac: int(np.searchsorted(cum, frac) + 1)
+    print(f"\n[spectrum] mu_q covariance ({flat.shape[1]} dims) "
+          f"top eigvals = {np.array2string(evals[:8], precision=3)}")
+    print(f"[spectrum] directions for 90 / 95 / 99% variance: "
+          f"{rank_for(0.90)} / {rank_for(0.95)} / {rank_for(0.99)}  "
+          f"=> suggested prior_cov_rank ~ {rank_for(0.95)}")
+
+    cov = cov_raw + 1e-4 * np.eye(flat.shape[1])  # ridge for PD sampling
     try:
         L = np.linalg.cholesky(cov)
     except np.linalg.LinAlgError:

@@ -225,6 +225,7 @@ def build_model_config(config) -> dict:
         'prior_hidden_dim':         config.get('prior_hidden_dim', config.get('latent_dim')),
         'prior_mp_layers':          config.get('prior_mp_layers', 10),
         'prior_min_std':            config.get('prior_min_std', 0.1),
+        'prior_cov_rank':           config.get('prior_cov_rank', 0),
         # alpha_prior (single-sample prior reconstruction) is variance-collapsing
         # for spread modeling — default 0. The prior is trained by density
         # matching instead (mc_nll + small analytical-KL anchor).

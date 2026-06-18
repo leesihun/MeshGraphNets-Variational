@@ -1,44 +1,53 @@
-"""Generate the posterior_min_std x alpha_recon sweep configs.
+"""Generate the prior_cov_rank x posterior_min_std sweep configs.
 
-Grid: posterior_min_std in {0.10, 0.20, 0.30, 0.40} x alpha_recon in {25, 50}
-= 8 cells -> config_train1..8, each on a single GPU (0..7) so all 8 run at once
-on the 8-GPU box. For each cell a matching pair of inference configs
-(config_inferN_main.txt / _sec.txt) points at that cell's checkpoint.
+Post-diagnosis (diag_prior_spread.py) the bottleneck is TWO things:
+  1. the diagonal conditional prior loses the correlated (amplitude) latent
+     direction  -> fix: prior_cov_rank > 0 (low-rank covariance components);
+  2. the decoder ceiling was smoothed by a high posterior_min_std noise floor +
+     low alpha_recon  -> fix: lower posterior_min_std, keep alpha_recon high so
+     reconstruction stays sharp (spread comes from Var(mu_q), not sigma_q noise).
 
-Only posterior_min_std and alpha_recon vary; everything else matches the
-config_train2 baseline. Re-run this script to regenerate after editing the grid.
+Grid: prior_cov_rank in {4, 8, 16, 32} x posterior_min_std in {0.05, 0.10}
+= 8 cells -> config_train1..8, single GPU each (0..7), all run concurrently.
+alpha_recon is fixed at 100 (sharp reconstruction = high amplitude ceiling).
+
+For each cell a matching pair of inference configs (config_inferN_main.txt /
+_sec.txt) points at that cell's checkpoint. Re-run after editing the grid.
 """
 import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-PMINS = [0.10, 0.20, 0.30, 0.40]
-ALPHAS = [25, 50]
+RANKS = [4, 8, 16, 32]
+PMINS = [0.05, 0.10]
+ALPHA = 100  # fixed: sharp reconstruction -> high amplitude ceiling
 
-# alpha-major (alpha outer, pmin inner); train2 = primary (p0.20, a25); gpu = 0..7
+# pmin-major (outer), rank inner; gpu = 0..7. train2 (pmin0.05, rank8) = primary.
 cells = []
 n = 1
 gpu = 0
-for alpha in ALPHAS:
-    for pmin in PMINS:
-        cells.append({"n": n, "pmin": pmin, "alpha": alpha, "gpu": gpu})
+for pmin in PMINS:
+    for rank in RANKS:
+        cells.append({"n": n, "pmin": pmin, "rank": rank, "gpu": gpu})
         n += 1
         gpu += 1
 
 
 def suffix(c):
-    return f"p{int(round(c['pmin'] * 100)):03d}_a{c['alpha']:03d}"
+    return f"r{c['rank']:02d}_p{int(round(c['pmin'] * 100)):03d}"
 
 
 def primary_tag(c):
-    return "   [PRIMARY recommendation]" if (c["pmin"] == 0.20 and c["alpha"] == 25) else ""
+    return "   [PRIMARY: sharp ceiling + low-rank prior]" if (
+        c["pmin"] == 0.05 and c["rank"] == 8) else ""
 
 
 TRAIN_TMPL = """% ============================================================
-% SWEEP cell: posterior_min_std={pmin:.2f}, alpha_recon={alpha}{tag}
-% Fix for narrow generated spread. Baseline = config_train2.txt
-% (posterior_min_std=0 -> sigma_q collapse -> narrow prior).
-% Only posterior_min_std and alpha_recon differ from baseline.
+% SWEEP cell: prior_cov_rank={rank}, posterior_min_std={pmin:.2f}, alpha_recon={alpha}{tag}
+% Two-pronged fix for narrow generated spread (see diag_prior_spread.py):
+%   prior_cov_rank>0  -> prior captures the correlated amplitude direction
+%   low posterior_min_std + high alpha_recon -> sharp decoder (high ceiling);
+%   spread comes from Var(mu_q), not sigma_q noise.
 % Single GPU per run; 8 cells fill GPUs 0-7 and run concurrently.
 % ============================================================
 model   MeshGraphNets-V
@@ -101,17 +110,17 @@ bipartite_unpool    True
 % VAE (MMD-InfoVAE)
 use_vae          True
 vae_latent_dim   32
-alpha_recon      {alpha}     # SWEPT (baseline 100); lower = less pressure to memorise
+alpha_recon      {alpha}    # high: sharp reconstruction -> high amplitude ceiling
 lambda_mmd       0.1    # low: z encodes structured spread, not collapsed to N(0,I)
 vae_graph_aware  True   # z encodes only y-residual unexplained by x
 beta_aux         1.0    # anchors z to per-graph [y_mean, y_std]; teaches z to encode spread
-posterior_min_std {pmin:.2f}  # SWEPT (baseline 0): hard floor on sigma_q -> posterior is a real cloud
+posterior_min_std {pmin:.2f}  # SWEPT: low floor -> sharp decoder; spread comes from Var(mu_q)
 
-% Prior - gnn_e2e: joint training, graph-conditional.
-% Density matching only: the alpha_prior recon term is variance-collapsing
-% (it shrinks generated spread toward a point) and must stay 0.
+% Prior - gnn_e2e: joint training, graph-conditional, low-rank covariance.
+% Density matching only: the alpha_prior recon term is variance-collapsing and stays 0.
 prior_type               gnn_e2e
-use_conditional_prior    True    # CRITICAL: persist True so rollout uses the learned prior (setup default False)
+use_conditional_prior    True    # CRITICAL: persist True so rollout uses the learned prior
+prior_cov_rank           {rank}     # SWEPT: low-rank covariance per component (captures correlation)
 alpha_prior_max          0.0     # MUST be 0 for spread modeling
 prior_loss_type          mc_nll  # mixture NLL on fresh posterior samples
 prior_nll_weight         1.0
@@ -124,7 +133,7 @@ prior_min_std            0.1
 prior_temperature        1.0
 """
 
-INFER_TMPL = """% Inference for sweep cell train{n}: posterior_min_std={pmin:.2f}, alpha_recon={alpha}{tag}
+INFER_TMPL = """% Inference for sweep cell train{n}: prior_cov_rank={rank}, posterior_min_std={pmin:.2f}{tag}
 model   MeshGraphNets-V
 mode    inference
 gpu_ids {gpu}
@@ -188,6 +197,7 @@ vae_graph_aware  True
 % Prior - sample z from the learned conditional prior p(z|graph)
 prior_type               gnn_e2e
 use_conditional_prior    True
+prior_cov_rank           {rank}
 alpha_prior_max          0.0
 prior_kl_reg_weight      0.05
 prior_gumbel_temp        1.0
@@ -214,11 +224,12 @@ for c in cells:
     sfx = suffix(c)
     tag = primary_tag(c)
     tpath = os.path.join(HERE, f"config_train{c['n']}.txt")
-    write(tpath, TRAIN_TMPL.format(sfx=sfx, tag=tag, **c))
+    write(tpath, TRAIN_TMPL.format(sfx=sfx, tag=tag, alpha=ALPHA, **c))
     written.append(os.path.basename(tpath))
     for which, ds in INFER_DATASETS.items():
         ipath = os.path.join(HERE, f"config_infer{c['n']}_{which}.txt")
-        write(ipath, INFER_TMPL.format(sfx=sfx, tag=tag, which=which, infer_ds=ds, **c))
+        write(ipath, INFER_TMPL.format(sfx=sfx, tag=tag, alpha=ALPHA, which=which,
+                                       infer_ds=ds, **c))
         written.append(os.path.basename(ipath))
 
 print(f"Wrote {len(written)} files:")
