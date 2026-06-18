@@ -1,4 +1,5 @@
 import math
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -101,11 +102,19 @@ class ConditionalMixturePrior(nn.Module):
         return sample_from_mixture(params, temperature=temperature)
 
 
+def _autocast_disabled_for(tensor):
+    device_type = tensor.device.type
+    if device_type in ('cuda', 'cpu'):
+        return torch.amp.autocast(device_type, enabled=False)
+    return nullcontext()
+
+
 def _lowrank_mvn(mu, log_std, cov_factor):
     """Batched low-rank-plus-diagonal Gaussian: Sigma = L L^T + diag(exp(2*log_std)).
 
-    Done in float32 for numerical stability (the capacitance Cholesky underflows
-    in bfloat16). Batch dims are everything before the last (D) dim of `mu`.
+    Construct and consume this distribution with autocast disabled.
+    LowRankMultivariateNormal uses a capacitance Cholesky internally, and CUDA
+    does not implement Cholesky for bfloat16.
     """
     return torch.distributions.LowRankMultivariateNormal(
         loc=mu.float(),
@@ -113,6 +122,23 @@ def _lowrank_mvn(mu, log_std, cov_factor):
         cov_diag=torch.exp(2.0 * log_std.float()),
         validate_args=False,
     )
+
+
+def _lowrank_log_prob(mu, log_std, cov_factor, value):
+    with _autocast_disabled_for(mu):
+        return _lowrank_mvn(mu, log_std, cov_factor).log_prob(value.float())
+
+
+def _lowrank_sample(mu, log_std, cov_factor, *, temperature=1.0, reparameterized=False):
+    temp = max(float(temperature), 1e-6)
+    with _autocast_disabled_for(mu):
+        mvn = torch.distributions.LowRankMultivariateNormal(
+            loc=mu.float(),
+            cov_factor=cov_factor.float() * math.sqrt(temp),
+            cov_diag=torch.exp(2.0 * log_std.float()) * temp,
+            validate_args=False,
+        )
+        return mvn.rsample() if reparameterized else mvn.sample()
 
 
 def mixture_nll(params, target_z):
@@ -139,8 +165,9 @@ def mixture_nll(params, target_z):
 
     z = target_z.unsqueeze(2)  # [B, num_z, 1, D]
     if cov_factor is not None:
-        mvn = _lowrank_mvn(mu, log_std, cov_factor)        # batch [B, num_z, K]
-        comp_log_prob = mvn.log_prob(z.float())            # [B, num_z, K]
+        comp_log_prob = _lowrank_log_prob(
+            mu, log_std, cov_factor, z,
+        )  # [B, num_z, K]
     else:
         var_term = ((z - mu) / torch.exp(log_std)).pow(2)
         comp_log_prob = -0.5 * (
@@ -231,13 +258,9 @@ def sample_from_mixture(params, temperature=1.0):
     if cov_factor is not None:
         chosen_factor = cov_factor[b_idx, z_idx, component]  # [B, num_z, D, rank]
         # Temperature scales the covariance by `temp` (std by sqrt(temp)).
-        mvn = torch.distributions.LowRankMultivariateNormal(
-            loc=chosen_mu.float(),
-            cov_factor=chosen_factor.float() * math.sqrt(temp),
-            cov_diag=torch.exp(2.0 * chosen_log_std.float()) * temp,
-            validate_args=False,
-        )
-        return mvn.sample().to(chosen_mu.dtype)
+        return _lowrank_sample(
+            chosen_mu, chosen_log_std, chosen_factor, temperature=temp,
+        ).to(chosen_mu.dtype)
 
     chosen_std = torch.exp(chosen_log_std) * math.sqrt(temp)
     return chosen_mu + chosen_std * torch.randn_like(chosen_std)
@@ -285,13 +308,10 @@ def sample_from_mixture_reparam(params, temperature=1.0, hard=False):
     if cov_factor is not None:
         # [B,num_z,K,1,1] * [B,num_z,K,D,rank] → sum over K → [B,num_z,D,rank]
         factor_mixed = (weights[..., None, None] * cov_factor).sum(dim=2)
-        mvn = torch.distributions.LowRankMultivariateNormal(
-            loc=mu_mixed.float(),
-            cov_factor=factor_mixed.float(),
-            cov_diag=torch.exp(2.0 * log_std_mixed.float()),
-            validate_args=False,
-        )
-        return mvn.rsample().to(mu_mixed.dtype)
+        return _lowrank_sample(
+            mu_mixed, log_std_mixed, factor_mixed,
+            temperature=1.0, reparameterized=True,
+        ).to(mu_mixed.dtype)
 
     eps = torch.randn_like(mu_mixed)
     z = mu_mixed + torch.exp(log_std_mixed) * eps
