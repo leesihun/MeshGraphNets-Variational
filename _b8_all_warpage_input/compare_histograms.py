@@ -165,6 +165,9 @@ def main() -> None:
     fig.savefig(out_path, dpi=150)
     print(f"\nSaved figure: {out_path}")
 
+    print(f"\nHIST_STATS  GT  mu={gt_s['mean']:.4e}  sigma={gt_s['std']:.4e}  n={gt_s['n']}")
+    print(f"HIST_STATS  Gen mu={gen_s['mean']:.4e}  sigma={gen_s['std']:.4e}  n={gen_s['n']}")
+
 
 if __name__ == "__main__":
     main()

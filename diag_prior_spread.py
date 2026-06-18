@@ -1,0 +1,217 @@
+"""Diagnostic: is the generated under-dispersion a PRIOR problem (fixable by a
+better prior) or a CEILING problem (encoder/decoder)?
+
+For ONE part type (one GT dataset, e.g. dataset/eval_b8_main.h5) this reports the
+per-object warpage-amplitude spread — the SAME scalar compare_histograms.py uses:
+
+    amplitude = max(z_disp_over_nodes) - min(z_disp_over_nodes)   (final timestep)
+
+aggregated (mean, std) over a population of objects, under three z-sources:
+
+  (a) posterior  z = mu_q          (encoder sees true y)     -> CEILING. should ~ GT.
+  (b) prior      z ~ p(z|graph)    (conditional mixture)     -> what rollout does.
+  (c) fullcov    z ~ N(mean, Sigma) fit to {mu_q}            -> correlated sampler.
+
+Interpretation:
+  (a) ~ GT, (b) << GT, (c) ~ GT   -> diagonal mixture loses the correlated amplitude
+                                     direction  =>  fix = low-rank-covariance prior.
+  (a) ~ GT, (b) << GT, (c) << GT  -> prior under-fits amplitude even with full cov
+                                     (capacity / training), not just correlation.
+  (a) << GT                       -> CEILING problem (encoder/decoder); only THEN do
+                                     alpha_recon / lambda_mmd / decoder matter.
+
+Run on the GPU box (from repo root):
+  python diag_prior_spread.py \
+      --config _b8_all_warpage_input/config_infer2_main.txt \
+      --gt_dataset dataset/eval_b8_main.h5 \
+      --gt_mu 701 --gt_sigma 280 \
+      --n_samples 2000 --max_objects 300
+
+
+
+
+python diag_prior_spread.py --config _b8_all_warpage_input/config_infer2_main.txt \
+    --gt_dataset dataset/eval_b8_main.h5      --gt_mu 701 --gt_sigma 280
+
+python diag_prior_spread.py --config _b8_all_warpage_input/config_infer2_sec.txt \
+    --gt_dataset dataset/eval_b8_secondary.h5 --gt_mu 749 --gt_sigma 360
+
+
+
+
+
+"""
+import argparse
+import os
+
+import numpy as np
+import torch
+from torch_geometric.loader import DataLoader
+
+from general_modules.load_config import load_config
+from general_modules.data_loader import load_data
+from model.MeshGraphNets import MeshGraphNets
+from model.conditional_prior import sample_from_mixture
+from training_profiles.training_loop import _move_graph_to_device
+
+# Output channel order is (x_disp, y_disp, z_disp); z_disp is index 2.
+Z_DISP_OUT_IDX = 2
+
+
+def _amplitude(predicted_norm, delta_mean, delta_std):
+    """max-min of the denormalized z_disp field over nodes (one scalar)."""
+    pred = predicted_norm.detach().float().cpu().numpy()      # [N, output_dim]
+    delta = pred * delta_std + delta_mean                     # denormalize
+    z = delta[:, Z_DISP_OUT_IDX]                              # [N]
+    return float(z.max() - z.min())
+
+
+def _get_batch(graph):
+    batch = getattr(graph, 'batch', None)
+    if batch is None:
+        batch = torch.zeros(graph.x.shape[0], dtype=torch.long, device=graph.x.device)
+    return batch
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--config', required=True, help='Infer config (for model arch + modelpath).')
+    ap.add_argument('--gt_dataset', required=True, help='GT HDF5 with true fields (has y), one part type.')
+    ap.add_argument('--n_samples', type=int, default=2000, help='# z samples for prior/fullcov decode.')
+    ap.add_argument('--max_objects', type=int, default=300, help='# objects for the posterior/mu_q pass.')
+    ap.add_argument('--temperature', type=float, default=1.0, help='prior sampling temperature.')
+    ap.add_argument('--gt_mu', type=float, default=None, help='(optional) GT mean for the verdict line.')
+    ap.add_argument('--gt_sigma', type=float, default=None, help='(optional) GT sigma for the verdict line.')
+    args = ap.parse_args()
+
+    config = load_config(args.config)
+    gpu_ids = config.get('gpu_ids', [0])
+    gpu = gpu_ids[0] if isinstance(gpu_ids, (list, tuple)) else gpu_ids
+    device = torch.device(f'cuda:{gpu}' if torch.cuda.is_available() else 'cpu')
+    print(f"Device: {device}")
+
+    # --- checkpoint: weights + normalization + model_config (mirror rollout) ---
+    ckpt = torch.load(config['modelpath'], map_location=device, weights_only=False)
+    norm = ckpt['normalization']
+    delta_mean = np.asarray(norm['delta_mean'], dtype=np.float64)
+    delta_std = np.asarray(norm['delta_std'], dtype=np.float64)
+    if 'model_config' in ckpt:
+        for k, v in ckpt['model_config'].items():
+            config[k] = v
+
+    # --- dataset (GT fields -> graphs with y), normalized with the CHECKPOINT stats ---
+    config['dataset_dir'] = args.gt_dataset
+    config['augment_geometry'] = False
+    dataset = load_data(config)
+    # Override the dataset's freshly-computed normalization with the checkpoint's,
+    # so the encoder sees exactly training-consistent inputs.
+    dataset.node_mean = np.asarray(norm['node_mean']); dataset.node_std = np.asarray(norm['node_std'])
+    dataset.edge_mean = np.asarray(norm['edge_mean']); dataset.edge_std = np.asarray(norm['edge_std'])
+    dataset.delta_mean = delta_mean.astype(np.float32); dataset.delta_std = delta_std.astype(np.float32)
+    n_obj = len(dataset)
+    print(f"Objects in {args.gt_dataset}: {n_obj}")
+    if getattr(dataset, 'num_timesteps', 1) != 1:
+        print(f"  WARNING: dataset.num_timesteps={dataset.num_timesteps} (expected 1 for static "
+              f"warpage). y is then state_t+1 - state_t, and the amplitude comparison may not "
+              f"match compare_histograms.py. Proceed only if this is the intended setup.")
+    # PyG DataLoader adds .batch and collates the multiscale hierarchy exactly as
+    # validation does — raw dataset[i] would lack .batch and break pooling.
+    loader = DataLoader(dataset, batch_size=1, shuffle=False)
+
+    # --- model ---
+    model = MeshGraphNets(config, str(device)).to(device)
+    if 'ema_state_dict' in ckpt:
+        sd = {k[len('module.'):]: v for k, v in ckpt['ema_state_dict'].items() if k.startswith('module.')}
+        model.load_state_dict(sd); print("Loaded EMA weights")
+    else:
+        model.load_state_dict(ckpt['model_state_dict']); print("Loaded training weights")
+    model.eval()
+
+    vae_encoder = getattr(getattr(model, 'model', None), 'vae_encoder', None)
+    prior = getattr(model, 'prior', None)
+    if vae_encoder is None:
+        raise RuntimeError("No vae_encoder on model — is this a VAE checkpoint?")
+    if prior is None:
+        raise RuntimeError("No conditional prior on model — checkpoint has no learned prior.")
+    graph_aware = bool(getattr(vae_encoder, 'graph_aware', False))
+
+    amp_post, mu_list = [], []
+    ref_graph = None
+
+    # ---------- (a) posterior pass: z = mu_q, collect mu_q ----------
+    n_pass = min(args.max_objects, n_obj)
+    print(f"\n[a] posterior pass over {n_pass} objects ...")
+    with torch.no_grad():
+        for i, graph in enumerate(loader):
+            if i >= n_pass:
+                break
+            graph = _move_graph_to_device(graph, device, config)
+            if ref_graph is None:
+                ref_graph = graph  # reuse one graph for prior/fullcov decode
+            batch = _get_batch(graph)
+            x_in = graph.x if graph_aware else None
+            _, mu_q, _ = vae_encoder(graph.y, graph.edge_index, graph.edge_attr, batch, x=x_in)
+            out = model(graph, add_noise=False, use_posterior=False, fixed_z=mu_q)
+            amp_post.append(_amplitude(out[0], delta_mean, delta_std))
+            mu_list.append(mu_q.squeeze(0).float().cpu().numpy())  # [num_z, D]
+            if (i + 1) % max(1, n_pass // 10) == 0:
+                print(f"  {i + 1}/{n_pass}")
+
+    mus = np.stack(mu_list, axis=0)            # [M, num_z, D]
+    M = mus.shape[0]
+
+    # ---------- (b) prior pass: z ~ p(z|graph) on the reference graph ----------
+    print(f"\n[b] prior pass: {args.n_samples} samples on one reference graph ...")
+    amp_prior = []
+    with torch.no_grad():
+        prior_params = prior(ref_graph)
+        for j in range(args.n_samples):
+            z = sample_from_mixture(prior_params, temperature=args.temperature)
+            out = model(ref_graph, add_noise=False, use_posterior=False, fixed_z=z)
+            amp_prior.append(_amplitude(out[0], delta_mean, delta_std))
+
+    # ---------- (c) fullcov pass: z ~ N(mean, Sigma) fit to {mu_q} ----------
+    print(f"\n[c] fullcov pass: {args.n_samples} samples from full-cov Gaussian over mu_q ...")
+    flat = mus.reshape(M, -1).astype(np.float64)        # [M, num_z*D]
+    mean_v = flat.mean(axis=0)
+    cov = np.cov(flat, rowvar=False)
+    cov = np.atleast_2d(cov) + 1e-4 * np.eye(flat.shape[1])  # ridge for PD
+    try:
+        L = np.linalg.cholesky(cov)
+    except np.linalg.LinAlgError:
+        w, V = np.linalg.eigh(cov)
+        L = V @ np.diag(np.sqrt(np.clip(w, 1e-8, None)))
+    num_z, D = mus.shape[1], mus.shape[2]
+    amp_fullcov = []
+    with torch.no_grad():
+        for j in range(args.n_samples):
+            zf = mean_v + L @ np.random.randn(flat.shape[1])
+            z = torch.from_numpy(zf.reshape(1, num_z, D).astype(np.float32)).to(device)
+            out = model(ref_graph, add_noise=False, use_posterior=False, fixed_z=z)
+            amp_fullcov.append(_amplitude(out[0], delta_mean, delta_std))
+
+    # ---------- report ----------
+    def stats(a):
+        a = np.asarray(a); return a.mean(), a.std()
+
+    print("\n" + "=" * 64)
+    print(f"GT dataset: {args.gt_dataset}")
+    if args.gt_mu is not None and args.gt_sigma is not None:
+        print(f"  GT          mu={args.gt_mu:.3e}  sigma={args.gt_sigma:.3e}")
+    for name, a in [("(a) posterior", amp_post), ("(b) prior    ", amp_prior),
+                    ("(c) fullcov  ", amp_fullcov)]:
+        m, s = stats(a)
+        frac = f"  sigma/GT={s/args.gt_sigma:.2f}" if args.gt_sigma else ""
+        print(f"  {name} mu={m:.3e}  sigma={s:.3e}{frac}  (n={len(a)})")
+    print("=" * 64)
+    print("Read:  (a)~GT & (b)<<GT & (c)~GT  -> diagonal prior loses correlation "
+          "=> low-rank-cov prior.\n"
+          "       (a)~GT & (c)<<GT           -> prior under-fits amplitude "
+          "(capacity/training).\n"
+          "       (a)<<GT                    -> ceiling (encoder/decoder); only then "
+          "alpha/mmd matter.")
+
+
+if __name__ == '__main__':
+    main()
