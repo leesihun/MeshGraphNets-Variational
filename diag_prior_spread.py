@@ -1,41 +1,15 @@
 """Diagnostic: is the generated under-dispersion a PRIOR problem (fixable by a
 better prior) or a CEILING problem (encoder/decoder)?
 
-For ONE part type (one GT dataset, e.g. dataset/eval_b8_main.h5) this reports the
-per-object warpage-amplitude spread — the SAME scalar compare_histograms.py uses:
-
-    amplitude = max(z_disp_over_nodes) - min(z_disp_over_nodes)   (final timestep)
-
-aggregated (mean, std) over a population of objects, under three z-sources:
-
-  (a) posterior  z = mu_q          (encoder sees true y)     -> CEILING. should ~ GT.
-  (b) prior      z ~ p(z|graph)    (conditional mixture)     -> what rollout does.
-  (c) fullcov    z ~ N(mean, Sigma) fit to {mu_q}            -> correlated sampler.
-
-Interpretation:
-  (a) ~ GT, (b) << GT, (c) ~ GT   -> diagonal mixture loses the correlated amplitude
-                                     direction  =>  fix = low-rank-covariance prior.
-  (a) ~ GT, (b) << GT, (c) << GT  -> prior under-fits amplitude even with full cov
-                                     (capacity / training), not just correlation.
-  (a) << GT                       -> CEILING problem (encoder/decoder); only THEN do
-                                     alpha_recon / lambda_mmd / decoder matter.
-
-Run on the GPU box (from repo root):
-  python diag_prior_spread.py \
-      --config _b8_all_warpage_input/config_infer2_main.txt \
-      --gt_dataset dataset/eval_b8_main.h5 \
-      --gt_mu 701 --gt_sigma 280 \
-      --n_samples 2000 --max_objects 300
 
 
 
+python diag_prior_spread.py --config _b8_all_warpage_input/config_infer3_main.txt \
+    --gt_dataset dataset/infer_b8_main.h5 --gt_mu 701 --gt_sigma 280 --prior_only
 
-python diag_prior_spread.py --config _b8_all_warpage_input/config_infer2_main.txt \
-    --gt_dataset dataset/eval_b8_main.h5      --gt_mu 701 --gt_sigma 280
-
-python diag_prior_spread.py --config _b8_all_warpage_input/config_infer2_sec.txt \
-    --gt_dataset dataset/eval_b8_secondary.h5 --gt_mu 749 --gt_sigma 360
-
+# 대조군 (sec는 rollout 0.86과 일치해야 정상)
+python diag_prior_spread.py --config _b8_all_warpage_input/config_infer3_sec.txt \
+    --gt_dataset dataset/infer_b8_secondary.h5 --gt_mu 749 --gt_sigma 360 --prior_only
 
 
 
@@ -83,6 +57,9 @@ def main():
     ap.add_argument('--temperature', type=float, default=1.0, help='prior sampling temperature.')
     ap.add_argument('--gt_mu', type=float, default=None, help='(optional) GT mean for the verdict line.')
     ap.add_argument('--gt_sigma', type=float, default=None, help='(optional) GT sigma for the verdict line.')
+    ap.add_argument('--prior_only', action='store_true',
+                    help='Skip posterior/fullcov/spectrum (which need a real target y); run only '
+                         'the prior passes. Use on initial-condition datasets like infer_b8_*.h5.')
     args = ap.parse_args()
 
     config = load_config(args.config)
@@ -156,11 +133,12 @@ def main():
             if ref_graph is None:
                 ref_graph = graph  # reuse one graph for the 1-graph prior/fullcov decode
             batch = _get_batch(graph)
-            x_in = graph.x if graph_aware else None
-            _, mu_q, _ = vae_encoder(graph.y, graph.edge_index, graph.edge_attr, batch, x=x_in)
-            out = model(graph, add_noise=False, use_posterior=False, fixed_z=mu_q)
-            amp_post.append(_amplitude(out[0], delta_mean, delta_std))
-            mu_list.append(mu_q.squeeze(0).float().cpu().numpy())  # [num_z, D]
+            if not args.prior_only:
+                x_in = graph.x if graph_aware else None
+                _, mu_q, _ = vae_encoder(graph.y, graph.edge_index, graph.edge_attr, batch, x=x_in)
+                out = model(graph, add_noise=False, use_posterior=False, fixed_z=mu_q)
+                amp_post.append(_amplitude(out[0], delta_mean, delta_std))
+                mu_list.append(mu_q.squeeze(0).float().cpu().numpy())  # [num_z, D]
             # prior conditioned on THIS graph (mirrors the rollout: many graphs)
             prior_params_g = prior(graph)
             for _ in range(samples_per_graph):
@@ -170,10 +148,7 @@ def main():
             if (i + 1) % max(1, n_pass // 10) == 0:
                 print(f"  {i + 1}/{n_pass}")
 
-    mus = np.stack(mu_list, axis=0)            # [M, num_z, D]
-    M = mus.shape[0]
-
-    # ---------- (b) prior pass: z ~ p(z|graph) on the reference graph ----------
+    # ---------- (b) prior pass: z ~ p(z|graph) on ONE reference graph ----------
     print(f"\n[b] prior pass: {args.n_samples} samples on one reference graph ...")
     amp_prior = []
     with torch.no_grad():
@@ -183,41 +158,54 @@ def main():
             out = model(ref_graph, add_noise=False, use_posterior=False, fixed_z=z)
             amp_prior.append(_amplitude(out[0], delta_mean, delta_std))
 
-    # ---------- (c) fullcov pass: z ~ N(mean, Sigma) fit to {mu_q} ----------
-    print(f"\n[c] fullcov pass: {args.n_samples} samples from full-cov Gaussian over mu_q ...")
-    flat = mus.reshape(M, -1).astype(np.float64)        # [M, num_z*D]
-    mean_v = flat.mean(axis=0)
-    cov_raw = np.atleast_2d(np.cov(flat, rowvar=False))
-
-    # Eigen-spectrum of the mu_q covariance: how many latent directions carry the
-    # spread. This sizes prior_cov_rank for the low-rank-covariance prior.
-    evals = np.clip(np.sort(np.linalg.eigvalsh(cov_raw))[::-1], 0, None)
-    cum = np.cumsum(evals) / max(evals.sum(), 1e-12)
-    rank_for = lambda frac: int(np.searchsorted(cum, frac) + 1)
-    print(f"\n[spectrum] mu_q covariance ({flat.shape[1]} dims) "
-          f"top eigvals = {np.array2string(evals[:8], precision=3)}")
-    print(f"[spectrum] directions for 90 / 95 / 99% variance: "
-          f"{rank_for(0.90)} / {rank_for(0.95)} / {rank_for(0.99)}  "
-          f"=> suggested prior_cov_rank ~ {rank_for(0.95)}")
-
-    cov = cov_raw + 1e-4 * np.eye(flat.shape[1])  # ridge for PD sampling
-    try:
-        L = np.linalg.cholesky(cov)
-    except np.linalg.LinAlgError:
-        w, V = np.linalg.eigh(cov)
-        L = V @ np.diag(np.sqrt(np.clip(w, 1e-8, None)))
-    num_z, D = mus.shape[1], mus.shape[2]
+    # ---------- (c) fullcov pass + spectrum (need mu_q; skipped in --prior_only) ----------
     amp_fullcov = []
-    with torch.no_grad():
-        for j in range(args.n_samples):
-            zf = mean_v + L @ np.random.randn(flat.shape[1])
-            z = torch.from_numpy(zf.reshape(1, num_z, D).astype(np.float32)).to(device)
-            out = model(ref_graph, add_noise=False, use_posterior=False, fixed_z=z)
-            amp_fullcov.append(_amplitude(out[0], delta_mean, delta_std))
+    if not args.prior_only and mu_list:
+        try:
+            mus = np.stack(mu_list, axis=0)                  # [M, num_z, D]
+            M, num_z, D = mus.shape
+            flat = mus.reshape(M, -1).astype(np.float64)     # [M, num_z*D]
+            if not np.all(np.isfinite(flat)):
+                raise np.linalg.LinAlgError("mu_q contains NaN/Inf")
+            mean_v = flat.mean(axis=0)
+            cov_raw = np.atleast_2d(np.cov(flat, rowvar=False))
+
+            # Eigen-spectrum of the mu_q covariance: how many latent directions
+            # carry the spread. This sizes prior_cov_rank.
+            evals = np.clip(np.sort(np.linalg.eigvalsh(cov_raw))[::-1], 0, None)
+            cum = np.cumsum(evals) / max(evals.sum(), 1e-12)
+            rank_for = lambda frac: int(np.searchsorted(cum, frac) + 1)
+            print(f"\n[spectrum] mu_q covariance ({flat.shape[1]} dims) "
+                  f"top eigvals = {np.array2string(evals[:8], precision=3)}")
+            print(f"[spectrum] directions for 90 / 95 / 99% variance: "
+                  f"{rank_for(0.90)} / {rank_for(0.95)} / {rank_for(0.99)}  "
+                  f"=> suggested prior_cov_rank ~ {rank_for(0.95)}")
+
+            print(f"\n[c] fullcov pass: {args.n_samples} samples from full-cov Gaussian over mu_q ...")
+            cov = cov_raw + 1e-4 * np.eye(flat.shape[1])     # ridge for PD sampling
+            try:
+                L = np.linalg.cholesky(cov)
+            except np.linalg.LinAlgError:
+                w, V = np.linalg.eigh(cov)
+                L = V @ np.diag(np.sqrt(np.clip(w, 1e-8, None)))
+            with torch.no_grad():
+                for j in range(args.n_samples):
+                    zf = mean_v + L @ np.random.randn(flat.shape[1])
+                    z = torch.from_numpy(zf.reshape(1, num_z, D).astype(np.float32)).to(device)
+                    out = model(ref_graph, add_noise=False, use_posterior=False, fixed_z=z)
+                    amp_fullcov.append(_amplitude(out[0], delta_mean, delta_std))
+        except (np.linalg.LinAlgError, ValueError) as e:
+            print(f"\n[c/spectrum] SKIPPED: {e}\n  (mu_q degenerate/non-finite — expected on "
+                  f"initial-condition datasets without real targets; (b*) prior is still valid.)")
+            amp_fullcov = []
 
     # ---------- report ----------
     def stats(a):
-        a = np.asarray(a); return a.mean(), a.std()
+        a = np.asarray(a, dtype=np.float64)
+        a = a[np.isfinite(a)]               # drop NaN/Inf decodes
+        if a.size == 0:
+            return float('nan'), float('nan'), 0
+        return a.mean(), a.std(), a.size
 
     print("\n" + "=" * 64)
     print(f"GT dataset: {args.gt_dataset}")
@@ -227,9 +215,12 @@ def main():
                     ("(b*) prior  Ngraphs", amp_prior_multi),
                     ("(b)  prior  1graph ", amp_prior),
                     ("(c)  fullcov 1graph", amp_fullcov)]:
-        m, s = stats(a)
-        frac = f"  sigma/GT={s/args.gt_sigma:.2f}" if args.gt_sigma else ""
-        print(f"  {name} mu={m:.3e}  sigma={s:.3e}{frac}  (n={len(a)})")
+        if len(a) == 0:
+            continue
+        m, s, nfin = stats(a)
+        frac = (f"  sigma/GT={s / args.gt_sigma:.2f}"
+                if args.gt_sigma and np.isfinite(s) else "")
+        print(f"  {name} mu={m:.3e}  sigma={s:.3e}{frac}  (n={nfin})")
     print("=" * 64)
     print("Read:  (b*) is the apples-to-apples match to the rollout histogram.\n"
           "       (b*)<<(b)  -> prior COLLAPSES per-graph; the 1-graph (b) was a\n"
