@@ -1,16 +1,16 @@
 % ============================================================
-% SWEEP cell: prior_cov_rank=32, posterior_min_std=0.10, alpha_recon=100
-% Two-pronged fix for narrow generated spread (see diag_prior_spread.py):
-%   prior_cov_rank>0  -> prior captures the correlated amplitude direction
-%   low posterior_min_std + high alpha_recon + MSE loss -> sharp decoder (high
-%   ceiling, extremes not smoothed); spread comes from Var(mu_q), not sigma_q noise.
-% Single GPU per run; 8 cells fill GPUs 0-7 and run concurrently.
+% SWEEP cell: multiscale_levels=4, mp_per_level=[2, 3, 3, 4, 6, 4, 3, 3, 2] (sum=30), voronoi=1000, 250, 60, 16
+% Decoder-ceiling probe (amplitude peaks are smoothed; (a) posterior ~0.74).
+% Total MP budget held ~30; vary how it splits across scales (L) and how
+% aggressively pooling discards fine detail (voronoi_clusters).
+% Latent side held fixed (cov_rank=8, pmin=0.05, alpha_recon=100, mse).
+% Single GPU per run; 8 cells fill GPUs 0-7.
 % ============================================================
 model   MeshGraphNets-V
 mode    train
 gpu_ids 7
-log_file_dir    b8_all/train8_r32_p010.log
-modelpath       ./outputs/b8_all/warpage_train8_r32_p010.pth
+log_file_dir    b8_all/train8_L4_vc1000.log
+modelpath       ./outputs/b8_all/warpage_train8_L4_vc1000.pth
 
 % Datasets
 dataset_dir     ./dataset/b8_main_sec_dataset_traincopy.h5
@@ -55,12 +55,12 @@ use_world_edges False
 test_batch_idx   0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 33, 34
 plot_feature_idx -1
 
-% Multiscale (2-level Voronoi V-cycle)
+% Multiscale (Voronoi V-cycle) -- SWEPT: L levels + voronoi resolution
 use_multiscale      True
-coarsening_type     voronoi_seedmean
-voronoi_clusters    2000, 500
-multiscale_levels   2
-mp_per_level        4, 8, 12, 8, 4
+coarsening_type     voronoi_seedmean, voronoi_seedmean, voronoi_seedmean, voronoi_seedmean
+voronoi_clusters    1000, 250, 60, 16
+multiscale_levels   4
+mp_per_level        2, 3, 3, 4, 6, 4, 3, 3, 2
 bipartite_unpool    True
 
 % VAE (MMD-InfoVAE)
@@ -71,13 +71,12 @@ alpha_recon      100    # high: sharp reconstruction -> high amplitude ceiling
 lambda_mmd       0.1    # low: z encodes structured spread, not collapsed to N(0,I)
 vae_graph_aware  True   # z encodes only y-residual unexplained by x
 beta_aux         1.0    # anchors z to per-graph [y_mean, y_std]; teaches z to encode spread
-posterior_min_std 0.10  # SWEPT: low floor -> sharp decoder; spread comes from Var(mu_q)
+posterior_min_std 0.05  # low floor -> sharp decoder; spread comes from Var(mu_q)
 
 % Prior - gnn_e2e: joint training, graph-conditional, low-rank covariance.
-% Density matching only: the alpha_prior recon term is variance-collapsing and stays 0.
 prior_type               gnn_e2e
 use_conditional_prior    True    # CRITICAL: persist True so rollout uses the learned prior
-prior_cov_rank           32     # SWEPT: low-rank covariance per component (captures correlation)
+prior_cov_rank           8       # low-rank covariance per component (captures correlation)
 alpha_prior_max          0.0     # MUST be 0 for spread modeling
 prior_loss_type          mc_nll  # mixture NLL on fresh posterior samples
 prior_nll_weight         1.0

@@ -1,9 +1,9 @@
-% Inference for sweep cell train6: prior_cov_rank=8, posterior_min_std=0.10
+% Inference for sweep cell train6: multiscale_levels=4, voronoi=2000, 500, 125, 32
 model   MeshGraphNets-V
 mode    inference
 gpu_ids 5
 log_file_dir         b8_all/infer_train6_main.log
-modelpath            ./outputs/b8_all/warpage_train6_r08_p010.pth
+modelpath            ./outputs/b8_all/warpage_train6_L4_vc2000.pth
 inference_output_dir outputs/b8_all/infer_train6_main
 
 % Datasets
@@ -44,17 +44,18 @@ use_world_edges False
 test_batch_idx   0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 33, 34
 plot_feature_idx -1
 
-% Multiscale - MUST match training coarsening mode (voronoi_seedmean)
+% Multiscale - MUST match training (L levels + voronoi resolution + seedmean)
 use_multiscale      True
-coarsening_type     voronoi_seedmean
-voronoi_clusters    2000, 500
-multiscale_levels   2
-mp_per_level        4, 8, 12, 8, 4
+coarsening_type     voronoi_seedmean, voronoi_seedmean, voronoi_seedmean, voronoi_seedmean
+voronoi_clusters    2000, 500, 125, 32
+multiscale_levels   4
+mp_per_level        2, 3, 3, 4, 6, 4, 3, 3, 2
 bipartite_unpool    True
 
 % VAE (MMD-InfoVAE)
 use_vae          True
 vae_latent_dim   32
+recon_loss       mse
 alpha_recon      100
 lambda_mmd       0.1
 vae_graph_aware  True

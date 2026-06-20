@@ -1,54 +1,55 @@
-"""Generate the prior_cov_rank x posterior_min_std sweep configs.
+"""Generate the multiscale-levels x voronoi-resolution sweep configs.
 
-Post-diagnosis (diag_prior_spread.py) the bottleneck is TWO things:
-  1. the diagonal conditional prior loses the correlated (amplitude) latent
-     direction  -> fix: prior_cov_rank > 0 (low-rank covariance components);
-  2. the decoder ceiling was smoothed by a high posterior_min_std noise floor +
-     low alpha_recon  -> fix: lower posterior_min_std, keep alpha_recon high so
-     reconstruction stays sharp (spread comes from Var(mu_q), not sigma_q noise).
+Diagnosis: the amplitude ceiling (decode(mu_q) ~ 0.74 of GT) is a DECODER problem
+— per-node recon is good but peaks are smoothed. Latent knobs (beta_aux,
+lambda_mmd, cov_rank, std_noise) are downstream and don't move it; the prior
+already saturates the ceiling. So this sweep probes the DECODER's structural
+smoothing, holding the total message-passing budget ~constant (~30) while varying:
+  - multiscale_levels L in {2, 3, 4}  (how the budget is split across scales)
+  - voronoi_clusters                  (how aggressively pooling discards fine
+                                       detail where peaks live)
+This isolates over-smoothing vs pooling-detail-loss vs capacity without changing
+the loss. Everything else is held at the best known values.
 
-Grid: prior_cov_rank in {4, 8, 16, 32} x posterior_min_std in {0.05, 0.10}
-= 8 cells -> config_train1..8, single GPU each (0..7), all run concurrently.
-alpha_recon is fixed at 100 (sharp reconstruction = high amplitude ceiling).
-
-For each cell a matching pair of inference configs (config_inferN_main.txt /
-_sec.txt) points at that cell's checkpoint. Re-run after editing the grid.
+8 cells -> config_train1..8, single GPU each (0..7). Re-run after editing cells.
 """
 import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-RANKS = [4, 8, 16, 32]
-PMINS = [0.05, 0.10]
-ALPHA = 100  # fixed: sharp reconstruction -> high amplitude ceiling
+# n, gpu, L, mp_per_level (sum ~30, symmetric V-cycle of length 2L+1), voronoi_clusters (L)
+cells = [
+    dict(n=1, gpu=0, L=2, mp=[4, 6, 10, 6, 4],              vc=[2000, 500]),
+    dict(n=2, gpu=1, L=2, mp=[4, 6, 10, 6, 4],              vc=[4000, 1000]),
+    dict(n=3, gpu=2, L=3, mp=[3, 4, 5, 6, 5, 4, 3],         vc=[2000, 500, 125]),
+    dict(n=4, gpu=3, L=3, mp=[3, 4, 5, 6, 5, 4, 3],         vc=[4000, 1000, 250]),
+    dict(n=5, gpu=4, L=3, mp=[3, 4, 5, 6, 5, 4, 3],         vc=[1000, 250, 60]),
+    dict(n=6, gpu=5, L=4, mp=[2, 3, 3, 4, 6, 4, 3, 3, 2],   vc=[2000, 500, 125, 32]),
+    dict(n=7, gpu=6, L=4, mp=[2, 3, 3, 4, 6, 4, 3, 3, 2],   vc=[4000, 1000, 250, 64]),
+    dict(n=8, gpu=7, L=4, mp=[2, 3, 3, 4, 6, 4, 3, 3, 2],   vc=[1000, 250, 60, 16]),
+]
 
-# pmin-major (outer), rank inner; gpu = 0..7. train2 (pmin0.05, rank8) = primary.
-cells = []
-n = 1
-gpu = 0
-for pmin in PMINS:
-    for rank in RANKS:
-        cells.append({"n": n, "pmin": pmin, "rank": rank, "gpu": gpu})
-        n += 1
-        gpu += 1
+# sanity: mp_per_level length must be 2L+1 and sum ~30
+for c in cells:
+    assert len(c["mp"]) == 2 * c["L"] + 1, (c["n"], len(c["mp"]), c["L"])
+    assert len(c["vc"]) == c["L"], (c["n"], len(c["vc"]), c["L"])
 
 
 def suffix(c):
-    return f"r{c['rank']:02d}_p{int(round(c['pmin'] * 100)):03d}"
+    return f"L{c['L']}_vc{c['vc'][0]}"
 
 
-def primary_tag(c):
-    return "   [PRIMARY: sharp ceiling + low-rank prior]" if (
-        c["pmin"] == 0.05 and c["rank"] == 8) else ""
+def csv(xs):
+    return ", ".join(str(x) for x in xs)
 
 
 TRAIN_TMPL = """% ============================================================
-% SWEEP cell: prior_cov_rank={rank}, posterior_min_std={pmin:.2f}, alpha_recon={alpha}{tag}
-% Two-pronged fix for narrow generated spread (see diag_prior_spread.py):
-%   prior_cov_rank>0  -> prior captures the correlated amplitude direction
-%   low posterior_min_std + high alpha_recon + MSE loss -> sharp decoder (high
-%   ceiling, extremes not smoothed); spread comes from Var(mu_q), not sigma_q noise.
-% Single GPU per run; 8 cells fill GPUs 0-7 and run concurrently.
+% SWEEP cell: multiscale_levels={L}, mp_per_level=[{mp}] (sum={mpsum}), voronoi={vc}
+% Decoder-ceiling probe (amplitude peaks are smoothed; (a) posterior ~0.74).
+% Total MP budget held ~30; vary how it splits across scales (L) and how
+% aggressively pooling discards fine detail (voronoi_clusters).
+% Latent side held fixed (cov_rank=8, pmin=0.05, alpha_recon=100, mse).
+% Single GPU per run; 8 cells fill GPUs 0-7.
 % ============================================================
 model   MeshGraphNets-V
 mode    train
@@ -99,29 +100,28 @@ use_world_edges False
 test_batch_idx   0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 33, 34
 plot_feature_idx -1
 
-% Multiscale (2-level Voronoi V-cycle)
+% Multiscale (Voronoi V-cycle) -- SWEPT: L levels + voronoi resolution
 use_multiscale      True
-coarsening_type     voronoi_seedmean
-voronoi_clusters    2000, 500
-multiscale_levels   2
-mp_per_level        4, 8, 12, 8, 4
+coarsening_type     {ctype}
+voronoi_clusters    {vc}
+multiscale_levels   {L}
+mp_per_level        {mp}
 bipartite_unpool    True
 
 % VAE (MMD-InfoVAE)
 use_vae          True
 vae_latent_dim   32
 recon_loss       mse    # MSE penalizes extreme-node errors -> sharper amplitude (vs Huber)
-alpha_recon      {alpha}    # high: sharp reconstruction -> high amplitude ceiling
+alpha_recon      100    # high: sharp reconstruction -> high amplitude ceiling
 lambda_mmd       0.1    # low: z encodes structured spread, not collapsed to N(0,I)
 vae_graph_aware  True   # z encodes only y-residual unexplained by x
 beta_aux         1.0    # anchors z to per-graph [y_mean, y_std]; teaches z to encode spread
-posterior_min_std {pmin:.2f}  # SWEPT: low floor -> sharp decoder; spread comes from Var(mu_q)
+posterior_min_std 0.05  # low floor -> sharp decoder; spread comes from Var(mu_q)
 
 % Prior - gnn_e2e: joint training, graph-conditional, low-rank covariance.
-% Density matching only: the alpha_prior recon term is variance-collapsing and stays 0.
 prior_type               gnn_e2e
 use_conditional_prior    True    # CRITICAL: persist True so rollout uses the learned prior
-prior_cov_rank           {rank}     # SWEPT: low-rank covariance per component (captures correlation)
+prior_cov_rank           8       # low-rank covariance per component (captures correlation)
 alpha_prior_max          0.0     # MUST be 0 for spread modeling
 prior_loss_type          mc_nll  # mixture NLL on fresh posterior samples
 prior_nll_weight         1.0
@@ -134,7 +134,7 @@ prior_min_std            0.1
 prior_temperature        1.0
 """
 
-INFER_TMPL = """% Inference for sweep cell train{n}: prior_cov_rank={rank}, posterior_min_std={pmin:.2f}{tag}
+INFER_TMPL = """% Inference for sweep cell train{n}: multiscale_levels={L}, voronoi={vc}
 model   MeshGraphNets-V
 mode    inference
 gpu_ids {gpu}
@@ -180,25 +180,26 @@ use_world_edges False
 test_batch_idx   0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 33, 34
 plot_feature_idx -1
 
-% Multiscale - MUST match training coarsening mode (voronoi_seedmean)
+% Multiscale - MUST match training (L levels + voronoi resolution + seedmean)
 use_multiscale      True
-coarsening_type     voronoi_seedmean
-voronoi_clusters    2000, 500
-multiscale_levels   2
-mp_per_level        4, 8, 12, 8, 4
+coarsening_type     {ctype}
+voronoi_clusters    {vc}
+multiscale_levels   {L}
+mp_per_level        {mp}
 bipartite_unpool    True
 
 % VAE (MMD-InfoVAE)
 use_vae          True
 vae_latent_dim   32
-alpha_recon      {alpha}
+recon_loss       mse
+alpha_recon      100
 lambda_mmd       0.1
 vae_graph_aware  True
 
 % Prior - sample z from the learned conditional prior p(z|graph)
 prior_type               gnn_e2e
 use_conditional_prior    True
-prior_cov_rank           {rank}
+prior_cov_rank           8
 alpha_prior_max          0.0
 prior_kl_reg_weight      0.05
 prior_gumbel_temp        1.0
@@ -223,14 +224,15 @@ def write(path, text):
 written = []
 for c in cells:
     sfx = suffix(c)
-    tag = primary_tag(c)
+    ctype = csv(["voronoi_seedmean"] * c["L"])   # explicit per-level (length L)
+    fields = dict(n=c["n"], gpu=c["gpu"], L=c["L"], sfx=sfx,
+                  mp=csv(c["mp"]), mpsum=sum(c["mp"]), vc=csv(c["vc"]), ctype=ctype)
     tpath = os.path.join(HERE, f"config_train{c['n']}.txt")
-    write(tpath, TRAIN_TMPL.format(sfx=sfx, tag=tag, alpha=ALPHA, **c))
+    write(tpath, TRAIN_TMPL.format(**fields))
     written.append(os.path.basename(tpath))
     for which, ds in INFER_DATASETS.items():
         ipath = os.path.join(HERE, f"config_infer{c['n']}_{which}.txt")
-        write(ipath, INFER_TMPL.format(sfx=sfx, tag=tag, alpha=ALPHA, which=which,
-                                       infer_ds=ds, **c))
+        write(ipath, INFER_TMPL.format(which=which, infer_ds=ds, **fields))
         written.append(os.path.basename(ipath))
 
 print(f"Wrote {len(written)} files:")
