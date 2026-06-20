@@ -136,25 +136,37 @@ def main():
         raise RuntimeError("No conditional prior on model — checkpoint has no learned prior.")
     graph_aware = bool(getattr(vae_encoder, 'graph_aware', False))
 
-    amp_post, mu_list = [], []
+    amp_post, mu_list, amp_prior_multi = [], [], []
     ref_graph = None
 
-    # ---------- (a) posterior pass: z = mu_q, collect mu_q ----------
+    # ---------- (a) posterior + (b*) multi-graph prior, in one pass ----------
+    # (a)  z = mu_q on each graph (ceiling, collects mu_q)
+    # (b*) z ~ p(z|graph) drawn on EACH graph (many graphs x samples) — the
+    #      apples-to-apples match to the rollout histogram. The single-graph (b)
+    #      below can be unrepresentative if the prior collapses per-graph.
     n_pass = min(args.max_objects, n_obj)
-    print(f"\n[a] posterior pass over {n_pass} objects ...")
+    samples_per_graph = max(1, args.n_samples // n_pass)
+    print(f"\n[a] posterior + [b*] multi-graph prior over {n_pass} objects "
+          f"({samples_per_graph} prior draw(s)/graph) ...")
     with torch.no_grad():
         for i, graph in enumerate(loader):
             if i >= n_pass:
                 break
             graph = _move_graph_to_device(graph, device, config)
             if ref_graph is None:
-                ref_graph = graph  # reuse one graph for prior/fullcov decode
+                ref_graph = graph  # reuse one graph for the 1-graph prior/fullcov decode
             batch = _get_batch(graph)
             x_in = graph.x if graph_aware else None
             _, mu_q, _ = vae_encoder(graph.y, graph.edge_index, graph.edge_attr, batch, x=x_in)
             out = model(graph, add_noise=False, use_posterior=False, fixed_z=mu_q)
             amp_post.append(_amplitude(out[0], delta_mean, delta_std))
             mu_list.append(mu_q.squeeze(0).float().cpu().numpy())  # [num_z, D]
+            # prior conditioned on THIS graph (mirrors the rollout: many graphs)
+            prior_params_g = prior(graph)
+            for _ in range(samples_per_graph):
+                zp = sample_from_mixture(prior_params_g, temperature=args.temperature)
+                outp = model(graph, add_noise=False, use_posterior=False, fixed_z=zp)
+                amp_prior_multi.append(_amplitude(outp[0], delta_mean, delta_std))
             if (i + 1) % max(1, n_pass // 10) == 0:
                 print(f"  {i + 1}/{n_pass}")
 
@@ -211,18 +223,19 @@ def main():
     print(f"GT dataset: {args.gt_dataset}")
     if args.gt_mu is not None and args.gt_sigma is not None:
         print(f"  GT          mu={args.gt_mu:.3e}  sigma={args.gt_sigma:.3e}")
-    for name, a in [("(a) posterior", amp_post), ("(b) prior    ", amp_prior),
-                    ("(c) fullcov  ", amp_fullcov)]:
+    for name, a in [("(a)  posterior     ", amp_post),
+                    ("(b*) prior  Ngraphs", amp_prior_multi),
+                    ("(b)  prior  1graph ", amp_prior),
+                    ("(c)  fullcov 1graph", amp_fullcov)]:
         m, s = stats(a)
         frac = f"  sigma/GT={s/args.gt_sigma:.2f}" if args.gt_sigma else ""
         print(f"  {name} mu={m:.3e}  sigma={s:.3e}{frac}  (n={len(a)})")
     print("=" * 64)
-    print("Read:  (a)~GT & (b)<<GT & (c)~GT  -> diagonal prior loses correlation "
-          "=> low-rank-cov prior.\n"
-          "       (a)~GT & (c)<<GT           -> prior under-fits amplitude "
-          "(capacity/training).\n"
-          "       (a)<<GT                    -> ceiling (encoder/decoder); only then "
-          "alpha/mmd matter.")
+    print("Read:  (b*) is the apples-to-apples match to the rollout histogram.\n"
+          "       (b*)<<(b)  -> prior COLLAPSES per-graph; the 1-graph (b) was a\n"
+          "                     lucky non-collapsed graph. Fix the prior, not the decoder.\n"
+          "       (b*)~(b)~GT but rollout<<  -> the infer dataset graphs differ from eval.\n"
+          "       (a)<<GT    -> ceiling (encoder/decoder); only then alpha/mmd/loss matter.")
 
 
 if __name__ == '__main__':

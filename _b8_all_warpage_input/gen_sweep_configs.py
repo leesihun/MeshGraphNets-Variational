@@ -46,8 +46,8 @@ TRAIN_TMPL = """% ============================================================
 % SWEEP cell: prior_cov_rank={rank}, posterior_min_std={pmin:.2f}, alpha_recon={alpha}{tag}
 % Two-pronged fix for narrow generated spread (see diag_prior_spread.py):
 %   prior_cov_rank>0  -> prior captures the correlated amplitude direction
-%   low posterior_min_std + high alpha_recon -> sharp decoder (high ceiling);
-%   spread comes from Var(mu_q), not sigma_q noise.
+%   low posterior_min_std + high alpha_recon + MSE loss -> sharp decoder (high
+%   ceiling, extremes not smoothed); spread comes from Var(mu_q), not sigma_q noise.
 % Single GPU per run; 8 cells fill GPUs 0-7 and run concurrently.
 % ============================================================
 model   MeshGraphNets-V
@@ -110,6 +110,7 @@ bipartite_unpool    True
 % VAE (MMD-InfoVAE)
 use_vae          True
 vae_latent_dim   32
+recon_loss       mse    # MSE penalizes extreme-node errors -> sharper amplitude (vs Huber)
 alpha_recon      {alpha}    # high: sharp reconstruction -> high amplitude ceiling
 lambda_mmd       0.1    # low: z encodes structured spread, not collapsed to N(0,I)
 vae_graph_aware  True   # z encodes only y-residual unexplained by x

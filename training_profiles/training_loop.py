@@ -110,6 +110,16 @@ def _loss_from_errors(errors, loss_weights):
     return loss_sum / loss_count, loss_sum.item(), loss_count
 
 
+def _recon_errors(predicted, target, recon_loss='huber'):
+    """Element-wise reconstruction errors. 'mse' (squared error) penalizes large,
+    extreme-node errors far more than Huber(delta=1), which caps them — important
+    for reproducing the warpage amplitude (peak-to-valley), an extreme-value
+    statistic Huber systematically smooths. Default 'huber' keeps old behavior."""
+    if str(recon_loss).lower().strip() == 'mse':
+        return (predicted - target).pow(2)
+    return torch.nn.functional.huber_loss(predicted, target, reduction='none', delta=1.0)
+
+
 def _move_graph_to_device(graph, device, config):
     non_blocking = bool(config.get('_pin_memory', False)) and getattr(device, 'type', None) == 'cuda'
     return graph.to(device, non_blocking=non_blocking)
@@ -302,17 +312,17 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
             det_loss_val = predicted_acc.new_zeros(())
             if use_vae and lambda_det > 0.0:
                 predicted_det, _, _, _, _ = model(graph, add_noise=False, use_zero_z=True)
-                errors_det = torch.nn.functional.huber_loss(
-                    predicted_det, target_acc, reduction='none', delta=1.0)
+                errors_det = _recon_errors(
+                    predicted_det, target_acc, config.get('recon_loss', 'huber'))
                 det_loss_val, _, _ = _loss_from_errors(errors_det, loss_weights)
 
             # Legacy prior-path reconstruction (only when explicitly enabled via
             # alpha_prior_max > 0 — see the warning above).
             recon_prior_val = predicted_acc.new_zeros(())
             if prior_outputs is not None and prior_outputs.get('predicted_prior') is not None:
-                errors_prior = torch.nn.functional.huber_loss(
+                errors_prior = _recon_errors(
                     prior_outputs['predicted_prior'], target_acc,
-                    reduction='none', delta=1.0,
+                    config.get('recon_loss', 'huber'),
                 )
                 recon_prior_val, _, _ = _loss_from_errors(errors_prior, loss_weights)
 
@@ -359,7 +369,7 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
                     log_dir = config.get('log_dir', '.')
                     save_debug_batch(epoch, batch_idx, graph, predicted_acc, target_acc, log_dir)
 
-            errors = torch.nn.functional.huber_loss(predicted_acc, target_acc, reduction='none', delta=1.0)
+            errors = _recon_errors(predicted_acc, target_acc, config.get('recon_loss', 'huber'))
             recon_loss, batch_loss_sum, batch_loss_count = _loss_from_errors(errors, loss_weights)
             if use_vae:
                 loss = alpha_recon * recon_loss + lambda_mmd * mmd_loss_val + beta_aux * aux_loss_val
@@ -508,16 +518,14 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
             result['alpha_prior']      = alpha_prior_now
     return result
 
-def _eval_forward_errors(model, graph, use_amp, amp_dtype, use_posterior):
+def _eval_forward_errors(model, graph, use_amp, amp_dtype, use_posterior, recon_loss='huber'):
     with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
         predicted, target, vae_losses, _, _ = model(
             graph,
             add_noise=False,
             use_posterior=use_posterior,
         )
-        errors = torch.nn.functional.huber_loss(
-            predicted, target, reduction='none', delta=1.0
-        )
+        errors = _recon_errors(predicted, target, recon_loss)
     mmd_loss_val = vae_losses['mmd'] if isinstance(vae_losses, dict) else vae_losses
     return errors, mmd_loss_val
 
@@ -565,7 +573,8 @@ def _evaluate_epoch(model, dataloader, device, config, epoch=0, *,
                 errors_sum = None
                 for _ in range(num_prior_samples):
                     sample_errors, _ = _eval_forward_errors(
-                        model, graph, use_amp, amp_dtype, use_posterior=False
+                        model, graph, use_amp, amp_dtype, use_posterior=False,
+                        recon_loss=config.get('recon_loss', 'huber'),
                     )
                     if errors_sum is None:
                         errors_sum = sample_errors
@@ -575,7 +584,8 @@ def _evaluate_epoch(model, dataloader, device, config, epoch=0, *,
                 mmd_loss_val = errors.new_zeros(())
             else:
                 errors, mmd_loss_val = _eval_forward_errors(
-                    model, graph, use_amp, amp_dtype, use_posterior=use_posterior
+                    model, graph, use_amp, amp_dtype, use_posterior=use_posterior,
+                    recon_loss=config.get('recon_loss', 'huber'),
                 )
 
             recon_loss, batch_loss_sum, batch_loss_count = _loss_from_errors(errors, loss_weights)
@@ -720,8 +730,8 @@ def evaluate_vae_learned_prior_epoch(model, dataloader, device, config, epoch=0,
                 predicted, target, _, _, _ = model(
                     graph, add_noise=False, use_posterior=False, fixed_z=z_prior,
                 )
-                errors = torch.nn.functional.huber_loss(
-                    predicted, target, reduction='none', delta=1.0,
+                errors = _recon_errors(
+                    predicted, target, config.get('recon_loss', 'huber'),
                 )
 
                 # Posterior cloud sample (encoder sees the true target y).
@@ -841,7 +851,7 @@ def test_model(model, dataloader, device, config, epoch, dataset=None, output_pr
             graph = _move_graph_to_device(graph, device, config)
             with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
                 predicted, target, _, _, _ = model(graph, use_posterior=True)
-                errors = torch.nn.functional.huber_loss(predicted, target, reduction='none', delta=1.0)
+                errors = _recon_errors(predicted, target, config.get('recon_loss', 'huber'))
                 loss, batch_loss_sum, batch_loss_count = _loss_from_errors(errors, loss_weights)
 
             # Accumulate per-feature losses
