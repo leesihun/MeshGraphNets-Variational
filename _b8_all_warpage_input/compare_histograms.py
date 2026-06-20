@@ -71,14 +71,72 @@ def _rollout_spreads(rollout_dir: str) -> np.ndarray:
     return spreads
 
 
+def _skew(x: np.ndarray) -> float:
+    m, s = x.mean(), x.std()
+    return float(((x - m) ** 3).mean() / (s ** 3 + 1e-12))
+
+
+def _kurtosis(x: np.ndarray) -> float:
+    """Excess kurtosis (0 = Gaussian; >0 = heavy tails / more outliers)."""
+    m, s = x.mean(), x.std()
+    return float(((x - m) ** 4).mean() / (s ** 4 + 1e-12) - 3.0)
+
+
 def _stats(col: np.ndarray) -> dict:
+    col = np.asarray(col, dtype=np.float64)
+    p1, p5, p50, p95, p99 = np.quantile(col, [0.01, 0.05, 0.50, 0.95, 0.99])
     return {
-        "mean": float(col.mean()),
-        "std": float(col.std()),
-        "min": float(col.min()),
-        "max": float(col.max()),
+        "mean": float(col.mean()), "std": float(col.std()),
+        "min": float(col.min()), "max": float(col.max()),
+        "p1": float(p1), "p5": float(p5), "p50": float(p50),
+        "p95": float(p95), "p99": float(p99),
+        "skew": _skew(col), "kurt": _kurtosis(col),
         "n": int(col.size),
     }
+
+
+def _crps(forecast: np.ndarray, obs: np.ndarray) -> float:
+    """CRPS of the generated ensemble vs GT observations (lower = better; a proper
+    scoring rule that rewards both calibration and sharpness, tail-sensitive).
+    Estimator  mean_y E|X-y| - 0.5 E|X-X'|  in O((n+m) log n)."""
+    f = np.sort(np.asarray(forecast, dtype=np.float64))
+    y = np.asarray(obs, dtype=np.float64)
+    n = f.size
+    if n == 0 or y.size == 0:
+        return float("nan")
+    csum = np.concatenate([[0.0], np.cumsum(f)])
+    idx = np.searchsorted(f, y, side="right")            # # forecast <= y
+    e_abs = (idx * y - csum[idx]) + ((csum[n] - csum[idx]) - (n - idx) * y)
+    term1 = (e_abs / n).mean()                           # mean_y E|X-y|
+    i = np.arange(n)
+    term2 = (2.0 / n ** 2) * np.sum((2 * i - n + 1) * f)  # E|X-X'|
+    return float(term1 - 0.5 * term2)
+
+
+def _compare(gt: np.ndarray, gen: np.ndarray) -> dict:
+    """Cross-distribution metrics, tail-focused — outliers (extreme warpage) matter."""
+    gt = np.asarray(gt, dtype=np.float64)
+    gen = np.asarray(gen, dtype=np.float64)
+    gt_p99, gt_p1 = np.quantile(gt, 0.99), np.quantile(gt, 0.01)
+    out = {
+        # tail coverage ratios: 1.0 = gen reaches GT's extremes; <1 = too timid.
+        "max_cov": float(gen.max() / gt.max()) if gt.max() else float("nan"),
+        "min_cov": float(gen.min() / gt.min()) if gt.min() else float("nan"),
+        "p99_cov": float(np.quantile(gen, 0.99) / gt_p99) if gt_p99 else float("nan"),
+        "p1_cov":  float(np.quantile(gen, 0.01) / gt_p1) if gt_p1 else float("nan"),
+        # outlier rate: ~1% each if gen matches GT's tails; <<1% = misses outliers.
+        "gen_frac_above_gt_p99": float((gen > gt_p99).mean()),
+        "gen_frac_below_gt_p1":  float((gen < gt_p1).mean()),
+    }
+    out["crps"] = _crps(gen, gt)        # gen ensemble vs GT observations
+    try:
+        from scipy import stats as sps
+        out["wasserstein"] = float(sps.wasserstein_distance(gt, gen))
+        out["ks"] = float(sps.ks_2samp(gt, gen).statistic)
+    except Exception:
+        out["wasserstein"] = float("nan")
+        out["ks"] = float("nan")
+    return out
 
 
 def main() -> None:
@@ -146,10 +204,10 @@ def main() -> None:
     gen_s = _stats(gen)
     ax.set_title(
         "z_disp spread (max - min) per realization, final timestep\n"
-        f"GT  mu={gt_s['mean']:.3e}  sigma={gt_s['std']:.3e}  "
-        f"[{gt_s['min']:.3e}, {gt_s['max']:.3e}]\n"
-        f"Gen mu={gen_s['mean']:.3e}  sigma={gen_s['std']:.3e}  "
-        f"[{gen_s['min']:.3e}, {gen_s['max']:.3e}]"
+        f"GT  mu={gt_s['mean']:.2e} sd={gt_s['std']:.2e} p99={gt_s['p99']:.2e} "
+        f"max={gt_s['max']:.2e} kurt={gt_s['kurt']:.1f}\n"
+        f"Gen mu={gen_s['mean']:.2e} sd={gen_s['std']:.2e} p99={gen_s['p99']:.2e} "
+        f"max={gen_s['max']:.2e} kurt={gen_s['kurt']:.1f}"
     )
     ax.set_xlabel("max(z_disp) - min(z_disp)")
     ax.set_ylabel("density")
@@ -165,8 +223,35 @@ def main() -> None:
     fig.savefig(out_path, dpi=150)
     print(f"\nSaved figure: {out_path}")
 
-    print(f"\nHIST_STATS  GT  mu={gt_s['mean']:.4e}  sigma={gt_s['std']:.4e}  n={gt_s['n']}")
-    print(f"HIST_STATS  Gen mu={gen_s['mean']:.4e}  sigma={gen_s['std']:.4e}  n={gen_s['n']}")
+    cmp = _compare(gt, gen)
+
+    def _row(tag, s):
+        return (f"  {tag:>3}  mean={s['mean']:.3e}  std={s['std']:.3e}  min={s['min']:.3e}  "
+                f"p1={s['p1']:.3e}  p50={s['p50']:.3e}  p99={s['p99']:.3e}  max={s['max']:.3e}  "
+                f"skew={s['skew']:+.2f}  kurt={s['kurt']:+.2f}")
+
+    print("\n" + "=" * 80)
+    print("  spread = max(z_disp) - min(z_disp) per realization   (outliers = extreme warpage)")
+    print(_row("GT", gt_s))
+    print(_row("Gen", gen_s))
+    print(f"\n  GT vs Gen     wasserstein={cmp['wasserstein']:.3e}   ks={cmp['ks']:.3f}   "
+          f"crps={cmp['crps']:.3e}")
+    print(f"  tail coverage p99_cov={cmp['p99_cov']:.2f}  max_cov={cmp['max_cov']:.2f}  "
+          f"p1_cov={cmp['p1_cov']:.2f}  min_cov={cmp['min_cov']:.2f}   (1.00 = matches GT extremes)")
+    print(f"  outlier rate  gen>GT_p99={cmp['gen_frac_above_gt_p99'] * 100:.2f}%   "
+          f"gen<GT_p1={cmp['gen_frac_below_gt_p1'] * 100:.2f}%   (ideal ~1.00% each)")
+    print("=" * 80)
+
+    # machine-parseable (run_all.sh summary parses these)
+    print(f"\nHIST_STATS  GT  mu={gt_s['mean']:.4e} sigma={gt_s['std']:.4e} "
+          f"min={gt_s['min']:.4e} max={gt_s['max']:.4e} p99={gt_s['p99']:.4e} "
+          f"kurt={gt_s['kurt']:.3f} n={gt_s['n']}")
+    print(f"HIST_STATS  Gen mu={gen_s['mean']:.4e} sigma={gen_s['std']:.4e} "
+          f"min={gen_s['min']:.4e} max={gen_s['max']:.4e} p99={gen_s['p99']:.4e} "
+          f"kurt={gen_s['kurt']:.3f} n={gen_s['n']}")
+    print(f"HIST_COMPARE wasserstein={cmp['wasserstein']:.4e} ks={cmp['ks']:.4f} "
+          f"crps={cmp['crps']:.4e} p99_cov={cmp['p99_cov']:.4f} max_cov={cmp['max_cov']:.4f} "
+          f"gen_frac_gt_p99={cmp['gen_frac_above_gt_p99']:.4f}")
 
 
 if __name__ == "__main__":

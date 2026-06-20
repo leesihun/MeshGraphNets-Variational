@@ -165,22 +165,28 @@ echo "Histogram PNGs:  outputs/b8_all/infer_train<i>_<ds>/histogram_compare.png"
 if [ "$ONLY" = "both" ] || [ "$ONLY" = "hist" ]; then
     SUMMARY="$LOG_ROOT/summary_stats.txt"
     {
-        printf "# Spread mu/sigma summary — %s\n" "$(date)"
-        printf "%-16s  %13s  %13s  %13s  %13s\n" \
-               "tag" "GT_mu" "GT_sigma" "Gen_mu" "Gen_sigma"
-        printf "%-16s  %13s  %13s  %13s  %13s\n" \
-               "----------------" "-------------" "-------------" "-------------" "-------------"
+        printf "# Spread summary (mu/sigma + tail/outlier metrics) — %s\n" "$(date)"
+        hdr="%-14s  %11s %11s  %11s %11s %11s  %8s %8s %11s\n"
+        printf "$hdr" "tag" "GT_mu" "GT_sig" "Gen_mu" "Gen_sig" "Gen_max" \
+               "p99_cov" "g>GTp99" "wass"
+        printf "$hdr" "------" "-----" "-----" "-----" "-----" "-----" \
+               "-----" "-----" "-----"
         for i in $BASELINES; do
             for ds in $DATASETS; do
                 tag="${i}_${ds}"
                 log="$LOG_ROOT/hist_${tag}.log"
                 [ -f "$log" ] || continue
-                gt_mu=$(  grep "^HIST_STATS  GT " "$log"  | grep -o 'mu=[^ ]*'    | cut -d= -f2 )
-                gt_sig=$( grep "^HIST_STATS  GT " "$log"  | grep -o 'sigma=[^ ]*' | cut -d= -f2 )
-                gn_mu=$(  grep "^HIST_STATS  Gen" "$log"  | grep -o 'mu=[^ ]*'    | cut -d= -f2 )
-                gn_sig=$( grep "^HIST_STATS  Gen" "$log"  | grep -o 'sigma=[^ ]*' | cut -d= -f2 )
-                printf "%-16s  %13s  %13s  %13s  %13s\n" \
-                       "$tag" "$gt_mu" "$gt_sig" "$gn_mu" "$gn_sig"
+                g="grep -o"
+                gt_mu=$(  grep "^HIST_STATS  GT " "$log"  | $g 'mu=[^ ]*'    | cut -d= -f2 )
+                gt_sig=$( grep "^HIST_STATS  GT " "$log"  | $g 'sigma=[^ ]*' | cut -d= -f2 )
+                gn_mu=$(  grep "^HIST_STATS  Gen" "$log"  | $g 'mu=[^ ]*'    | cut -d= -f2 )
+                gn_sig=$( grep "^HIST_STATS  Gen" "$log"  | $g 'sigma=[^ ]*' | cut -d= -f2 )
+                gn_max=$( grep "^HIST_STATS  Gen" "$log"  | $g 'max=[^ ]*'   | cut -d= -f2 )
+                p99c=$(   grep "^HIST_COMPARE"    "$log"  | $g 'p99_cov=[^ ]*'         | cut -d= -f2 )
+                gp99=$(   grep "^HIST_COMPARE"    "$log"  | $g 'gen_frac_gt_p99=[^ ]*' | cut -d= -f2 )
+                wass=$(   grep "^HIST_COMPARE"    "$log"  | $g 'wasserstein=[^ ]*'     | cut -d= -f2 )
+                printf "$hdr" "$tag" "$gt_mu" "$gt_sig" "$gn_mu" "$gn_sig" "$gn_max" \
+                       "$p99c" "$gp99" "$wass"
             done
         done
     } > "$SUMMARY"

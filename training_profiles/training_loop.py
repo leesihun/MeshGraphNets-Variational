@@ -120,6 +120,20 @@ def _recon_errors(predicted, target, recon_loss='huber'):
     return torch.nn.functional.huber_loss(predicted, target, reduction='none', delta=1.0)
 
 
+def _delta_stats(dataloader, device):
+    """Fetch (delta_mean, delta_std) tensors from the loader's dataset (handles a
+    Subset wrapper). Returns (None, None) if unavailable — used to denormalize
+    predictions for the generated-amplitude tail metric."""
+    ds = getattr(dataloader, 'dataset', None)
+    for obj in (ds, getattr(ds, 'dataset', None)):
+        dm = getattr(obj, 'delta_mean', None)
+        st = getattr(obj, 'delta_std', None)
+        if dm is not None and st is not None:
+            return (torch.as_tensor(dm, dtype=torch.float32, device=device),
+                    torch.as_tensor(st, dtype=torch.float32, device=device))
+    return None, None
+
+
 def _move_graph_to_device(graph, device, config):
     non_blocking = bool(config.get('_pin_memory', False)) and getattr(device, 'type', None) == 'cuda'
     return graph.to(device, non_blocking=non_blocking)
@@ -720,6 +734,16 @@ def evaluate_vae_learned_prior_epoch(model, dataloader, device, config, epoch=0,
     var_q_all = []         # posterior variances per sample [B, num_z, D]
     prior_var_all = []     # prior mixture total variance per graph [B, num_z, D]
 
+    # Generated-amplitude tail tracking (matches compare_histograms' metric):
+    # per-graph max-min of denormalized z_disp from prior-sampled predictions.
+    amp_gen_all, amp_gt_all, _track_tail, _zc = [], [], False, 2
+    try:
+        from torch_geometric.utils import scatter as _scatter
+        _dm, _st = _delta_stats(dataloader, device)
+        _track_tail = _dm is not None and _st is not None
+    except Exception:
+        _scatter = None
+
     with torch.no_grad():
         pbar = tqdm.tqdm(dataloader, desc=progress_name)
         for graph in pbar:
@@ -762,6 +786,22 @@ def evaluate_vae_learned_prior_epoch(model, dataloader, device, config, epoch=0,
             _, batch_loss_sum, batch_loss_count = _loss_from_errors(errors, loss_weights)
             total_loss_sum += batch_loss_sum
             total_loss_count += batch_loss_count
+
+            if _track_tail:
+                try:
+                    if predicted.shape[1] > _zc:
+                        b = (graph.batch if getattr(graph, 'batch', None) is not None
+                             else torch.zeros(predicted.shape[0], dtype=torch.long, device=device))
+                        zg = predicted[:, _zc].float() * _st[_zc] + _dm[_zc]
+                        amp_gen_all.append((_scatter(zg, b, dim=0, reduce='max')
+                                            - _scatter(zg, b, dim=0, reduce='min')).cpu())
+                        if getattr(graph, 'y', None) is not None:
+                            zt = target[:, _zc].float() * _st[_zc] + _dm[_zc]
+                            amp_gt_all.append((_scatter(zt, b, dim=0, reduce='max')
+                                               - _scatter(zt, b, dim=0, reduce='min')).cpu())
+                except Exception:
+                    _track_tail = False
+
             mem_gb = torch.cuda.memory_allocated() / 1e9
             pbar.set_postfix({'rec': f'{batch_loss_sum / max(batch_loss_count, 1):.2e}',
                               'mem': f'{mem_gb:.1f}GB'})
@@ -793,6 +833,24 @@ def evaluate_vae_learned_prior_epoch(model, dataloader, device, config, epoch=0,
         if min(result['spread_ratio']) < 0.5:
             tqdm.tqdm.write("  [PriorDiag] ⚠️  prior is narrower than half the posterior "
                             "cloud — generated spread will be too small.")
+
+    if amp_gen_all:
+        try:
+            ag = torch.cat(amp_gen_all)
+            gp99, gmax = float(torch.quantile(ag, 0.99)), float(ag.max())
+            gkurt = float((ag - ag.mean()).pow(4).mean() / (ag.std().pow(4) + 1e-12) - 3.0)
+            result['gen_amp_p99'] = round(gp99, 2)
+            result['gen_amp_max'] = round(gmax, 2)
+            result['gen_amp_kurt'] = round(gkurt, 2)
+            line = f"  [PriorTail] gen amp  p99={gp99:.3e}  max={gmax:.3e}  kurt={gkurt:+.2f}"
+            if amp_gt_all:
+                tp99 = float(torch.quantile(torch.cat(amp_gt_all), 0.99))
+                cov = gp99 / tp99 if tp99 > 1e-8 else float('nan')
+                result['amp_p99_cov'] = round(cov, 3)
+                line += f"  p99_cov={cov:.2f}  (1.0 = gen reaches GT extremes)"
+            tqdm.tqdm.write(line)
+        except Exception:
+            pass
 
     return result
 

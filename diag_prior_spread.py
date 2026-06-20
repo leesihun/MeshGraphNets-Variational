@@ -204,24 +204,25 @@ def main():
         a = np.asarray(a, dtype=np.float64)
         a = a[np.isfinite(a)]               # drop NaN/Inf decodes
         if a.size == 0:
-            return float('nan'), float('nan'), 0
-        return a.mean(), a.std(), a.size
+            return None
+        return dict(mean=a.mean(), std=a.std(), p99=float(np.quantile(a, 0.99)),
+                    mx=a.max(), n=a.size)
 
-    print("\n" + "=" * 64)
+    print("\n" + "=" * 78)
     print(f"GT dataset: {args.gt_dataset}")
     if args.gt_mu is not None and args.gt_sigma is not None:
-        print(f"  GT          mu={args.gt_mu:.3e}  sigma={args.gt_sigma:.3e}")
+        print(f"  GT           mu={args.gt_mu:.3e}  sigma={args.gt_sigma:.3e}")
     for name, a in [("(a)  posterior     ", amp_post),
                     ("(b*) prior  Ngraphs", amp_prior_multi),
                     ("(b)  prior  1graph ", amp_prior),
                     ("(c)  fullcov 1graph", amp_fullcov)]:
-        if len(a) == 0:
+        s = stats(a)
+        if s is None:
             continue
-        m, s, nfin = stats(a)
-        frac = (f"  sigma/GT={s / args.gt_sigma:.2f}"
-                if args.gt_sigma and np.isfinite(s) else "")
-        print(f"  {name} mu={m:.3e}  sigma={s:.3e}{frac}  (n={nfin})")
-    print("=" * 64)
+        frac = (f"  sd/GT={s['std'] / args.gt_sigma:.2f}" if args.gt_sigma else "")
+        print(f"  {name} mu={s['mean']:.3e} sd={s['std']:.3e} "
+              f"p99={s['p99']:.3e} max={s['mx']:.3e}{frac}  (n={s['n']})")
+    print("=" * 78)
     print("Read:  (b*) is the apples-to-apples match to the rollout histogram.\n"
           "       (b*)<<(b)  -> prior COLLAPSES per-graph; the 1-graph (b) was a\n"
           "                     lucky non-collapsed graph. Fix the prior, not the decoder.\n"
