@@ -102,9 +102,16 @@ def _per_node_loss(errors, loss_weights):
     return torch.mean(errors, dim=-1)
 
 
-def _loss_from_errors(errors, loss_weights):
-    """Return mean loss used for backprop plus exact aggregation stats."""
+def _loss_from_errors(errors, loss_weights, node_weights=None):
+    """Return mean loss used for backprop plus exact aggregation stats.
+
+    With node_weights [N] (extremity weighting), the node reduction becomes a
+    weighted mean  sum(w*per_node)/sum(w)  instead of a plain mean."""
     per_node = _per_node_loss(errors, loss_weights)
+    if node_weights is not None:
+        loss_sum = (per_node * node_weights).sum()
+        loss_count = node_weights.sum()
+        return loss_sum / loss_count, loss_sum.item(), loss_count.item()
     loss_sum = per_node.sum()
     loss_count = per_node.numel()
     return loss_sum / loss_count, loss_sum.item(), loss_count
@@ -118,6 +125,29 @@ def _recon_errors(predicted, target, recon_loss='huber'):
     if str(recon_loss).lower().strip() == 'mse':
         return (predicted - target).pow(2)
     return torch.nn.functional.huber_loss(predicted, target, reduction='none', delta=1.0)
+
+
+def _extremity_weights(target, batch, extreme_weight, zc=2):
+    """Per-node weight upweighting nodes whose TARGET z_disp is extreme (peaks/
+    valleys), so the posterior reconstruction does not smooth them — this raises
+    the amplitude (max-min) ceiling. Applied ONLY to the posterior recon (z
+    encodes the true target -> one-to-one -> no variance collapse).
+
+        w_n = 1 + extreme_weight * |y_n - graph_mean| / graph_max_dev   in [1, 1+ew]
+
+    Computed on the target (not the prediction), so it is a fixed reweighting.
+    Returns None when disabled (extreme_weight <= 0)."""
+    if extreme_weight <= 0.0 or target is None:
+        return None
+    from torch_geometric.utils import scatter
+    c = min(int(zc), target.shape[1] - 1)
+    yz = target[:, c]                                              # [N]
+    if batch is None:
+        batch = torch.zeros(yz.shape[0], dtype=torch.long, device=yz.device)
+    g_mean = scatter(yz, batch, reduce='mean')[batch]
+    dev = (yz - g_mean).abs()
+    g_max = scatter(dev, batch, reduce='max')[batch].clamp(min=1e-6)
+    return 1.0 + float(extreme_weight) * (dev / g_max)            # [N]
 
 
 def _delta_stats(dataloader, device):
@@ -384,7 +414,10 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
                     save_debug_batch(epoch, batch_idx, graph, predicted_acc, target_acc, log_dir)
 
             errors = _recon_errors(predicted_acc, target_acc, config.get('recon_loss', 'huber'))
-            recon_loss, batch_loss_sum, batch_loss_count = _loss_from_errors(errors, loss_weights)
+            node_w = _extremity_weights(target_acc, getattr(graph, 'batch', None),
+                                        float(config.get('extreme_weight', 0.0)))
+            recon_loss, batch_loss_sum, batch_loss_count = _loss_from_errors(
+                errors, loss_weights, node_w)
             if use_vae:
                 loss = alpha_recon * recon_loss + lambda_mmd * mmd_loss_val + beta_aux * aux_loss_val
                 if lambda_det > 0.0:

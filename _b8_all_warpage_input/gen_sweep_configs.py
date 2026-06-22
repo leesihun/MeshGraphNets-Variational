@@ -1,54 +1,57 @@
-"""Generate the multiscale-levels x voronoi-resolution sweep configs.
+"""Generate the extreme_weight sweep configs.
 
-Diagnosis: the amplitude ceiling (decode(mu_q) ~ 0.74 of GT) is a DECODER problem
-— per-node recon is good but peaks are smoothed. Latent knobs (beta_aux,
-lambda_mmd, cov_rank, std_noise) are downstream and don't move it; the prior
-already saturates the ceiling. So this sweep probes the DECODER's structural
-smoothing, holding the total message-passing budget ~constant (~30) while varying:
-  - multiscale_levels L in {2, 3, 4}  (how the budget is split across scales)
-  - voronoi_clusters                  (how aggressively pooling discards fine
-                                       detail where peaks live)
-This isolates over-smoothing vs pooling-detail-loss vs capacity without changing
-the loss. Everything else is held at the best known values.
+Diagnosis (confirmed): the amplitude ceiling (decode(mu_q) ~ 0.74 of GT) is a
+DECODER problem — per-node recon is good but PEAKS are smoothed, because the
+per-node averaged loss under-weights the few extreme nodes that set the
+amplitude (max-min). Structure (L / voronoi) and latent knobs (beta_aux,
+lambda_mmd, cov_rank, std_noise, temperature) don't move it.
 
-8 cells -> config_train1..8, single GPU each (0..7). Re-run after editing cells.
+Fix under test: `extreme_weight` upweights extreme-z_disp nodes in the POSTERIOR
+reconstruction only (one-to-one, z encodes the true target -> no variance
+collapse). Everything else is held at the best known config (cell2 of the
+cov_rank sweep: L=2, mp 4/8/12/8/4, voronoi 2000/500, cov_rank=8, pmin=0.05,
+alpha_recon=100, mse, feature_loss_weights 1/1/1, beta_aux=1.0).
+
+2 axes: extreme_weight {0,2,4,8} x feature_loss_weights {[1,1,1],[0,0,1]}.
+[0,0,1] focuses all decoder capacity on z_disp (warpage) — synergizes with ew.
+8 cells -> config_train1..8, single GPU each (0..7). cell1 (ew=0, flw111) is the
+control (= current best). SCREENING budget: Training_epochs=500 (relative ranking
+is valid early; full-train the winner to 1000). Re-run after editing the grid.
 """
 import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# n, gpu, L, mp_per_level (sum ~30, symmetric V-cycle of length 2L+1), voronoi_clusters (L)
-cells = [
-    dict(n=1, gpu=0, L=2, mp=[4, 6, 10, 6, 4],              vc=[2000, 500]),
-    dict(n=2, gpu=1, L=2, mp=[4, 6, 10, 6, 4],              vc=[4000, 1000]),
-    dict(n=3, gpu=2, L=3, mp=[3, 4, 5, 6, 5, 4, 3],         vc=[2000, 500, 125]),
-    dict(n=4, gpu=3, L=3, mp=[3, 4, 5, 6, 5, 4, 3],         vc=[4000, 1000, 250]),
-    dict(n=5, gpu=4, L=3, mp=[3, 4, 5, 6, 5, 4, 3],         vc=[1000, 250, 60]),
-    dict(n=6, gpu=5, L=4, mp=[2, 3, 3, 4, 6, 4, 3, 3, 2],   vc=[2000, 500, 125, 32]),
-    dict(n=7, gpu=6, L=4, mp=[2, 3, 3, 4, 6, 4, 3, 3, 2],   vc=[4000, 1000, 250, 64]),
-    dict(n=8, gpu=7, L=4, mp=[2, 3, 3, 4, 6, 4, 3, 3, 2],   vc=[1000, 250, 60, 16]),
-]
+EPOCHS = 500                              # screening budget (full-train winner to 1000)
+EWS = [0, 2, 4, 8]                        # extreme_weight
+FLWS = [("111", "1, 1, 1"), ("001", "0, 0, 1")]   # feature_loss_weights (tag, csv)
 
-# sanity: mp_per_level length must be 2L+1 and sum ~30
-for c in cells:
-    assert len(c["mp"]) == 2 * c["L"] + 1, (c["n"], len(c["mp"]), c["L"])
-    assert len(c["vc"]) == c["L"], (c["n"], len(c["vc"]), c["L"])
+cells = []
+n, gpu = 1, 0
+for flw_tag, flw_csv in FLWS:             # flw-major: cells 1-4 = 111, 5-8 = 001
+    for ew in EWS:
+        cells.append(dict(n=n, gpu=gpu, ew=ew, flw_tag=flw_tag, flw=flw_csv))
+        n += 1
+        gpu += 1
 
 
 def suffix(c):
-    return f"L{c['L']}_vc{c['vc'][0]}"
+    return f"ew{c['ew']}_flw{c['flw_tag']}"
 
 
-def csv(xs):
-    return ", ".join(str(x) for x in xs)
+def primary_tag(c):
+    if c["ew"] == 0 and c["flw_tag"] == "111":
+        return "   [control: ew=0, flw=1/1/1 == current best]"
+    if c["ew"] == 0 and c["flw_tag"] == "001":
+        return "   [isolates the z_disp-focus effect]"
+    return ""
 
 
 TRAIN_TMPL = """% ============================================================
-% SWEEP cell: multiscale_levels={L}, mp_per_level=[{mp}] (sum={mpsum}), voronoi={vc}
-% Decoder-ceiling probe (amplitude peaks are smoothed; (a) posterior ~0.74).
-% Total MP budget held ~30; vary how it splits across scales (L) and how
-% aggressively pooling discards fine detail (voronoi_clusters).
-% Latent side held fixed (cov_rank=8, pmin=0.05, alpha_recon=100, mse).
+% SWEEP cell: extreme_weight={ew}{tag}
+% Raises the amplitude ceiling by upweighting extreme-z_disp nodes in the
+% POSTERIOR reconstruction (one-to-one -> no variance collapse). Base = best
+% known config (L=2, mp 4/8/12/8/4, voronoi 2000/500, cov_rank=8, pmin=0.05, mse).
 % Single GPU per run; 8 cells fill GPUs 0-7.
 % ============================================================
 model   MeshGraphNets-V
@@ -66,13 +69,13 @@ num_vae_samples 10000
 % Common params
 input_var            3
 output_var           3
-feature_loss_weights 1, 1, 1
+feature_loss_weights {flw}    # SWEPT: 1/1/1 (all disp) vs 0/0/1 (z_disp/warpage only)
 edge_var             8
 positional_features  4
 
 % Network parameters
 message_passing_num  15
-Training_epochs      1000
+Training_epochs      {epochs}    # SCREENING budget; full-train the winner to 1000
 Batch_size           8
 LearningR            0.0001
 Latent_dim           128
@@ -83,7 +86,7 @@ augment_geometry     True
 grad_accum_steps     1
 
 % Memory / performance
-use_checkpointing    True
+use_checkpointing    False
 use_amp              True
 use_ema              True
 ema_decay            0.99
@@ -100,22 +103,23 @@ use_world_edges False
 test_batch_idx   0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 33, 34
 plot_feature_idx -1
 
-% Multiscale (Voronoi V-cycle) -- SWEPT: L levels + voronoi resolution
+% Multiscale (2-level Voronoi V-cycle) -- fixed at best known
 use_multiscale      True
-coarsening_type     {ctype}
-voronoi_clusters    {vc}
-multiscale_levels   {L}
-mp_per_level        {mp}
+coarsening_type     voronoi_seedmean
+voronoi_clusters    2000, 500
+multiscale_levels   2
+mp_per_level        4, 8, 12, 8, 4
 bipartite_unpool    True
 
 % VAE (MMD-InfoVAE)
 use_vae          True
 vae_latent_dim   32
 recon_loss       mse    # MSE penalizes extreme-node errors -> sharper amplitude (vs Huber)
+extreme_weight   {ew}      # SWEPT: upweight extreme-z_disp nodes in posterior recon (0 = off)
 alpha_recon      100    # high: sharp reconstruction -> high amplitude ceiling
 lambda_mmd       0.1    # low: z encodes structured spread, not collapsed to N(0,I)
 vae_graph_aware  True   # z encodes only y-residual unexplained by x
-beta_aux         1.0    # anchors z to per-graph [y_mean, y_std]; teaches z to encode spread
+beta_aux         1.0    # anchors z to per-graph [y_mean, y_std]; prevents posterior collapse
 posterior_min_std 0.05  # low floor -> sharp decoder; spread comes from Var(mu_q)
 
 % Prior - gnn_e2e: joint training, graph-conditional, low-rank covariance.
@@ -134,7 +138,8 @@ prior_min_std            0.1
 prior_temperature        1.0
 """
 
-INFER_TMPL = """% Inference for sweep cell train{n}: multiscale_levels={L}, voronoi={vc}
+INFER_TMPL = """% Inference for sweep cell train{n}: extreme_weight={ew}{tag}
+% (extreme_weight is training-only; architecture is identical across cells.)
 model   MeshGraphNets-V
 mode    inference
 gpu_ids {gpu}
@@ -165,7 +170,7 @@ std_noise            0.01
 residual_scale       1
 
 % Memory / performance
-use_checkpointing    True
+use_checkpointing    False
 use_amp              True
 use_ema              True
 ema_decay            0.99
@@ -180,12 +185,12 @@ use_world_edges False
 test_batch_idx   0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 33, 34
 plot_feature_idx -1
 
-% Multiscale - MUST match training (L levels + voronoi resolution + seedmean)
+% Multiscale - MUST match training
 use_multiscale      True
-coarsening_type     {ctype}
-voronoi_clusters    {vc}
-multiscale_levels   {L}
-mp_per_level        {mp}
+coarsening_type     voronoi_seedmean
+voronoi_clusters    2000, 500
+multiscale_levels   2
+mp_per_level        4, 8, 12, 8, 4
 bipartite_unpool    True
 
 % VAE (MMD-InfoVAE)
@@ -224,9 +229,9 @@ def write(path, text):
 written = []
 for c in cells:
     sfx = suffix(c)
-    ctype = csv(["voronoi_seedmean"] * c["L"])   # explicit per-level (length L)
-    fields = dict(n=c["n"], gpu=c["gpu"], L=c["L"], sfx=sfx,
-                  mp=csv(c["mp"]), mpsum=sum(c["mp"]), vc=csv(c["vc"]), ctype=ctype)
+    tag = primary_tag(c)
+    fields = dict(n=c["n"], gpu=c["gpu"], ew=c["ew"], sfx=sfx, tag=tag,
+                  flw=c["flw"], epochs=EPOCHS)
     tpath = os.path.join(HERE, f"config_train{c['n']}.txt")
     write(tpath, TRAIN_TMPL.format(**fields))
     written.append(os.path.basename(tpath))

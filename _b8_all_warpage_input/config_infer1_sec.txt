@@ -1,9 +1,10 @@
-% Inference for sweep cell train1: multiscale_levels=2, voronoi=2000, 500
+% Inference for sweep cell train1: extreme_weight=0   [control: ew=0, flw=1/1/1 == current best]
+% (extreme_weight is training-only; architecture is identical across cells.)
 model   MeshGraphNets-V
 mode    inference
 gpu_ids 0
 log_file_dir         b8_all/infer_train1_sec.log
-modelpath            ./outputs/b8_all/warpage_train1_L2_vc2000.pth
+modelpath            ./outputs/b8_all/warpage_train1_ew0_flw111.pth
 inference_output_dir outputs/b8_all/infer_train1_sec
 
 % Datasets
@@ -29,7 +30,7 @@ std_noise            0.01
 residual_scale       1
 
 % Memory / performance
-use_checkpointing    True
+use_checkpointing    False
 use_amp              True
 use_ema              True
 ema_decay            0.99
@@ -44,12 +45,12 @@ use_world_edges False
 test_batch_idx   0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 33, 34
 plot_feature_idx -1
 
-% Multiscale - MUST match training (L levels + voronoi resolution + seedmean)
+% Multiscale - MUST match training
 use_multiscale      True
-coarsening_type     voronoi_seedmean, voronoi_seedmean
+coarsening_type     voronoi_seedmean
 voronoi_clusters    2000, 500
 multiscale_levels   2
-mp_per_level        4, 6, 10, 6, 4
+mp_per_level        4, 8, 12, 8, 4
 bipartite_unpool    True
 
 % VAE (MMD-InfoVAE)
