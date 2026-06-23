@@ -162,8 +162,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--clip_quantile", type=float, default=0.0,
-        help="Symmetric quantile clip for the binning range, e.g. 0.001 trims "
-             "the 0.1%% tails. 0 = no clipping (default).",
+        help="Symmetric quantile clip for the binning RANGE only (visual zoom), "
+             "e.g. 0.001 trims the 0.1%% tails. 0 = no clipping (default).",
+    )
+    parser.add_argument(
+        "--trim_quantile", type=float, default=0.0,
+        help="EXCLUDE the bottom and top q fraction of EACH distribution before "
+             "stats AND histogram (e.g. 0.02 = drop <2%% and >98%%). Compares the "
+             "central bulk, ignoring artifact/spurious tails. 0 = off (default).",
     )
     args = parser.parse_args()
 
@@ -179,6 +185,19 @@ def main() -> None:
     print(f"Loading generated rollouts from: {args.rollout_dir}")
     gen = _rollout_spreads(args.rollout_dir)
     print(f"  generated spread values (1 per VAE sample): {gen.size:,}")
+
+    if args.trim_quantile > 0:
+        q = args.trim_quantile
+
+        def _trim(a):
+            lo, hi = np.quantile(a, q), np.quantile(a, 1.0 - q)
+            return a[(a >= lo) & (a <= hi)]
+
+        n_gt0, n_gen0 = gt.size, gen.size
+        gt, gen = _trim(gt), _trim(gen)
+        print(f"  Trimmed to central {100 * (1 - 2 * q):.0f}% (drop <{100 * q:.0f}% / "
+              f">{100 * (1 - q):.0f}% per distribution): GT {n_gt0:,}->{gt.size:,}, "
+              f"gen {n_gen0:,}->{gen.size:,}")
 
     if args.clip_quantile > 0:
         q = args.clip_quantile

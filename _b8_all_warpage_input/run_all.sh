@@ -24,6 +24,8 @@
 #   LOG_ROOT         = directory for tee logs (default: outputs/b8_all/run_logs)
 #   ONLY             = "infer" | "hist" | "diag" | "both" (default: both = infer+hist)
 #   DIAG             = 1 to also run diag_prior_spread.py after infer/hist (default: 0)
+#   TRIM             = quantile to drop from each tail in the histogram compare
+#                      (e.g. 0.02 -> central 96%; ignores artifact/spurious tails; default 0)
 #   BASELINES        = space-separated baseline indices (default: "1 2 3 4 5 6 7 8")
 #   DATASETS         = space-separated dataset tags (default: "main sec")
 #
@@ -47,7 +49,8 @@ set -euo pipefail
 PYTHON="${PYTHON:-python}"
 ONLY="${ONLY:-both}"
 DIAG="${DIAG:-0}"
-BASELINES="${BASELINES:-1 2 3 4 5 6 7 8}"
+TRIM="${TRIM:-0}"   # e.g. 0.02 -> drop bottom/top 2% of each distribution in the histogram compare
+BASELINES="${BASELINES:-1 2 3 4 5 6 7}"
 DATASETS="${DATASETS:-main sec}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -129,6 +132,7 @@ run_one() {
         if ! "$PYTHON" _b8_all_warpage_input/compare_histograms.py \
                 --eval_dataset "$eval_ds" \
                 --rollout_dir  "$rollout_dir" \
+                --trim_quantile "$TRIM" \
                 --output       "$rollout_dir/histogram_compare.png" 2>&1 \
                 | tee "$LOG_ROOT/hist_${tag}.log"; then
             echo "[$tag] histogram comparison FAILED — see $LOG_ROOT/hist_${tag}.log" >&2
