@@ -1,15 +1,14 @@
 % ============================================================
-% SWEEP cell: extreme_weight=2
-% Raises the amplitude ceiling by upweighting extreme-z_disp nodes in the
-% POSTERIOR reconstruction (one-to-one -> no variance collapse). Base = best
-% known config (L=2, mp 4/8/12/8/4, voronoi 2000/500, cov_rank=8, pmin=0.05, mse).
-% Single GPU per run; 8 cells fill GPUs 0-7.
+% ANTI-SMOOTHING sweep cell 2: bigcap
+% vae_latent_dim=64, Latent_dim=192, posterior_min_std=0.05
+% feature_loss_weights 1/1/1, Training_epochs 2000, 2-GPU DDP. Base L=2,
+% voronoi 2000/500, cov_rank=8, mse, ew=0.
 % ============================================================
 model   MeshGraphNets-V
 mode    train
-gpu_ids 1
-log_file_dir    b8_all/train2_ew2_flw111.log
-modelpath       ./outputs/b8_all/warpage_train2_ew2_flw111.pth
+gpu_ids 2,3
+log_file_dir    b8_all/train2_bigcap.log
+modelpath       ./outputs/b8_all/warpage_train2_bigcap.pth
 
 % Datasets
 dataset_dir     ./dataset/b8_main_sec_dataset_traincopy.h5
@@ -20,24 +19,24 @@ num_vae_samples 10000
 % Common params
 input_var            3
 output_var           3
-feature_loss_weights 1, 1, 1    # SWEPT: 1/1/1 (all disp) vs 0/0/1 (z_disp/warpage only)
+feature_loss_weights 1, 1, 1
 edge_var             8
 positional_features  4
 
 % Network parameters
 message_passing_num  15
-Training_epochs      500    # SCREENING budget; full-train the winner to 1000
+Training_epochs      2000
 Batch_size           8
 LearningR            0.0001
-Latent_dim           128
+Latent_dim           192
 num_workers          4
-std_noise            0.01    # without noise the model ignores z and memorises x->y
+std_noise            0.01
 residual_scale       1
 augment_geometry     True
 grad_accum_steps     1
 
 % Memory / performance
-use_checkpointing    False
+use_checkpointing    False   # faster; set True if OOM (esp. bigcap cells 2/3)
 use_amp              True
 use_ema              True
 ema_decay            0.99
@@ -54,7 +53,7 @@ use_world_edges False
 test_batch_idx   0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 33, 34
 plot_feature_idx -1
 
-% Multiscale (2-level Voronoi V-cycle) -- fixed at best known
+% Multiscale (2-level Voronoi V-cycle)
 use_multiscale      True
 coarsening_type     voronoi_seedmean
 voronoi_clusters    2000, 500
@@ -64,23 +63,23 @@ bipartite_unpool    True
 
 % VAE (MMD-InfoVAE)
 use_vae          True
-vae_latent_dim   32
-recon_loss       mse    # MSE penalizes extreme-node errors -> sharper amplitude (vs Huber)
-extreme_weight   2      # SWEPT: upweight extreme-z_disp nodes in posterior recon (0 = off)
-alpha_recon      100    # high: sharp reconstruction -> high amplitude ceiling
-lambda_mmd       0.1    # low: z encodes structured spread, not collapsed to N(0,I)
-vae_graph_aware  True   # z encodes only y-residual unexplained by x
-beta_aux         1.0    # anchors z to per-graph [y_mean, y_std]; prevents posterior collapse
-posterior_min_std 0.05  # low floor -> sharp decoder; spread comes from Var(mu_q)
+vae_latent_dim   64
+recon_loss       mse
+extreme_weight   0
+alpha_recon      100
+lambda_mmd       0.1
+vae_graph_aware  True
+beta_aux         1.0
+posterior_min_std 0.05
 
 % Prior - gnn_e2e: joint training, graph-conditional, low-rank covariance.
 prior_type               gnn_e2e
-use_conditional_prior    True    # CRITICAL: persist True so rollout uses the learned prior
-prior_cov_rank           8       # low-rank covariance per component (captures correlation)
-alpha_prior_max          0.0     # MUST be 0 for spread modeling
-prior_loss_type          mc_nll  # mixture NLL on fresh posterior samples
+use_conditional_prior    True
+prior_cov_rank           8
+alpha_prior_max          0.0
+prior_loss_type          mc_nll
 prior_nll_weight         1.0
-prior_kl_reg_weight      0.05    # small analytical-KL stability anchor
+prior_kl_reg_weight      0.05
 prior_gumbel_temp        1.0
 prior_mixture_components 30
 prior_mp_layers          5
