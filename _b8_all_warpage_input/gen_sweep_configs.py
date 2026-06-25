@@ -8,13 +8,16 @@ This sweep attacks smoothing with more capacity + an extremely sharp posterior:
   Base = L=2, mp 4/8/12/8/4, voronoi 2000/500, cov_rank=8, alpha_recon=100, mse,
   extreme_weight=0, beta_aux=1.0.
 
-  cell1 control      : vae_latent_dim=32, Latent_dim=128, posterior_min_std=0.05
-  cell2 bigcap       : vae_latent_dim=64, Latent_dim=192  (wider bottleneck+model)
-  cell3 bigcap+sharp : vae_latent_dim=64, Latent_dim=192, posterior_min_std=0.001
-                       (near-zero sigma_q floor -> sharpest decoder; watch for the
-                        sigma_q-collapse failure: [PriorDiag] spread_ratio / ValidQ)
+2x2 factorial: capacity {32/128, 64/192} x posterior_min_std {0.05, 0.001}.
+  cell1 control      : 32/128, pmin=0.05   (cap-, sharp-)
+  cell2 bigcap       : 64/192, pmin=0.05   (cap+, sharp-)
+  cell3 bigcap+sharp : 64/192, pmin=0.001  (cap+, sharp+)
+  cell4 sharp        : 32/128, pmin=0.001  (cap-, sharp+)  -- completes the 2x2
+pmin=0.001 is a near-zero sigma_q floor -> sharpest decoder; watch for the
+sigma_q-collapse failure ([PriorDiag] spread_ratio / ValidQ).
 
-GPU7 is down: cells use pairs (0,1)/(2,3)/(4,5) only. config_train1..3 (+ infer).
+GPU7 is down. cells 1-3 use pairs (0,1)/(2,3)/(4,5); cell4 reuses (0,1) in a
+second wave (after cell1). config_train1..4 (+ infer).
 """
 import os
 
@@ -27,6 +30,7 @@ cells = [
     dict(n=1, gpus="0,1", igpu=0, ld=32, ldm=128, pmin=0.05,  tag="control"),
     dict(n=2, gpus="2,3", igpu=2, ld=64, ldm=192, pmin=0.05,  tag="bigcap"),
     dict(n=3, gpus="4,5", igpu=4, ld=64, ldm=192, pmin=0.001, tag="bigcap_sharp"),
+    dict(n=4, gpus="0,1", igpu=0, ld=32, ldm=128, pmin=0.001, tag="sharp"),  # wave 2 (after cell1)
 ]
 
 
