@@ -10,28 +10,23 @@ from model.encoder_decoder import GnBlock
 from model.mlp import build_mlp, init_weights
 
 
-class ConditionalMixturePrior(nn.Module):
-    """Graph-conditioned Gaussian mixture prior for VAE latent z.
+class _ConditionalPriorBase(nn.Module):
+    """Shared graph trunk for conditional priors on the VAE latent z.
 
-    This module is trained post-hoc against the frozen VAE posterior.  At
-    inference it replaces the global latent sampler with p(z | graph).
+    Encodes the input graph (node/edge features + message passing + attention
+    pooling) into one conditioning vector per graph. Subclasses attach either
+    an explicit density head (Gaussian mixture) or a velocity head (flow
+    matching). Attribute names (node_encoder / edge_encoder / mp_layers / pool)
+    are load-bearing: mixture checkpoints saved before this refactor must keep
+    identical state_dict keys.
     """
 
     def __init__(self, config):
         super().__init__()
         self.config = dict(config)
         self.z_dim = int(config.get('vae_latent_dim', 32))
-        self.num_components = int(config.get('prior_mixture_components', 10))
         self.hidden_dim = int(config.get('prior_hidden_dim', config.get('latent_dim', 128)))
         self.num_mp_layers = int(config.get('prior_mp_layers', 3))
-        self.min_std = float(config.get('prior_min_std', 0.05))
-        # Low-rank covariance per mixture component: Sigma_k = L_k L_k^T + diag(psi_k).
-        # 0 (default) = diagonal components (back-compat, no cov_factor emitted).
-        # r > 0 lets a component capture correlated latent directions — the
-        # manufacturing-spread axis a diagonal prior misses (see diag_prior_spread).
-        self.cov_rank = int(config.get('prior_cov_rank', 0))
-        # Start near-diagonal (weak correlations) and let training grow them.
-        self.cov_factor_scale = 0.1
         # Per-level z slots (matches MeshGraphNets.num_z). Default 1 for back-compat.
         if config.get('use_multiscale', False):
             default_num_z = int(config.get('multiscale_levels', 1)) + 1
@@ -56,6 +51,40 @@ class ConditionalMixturePrior(nn.Module):
             for _ in range(self.num_mp_layers)
         ])
         self.pool = GlobalAttention(nn.Linear(self.hidden_dim, 1))
+
+    def condition(self, graph):
+        """Encode graph → pooled conditioning vector [B, hidden_dim]."""
+        batch = getattr(graph, 'batch', None)
+        if batch is None:
+            batch = torch.zeros(graph.x.shape[0], dtype=torch.long, device=graph.x.device)
+        h = self.node_encoder(graph.x)
+        e = self.edge_encoder(graph.edge_attr)
+        g = Data(x=h, edge_attr=e, edge_index=graph.edge_index)
+        for block in self.mp_layers:
+            g = block(g)
+        return self.pool(g.x, batch)
+
+
+class ConditionalMixturePrior(_ConditionalPriorBase):
+    """Graph-conditioned Gaussian mixture prior for VAE latent z (legacy family).
+
+    Kept as the `prior_family gmm` fallback and for loading pre-FM checkpoints.
+    At inference it replaces the global latent sampler with p(z | graph).
+    """
+
+    family = 'gmm'
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.num_components = int(config.get('prior_mixture_components', 10))
+        self.min_std = float(config.get('prior_min_std', 0.05))
+        # Low-rank covariance per mixture component: Sigma_k = L_k L_k^T + diag(psi_k).
+        # 0 (default) = diagonal components (back-compat, no cov_factor emitted).
+        # r > 0 lets a component capture correlated latent directions — the
+        # manufacturing-spread axis a diagonal prior misses (see diag_prior_spread).
+        self.cov_rank = int(config.get('prior_cov_rank', 0))
+        # Start near-diagonal (weak correlations) and let training grow them.
+        self.cov_factor_scale = 0.1
         # Per component: 1 logit + D mean + D diagonal log-std (+ D*rank cov factor).
         self.params_per_comp = 1 + (2 + self.cov_rank) * self.z_dim
         self.head = build_mlp(
@@ -67,17 +96,7 @@ class ConditionalMixturePrior(nn.Module):
         self.apply(init_weights)
 
     def forward(self, graph):
-        batch = getattr(graph, 'batch', None)
-        if batch is None:
-            batch = torch.zeros(graph.x.shape[0], dtype=torch.long, device=graph.x.device)
-
-        h = self.node_encoder(graph.x)
-        e = self.edge_encoder(graph.edge_attr)
-        g = Data(x=h, edge_attr=e, edge_index=graph.edge_index)
-        for block in self.mp_layers:
-            g = block(g)
-
-        pooled = self.pool(g.x, batch)
+        pooled = self.condition(graph)
         raw = self.head(pooled)
         bsz = raw.shape[0]
         D = self.z_dim
@@ -100,6 +119,122 @@ class ConditionalMixturePrior(nn.Module):
     def sample(self, graph, temperature=1.0):
         params = self.forward(graph)
         return sample_from_mixture(params, temperature=temperature)
+
+
+class ConditionalFMPrior(_ConditionalPriorBase):
+    """Graph-conditioned flow-matching prior for VAE latent z (default family).
+
+    Instead of emitting an explicit density, learns a velocity field
+    v(z_t, t, c) that transports N(0, I) onto the aggregate posterior of z for
+    each graph (conditional flow matching, Lipman et al. 2023; same recipe as
+    the LFMGN sampler in tum-pbs/dgn4cfd). Training is plain MSE regression on
+    straight-line interpolation paths — no logsumexp, no components, hence none
+    of the mixture's collapse machinery (min-std floors, KL anchor, Gumbel
+    reparameterization). Sampling integrates the ODE with fixed Euler steps.
+
+    The num_z slots are modeled jointly as one flat vector, so cross-level
+    correlations between per-level latents are captured — the mixture treated
+    each slot as an independent mixture.
+
+    z is consumed at its native scale: the MMD regularizer already holds the
+    aggregate posterior near unit scale, and avoiding running-stat buffers
+    keeps EMA/DDP snapshots exact.
+    """
+
+    family = 'fm'
+    # Small path-endpoint noise floor from the conditional-FM objective;
+    # sigma_min = 0 would make t=1 a Dirac endpoint.
+    sigma_min = 1e-4
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.num_steps = int(config.get('prior_fm_steps', 20))
+        self.flat_dim = self.num_z * self.z_dim
+        # Fourier features of t: [sin(2^k π t), cos(2^k π t)], k = 0..15.
+        freqs = (2.0 ** torch.arange(16, dtype=torch.float32)) * math.pi
+        self.register_buffer('t_freqs', freqs, persistent=False)
+        t_emb_dim = 2 * freqs.numel()
+        self.velocity_net = build_mlp(
+            self.flat_dim + t_emb_dim + self.hidden_dim,
+            self.hidden_dim,
+            self.flat_dim,
+            layer_norm=False,
+        )
+        self.apply(init_weights)
+
+    def _t_embed(self, t):
+        ang = t * self.t_freqs.view(1, -1)
+        return torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)
+
+    def velocity(self, z_t, t, cond):
+        """v_θ(z_t, t, c): [B, flat_dim] × [B, 1] × [B, hidden] → [B, flat_dim]."""
+        return self.velocity_net(torch.cat([z_t, self._t_embed(t), cond], dim=-1))
+
+    def fm_loss(self, cond, target_z):
+        """Conditional flow-matching MSE on a detached posterior sample.
+
+        Path: z_t = (1 − (1−σ_min)·t)·z0 + t·z1,  target v* = z1 − (1−σ_min)·z0.
+        The regression optimum at (z_t, t) is the marginal velocity
+        E[v* | z_t, c], whose ODE flow transports N(0,I) exactly onto the
+        distribution of z1 — single-sample noise averages out instead of
+        sculpting spurious sharp modes (the mixture-NLL failure).
+
+        Args:
+            cond:     [B, hidden_dim] pooled condition. Gradient flows through
+                      it into the trunk, so the trunk trains jointly.
+            target_z: [B, num_z, D] fresh detached posterior sample.
+        Returns scalar loss (fp32).
+        """
+        with _autocast_disabled_for(cond):
+            z1 = target_z.reshape(target_z.shape[0], -1).float()
+            c = cond.float()
+            z0 = torch.randn_like(z1)
+            t = torch.rand(z1.shape[0], 1, device=z1.device)
+            s = 1.0 - self.sigma_min
+            z_t = (1.0 - s * t) * z0 + t * z1
+            target_v = z1 - s * z0
+            pred_v = self.velocity(z_t, t, c)
+            return torch.nn.functional.mse_loss(pred_v, target_v)
+
+    @torch.no_grad()
+    def sample(self, graph, temperature=1.0):
+        """Sample z of shape [B, num_z, D] — same interface as the mixture."""
+        return self.sample_n(graph, 1, temperature=temperature)[:, 0]
+
+    @torch.no_grad()
+    def sample_n(self, graph, n, temperature=1.0):
+        """Draw n z samples per graph via Euler ODE integration: [B, n, num_z, D].
+
+        The trunk runs once per graph; only the (tiny) velocity net is called
+        per step. Temperature scales the initial noise std by sqrt(temperature)
+        — the nearest analog of mixture covariance scaling.
+        """
+        cond = self.condition(graph)
+        with _autocast_disabled_for(cond):
+            c = cond.float().repeat_interleave(n, dim=0)     # [B*n, hidden]
+            bn = c.shape[0]
+            z = torch.randn(bn, self.flat_dim, device=c.device)
+            z = z * math.sqrt(max(float(temperature), 1e-6))
+            dt = 1.0 / self.num_steps
+            for k in range(self.num_steps):
+                t = torch.full((bn, 1), k * dt, device=c.device)
+                z = z + dt * self.velocity(z, t, c)
+        B = cond.shape[0]
+        return z.view(B, n, self.num_z, self.z_dim).to(cond.dtype)
+
+
+def build_conditional_prior(config):
+    """Instantiate the conditional prior selected by `prior_family`.
+
+    'fm' (default) → ConditionalFMPrior; 'gmm' → ConditionalMixturePrior.
+    """
+    prior_config = build_prior_config(config)
+    family = prior_config.get('prior_family', 'fm')
+    if family == 'gmm':
+        return ConditionalMixturePrior(prior_config)
+    if family != 'fm':
+        raise ValueError(f"Unknown prior_family '{family}' (expected 'fm' or 'gmm')")
+    return ConditionalFMPrior(prior_config)
 
 
 def _autocast_disabled_for(tensor):
@@ -266,58 +401,6 @@ def sample_from_mixture(params, temperature=1.0):
     return chosen_mu + chosen_std * torch.randn_like(chosen_std)
 
 
-def sample_from_mixture_reparam(params, temperature=1.0, hard=False):
-    """Differentiable mixture sample for joint training.
-
-    Gumbel-Softmax over components + reparameterized Gaussian. Returns z of
-    shape [B, num_z, D] with gradients flowing to logits, mu, and log_std.
-
-    Args:
-        params: dict with 'logits' [B, num_z, K], 'mu' [B, num_z, K, D],
-                'log_std' [B, num_z, K, D].
-        temperature: Gumbel-Softmax temperature. Lower → harder selection,
-                     higher variance gradient. 1.0 is a reasonable default.
-        hard: if True, use straight-through estimator (forward = one-hot,
-              backward = soft). Forward draws are then exact mixture samples.
-    """
-    logits = params['logits']        # [B, num_z, K]
-    mu = params['mu']                # [B, num_z, K, D]
-    log_std = params['log_std']      # [B, num_z, K, D]
-
-    temp = max(float(temperature), 1e-6)
-
-    # Gumbel noise: u ~ Uniform(0,1), g = -log(-log(u + eps) + eps)
-    u = torch.rand_like(logits).clamp_(1e-9, 1.0 - 1e-9)
-    gumbel = -torch.log(-torch.log(u))
-    soft = torch.softmax((logits + gumbel) / temp, dim=-1)   # [B, num_z, K]
-
-    if hard:
-        # Straight-through: forward uses one-hot, backward uses soft
-        index = soft.argmax(dim=-1, keepdim=True)
-        hard_oh = torch.zeros_like(soft).scatter_(-1, index, 1.0)
-        weights = (hard_oh - soft).detach() + soft
-    else:
-        weights = soft
-
-    # Mix component parameters: [B, num_z, K, D] → [B, num_z, D]
-    w = weights.unsqueeze(-1)                                # [B, num_z, K, 1]
-    mu_mixed = (w * mu).sum(dim=-2)                          # [B, num_z, D]
-    log_std_mixed = (w * log_std).sum(dim=-2)                # [B, num_z, D]
-
-    cov_factor = params.get('cov_factor')
-    if cov_factor is not None:
-        # [B,num_z,K,1,1] * [B,num_z,K,D,rank] → sum over K → [B,num_z,D,rank]
-        factor_mixed = (weights[..., None, None] * cov_factor).sum(dim=2)
-        return _lowrank_sample(
-            mu_mixed, log_std_mixed, factor_mixed,
-            temperature=1.0, reparameterized=True,
-        ).to(mu_mixed.dtype)
-
-    eps = torch.randn_like(mu_mixed)
-    z = mu_mixed + torch.exp(log_std_mixed) * eps
-    return z
-
-
 def build_prior_config(config):
     use_multiscale = bool(config.get('use_multiscale', False))
     default_num_z = (int(config.get('multiscale_levels', 1)) + 1) if use_multiscale else 1
@@ -332,11 +415,14 @@ def build_prior_config(config):
         'use_multiscale': use_multiscale,
         'multiscale_levels': config.get('multiscale_levels', 1),
         'num_z': int(config.get('num_z', default_num_z)),
-        'prior_mixture_components': config.get('prior_mixture_components', 50),
+        'prior_family': str(config.get('prior_family', 'fm')).lower().strip(),
         'prior_hidden_dim': config.get('prior_hidden_dim', config.get('latent_dim')),
         'prior_mp_layers': config.get('prior_mp_layers', 10),
+        # fm family only:
+        'prior_fm_steps': config.get('prior_fm_steps', 20),
+        # gmm family only:
+        'prior_mixture_components': config.get('prior_mixture_components', 50),
         'prior_min_std': config.get('prior_min_std', 0.1),
         'prior_cov_rank': config.get('prior_cov_rank', 0),
-        'prior_loss_type': config.get('prior_loss_type', 'mc_nll'),
         'residual_scale': config.get('residual_scale', 1.0),
     }

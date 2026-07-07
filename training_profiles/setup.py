@@ -221,20 +221,17 @@ def build_model_config(config) -> dict:
         # which is what actually sizes the prior at construction. A mismatch makes
         # the saved model_config rebuild a differently-shaped prior at inference
         # and load_state_dict fails.
-        'prior_mixture_components': config.get('prior_mixture_components', 50),
+        'prior_family':             str(config.get('prior_family', 'fm')).lower().strip(),
         'prior_hidden_dim':         config.get('prior_hidden_dim', config.get('latent_dim')),
         'prior_mp_layers':          config.get('prior_mp_layers', 10),
+        # fm family only:
+        'prior_fm_steps':           config.get('prior_fm_steps', 20),
+        # gmm family only:
+        'prior_mixture_components': config.get('prior_mixture_components', 50),
         'prior_min_std':            config.get('prior_min_std', 0.1),
         'prior_cov_rank':           config.get('prior_cov_rank', 0),
-        # alpha_prior (single-sample prior reconstruction) is variance-collapsing
-        # for spread modeling — default 0. The prior is trained by density
-        # matching instead (mc_nll + small analytical-KL anchor).
-        'alpha_prior_max':          config.get('alpha_prior_max', 0.0),
-        'alpha_prior_warmup_frac':  config.get('alpha_prior_warmup_frac', 0.2),
-        'prior_loss_type':          config.get('prior_loss_type', 'mc_nll'),
         'prior_nll_weight':         config.get('prior_nll_weight', 1.0),
         'prior_kl_reg_weight':      config.get('prior_kl_reg_weight', 0.02),
-        'prior_gumbel_temp':        config.get('prior_gumbel_temp', 1.0),
     }
 
 

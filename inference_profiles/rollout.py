@@ -224,6 +224,13 @@ def run_rollout(config, config_filename='config.txt'):
     # Override config with model_config from checkpoint if available
     if 'model_config' in checkpoint:
         model_config = checkpoint['model_config']
+        # Back-compat: checkpoints saved before prior_family existed are all
+        # Gaussian-mixture priors. Without this shim the new 'fm' default
+        # would rebuild them as FM priors and state_dict loading would fail.
+        if ('prior_family' not in model_config
+                and str(model_config.get('prior_type', '')).lower().strip() == 'gnn_e2e'):
+            config['prior_family'] = 'gmm'
+            print("\n  prior_family: gmm (implied by pre-FM checkpoint)")
         print(f"\n  Model config loaded from checkpoint:")
         for k, v in model_config.items():
             old_val = config.get(k)
@@ -340,10 +347,16 @@ def run_rollout(config, config_filename='config.txt'):
     print(f"  Rollout steps: {num_rollout_steps}")
     if use_vae:
         if conditional_prior is not None:
-            sampler_desc = (
-                f"conditional mixture prior "
-                f"({conditional_prior.num_components} components, temp={prior_temperature:g})"
-            )
+            if getattr(conditional_prior, 'family', 'gmm') == 'fm':
+                sampler_desc = (
+                    f"conditional flow-matching prior "
+                    f"({conditional_prior.num_steps} Euler steps, temp={prior_temperature:g})"
+                )
+            else:
+                sampler_desc = (
+                    f"conditional mixture prior "
+                    f"({conditional_prior.num_components} components, temp={prior_temperature:g})"
+                )
         else:
             sampler_desc = (f"legacy GMM ({gmm_params['n_components']} components, "
                             f"{gmm_params['covariance_type']} cov)"

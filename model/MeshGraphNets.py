@@ -6,11 +6,7 @@ from torch_geometric.utils import scatter
 from general_modules.edge_features import EDGE_FEATURE_DIM
 from model.checkpointing import process_with_checkpointing
 from model.coarsening import pool_features, unpool_features
-from model.conditional_prior import (
-    ConditionalMixturePrior,
-    build_prior_config,
-    sample_from_mixture_reparam,
-)
+from model.conditional_prior import build_conditional_prior
 from model.encoder_decoder import Decoder, Encoder, GnBlock
 from model.mlp import build_mlp, init_weights
 from model.vae import GNNVariationalEncoder
@@ -39,8 +35,9 @@ class MeshGraphNets(nn.Module):
         self.use_vae = bool(config.get('use_vae', False))
         self.has_gnn_prior = self.use_vae and prior_type == 'gnn_e2e'
         if self.has_gnn_prior:
-            self.prior = ConditionalMixturePrior(build_prior_config(config)).to(device)
-            print('MeshGraphNets: joint GNN conditional prior enabled (prior_type=gnn_e2e)')
+            self.prior = build_conditional_prior(config).to(device)
+            print(f'MeshGraphNets: joint GNN conditional prior enabled '
+                  f'(prior_type=gnn_e2e, family={self.prior.family})')
         else:
             self.prior = None
 
@@ -50,8 +47,7 @@ class MeshGraphNets(nn.Module):
         self.model.set_checkpointing(enabled)
 
     def forward(self, graph, debug=False, add_noise=None, use_posterior=None,
-                fixed_z=None, use_zero_z=False, compute_prior_path=False,
-                compute_prior_recon=False, gumbel_temp=1.0):
+                fixed_z=None, use_zero_z=False, compute_prior_path=False):
         """
         Forward pass of the simulator.
 
@@ -64,28 +60,21 @@ class MeshGraphNets(nn.Module):
             Returns empty vae_losses/aux_loss. Used by the deterministic auxiliary
             loss (forces the graph-only pathway to predict y on its own).
 
-        compute_prior_path: when True and a GNN conditional prior exists,
-            runs the prior network on the graph and returns its mixture
-            parameters in the 5th tuple element. Density-matching prior losses
-            (mixture NLL / analytical KL) only need these parameters.
-
-        compute_prior_recon: when True (and compute_prior_path is True),
-            additionally draws a reparameterized z from the prior and runs a
-            second simulator forward with it. Only needed for the legacy
-            alpha_prior reconstruction term — that objective is variance-
-            collapsing for spread modeling and is off by default.
+        compute_prior_path: when True and a GNN conditional prior exists, runs
+            the prior network on the graph and returns what its density loss
+            needs in the 5th tuple element — mixture parameters for the gmm
+            family, the pooled conditioning vector for the fm family.
 
         Returns:
             predicted:     [N, output_var] posterior-path prediction
             target:        [N, output_var] graph.y (possibly noised)
             vae_losses:    dict from the posterior-path VAE encoder
             aux_loss:      scalar aux loss (0 if not training)
-            prior_outputs: None, or dict with keys:
-                'prior_params':    {'logits', 'mu', 'log_std'}
-                'predicted_prior': [N, output_var] prior-path prediction
-                                   (only when compute_prior_recon)
-                'z_prior':         [B, num_z, vae_latent_dim] sampled latent
-                                   (only when compute_prior_recon)
+            prior_outputs: None, or dict with exactly one of:
+                'prior_params': {'logits', 'mu', 'log_std'[, 'cov_factor']}
+                                (prior_family gmm)
+                'pooled':       [B, hidden_dim] conditioning vector
+                                (prior_family fm)
         """
         if add_noise is None:
             add_noise = self.training
@@ -116,15 +105,10 @@ class MeshGraphNets(nn.Module):
             # Prior reads raw (post-encoder MLP) graph features, NOT the encoded
             # latents — graph.x is unchanged across both forwards because the
             # simulator's encoder builds a fresh Data inside (does not mutate input).
-            prior_params = self.prior(graph)
-            prior_outputs = {'prior_params': prior_params}
-            if compute_prior_recon:
-                z_prior = sample_from_mixture_reparam(prior_params, temperature=gumbel_temp)
-                predicted_prior, _, _ = self.model(
-                    graph, debug=False, use_posterior=False, fixed_z=z_prior, use_zero_z=False,
-                )
-                prior_outputs['predicted_prior'] = predicted_prior
-                prior_outputs['z_prior'] = z_prior
+            if self.prior.family == 'fm':
+                prior_outputs = {'pooled': self.prior.condition(graph)}
+            else:
+                prior_outputs = {'prior_params': self.prior(graph)}
 
         return predicted, graph.y, vae_losses, aux_loss, prior_outputs
 

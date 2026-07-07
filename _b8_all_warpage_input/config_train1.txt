@@ -1,14 +1,14 @@
 % ============================================================
-% ANTI-SMOOTHING sweep cell 1: control
-% vae_latent_dim=32, Latent_dim=128, posterior_min_std=0.05
+% PRIOR-FAMILY x Z-DIM sweep cell 1: fm_z64
+% prior_family=fm, vae_latent_dim=64, Latent_dim=128, posterior_min_std=0.05
 % feature_loss_weights 1/1/1, Training_epochs 2000, 2-GPU DDP. Base L=2,
-% voronoi 2000/500, cov_rank=8, mse, ew=0.
+% voronoi 2000/500, mse, ew=0.
 % ============================================================
 model   MeshGraphNets-V
 mode    train
 gpu_ids 0,1
-log_file_dir    b8_all/train1_control.log
-modelpath       ./outputs/b8_all/warpage_train1_control.pth
+log_file_dir    b8_all/train1.log
+modelpath       ./outputs/b8_all/warpage_train1.pth
 
 % Datasets
 dataset_dir     ./dataset/b8_main_sec_dataset_traincopy.h5
@@ -63,7 +63,7 @@ bipartite_unpool    True
 
 % VAE (MMD-InfoVAE)
 use_vae          True
-vae_latent_dim   32
+vae_latent_dim   64
 recon_loss       mse
 extreme_weight   0
 alpha_recon      100
@@ -72,17 +72,14 @@ vae_graph_aware  True
 beta_aux         1.0
 posterior_min_std 0.05
 
-% Prior - gnn_e2e: joint training, graph-conditional, low-rank covariance.
+% Prior - gnn_e2e joint training; prior_family fm = conditional flow matching (default).
+% (gmm family remains selectable: prior_family gmm + prior_mixture_components /
+%  prior_min_std / prior_cov_rank / prior_kl_reg_weight.)
 prior_type               gnn_e2e
 use_conditional_prior    True
-prior_cov_rank           8
-alpha_prior_max          0.0
-prior_loss_type          mc_nll
+prior_family             fm
 prior_nll_weight         1.0
-prior_kl_reg_weight      0.05
-prior_gumbel_temp        1.0
-prior_mixture_components 30
+prior_fm_steps           20
 prior_mp_layers          5
 prior_hidden_dim         192
-prior_min_std            0.1
 prior_temperature        1.0

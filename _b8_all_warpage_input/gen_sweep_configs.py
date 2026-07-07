@@ -108,19 +108,14 @@ vae_graph_aware  True
 beta_aux         1.0
 posterior_min_std {pmin}
 
-% Prior - gnn_e2e: joint training, graph-conditional, low-rank covariance.
+% Prior - gnn_e2e joint training; prior_family fm = conditional flow matching (default).
 prior_type               gnn_e2e
 use_conditional_prior    True
-prior_cov_rank           8
-alpha_prior_max          0.0
-prior_loss_type          mc_nll
+prior_family             fm
 prior_nll_weight         1.0
-prior_kl_reg_weight      0.05
-prior_gumbel_temp        1.0
-prior_mixture_components 30
+prior_fm_steps           20
 prior_mp_layers          5
 prior_hidden_dim         192
-prior_min_std            0.1
 prior_temperature        1.0
 """
 
@@ -189,14 +184,10 @@ vae_graph_aware  True
 % Prior - sample z from the learned conditional prior p(z|graph)
 prior_type               gnn_e2e
 use_conditional_prior    True
-prior_cov_rank           8
-alpha_prior_max          0.0
-prior_kl_reg_weight      0.05
-prior_gumbel_temp        1.0
-prior_mixture_components 30
+prior_family             fm
+prior_fm_steps           20
 prior_mp_layers          5
 prior_hidden_dim         192
-prior_min_std            0.1
 prior_temperature        1.0   # raise (e.g. 1.3) to widen generated spread without retraining
 """
 

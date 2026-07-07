@@ -17,18 +17,6 @@ from model.conditional_prior import (
 )
 
 
-def _alpha_prior(epoch, total_epochs, warmup_frac, max_val):
-    """Linear ramp from 0 to max_val over the first `warmup_frac` of training.
-
-    Used to schedule alpha_prior in the joint GNN E2E objective: pure VAE training
-    early on (decoder + posterior stabilize), then the prior-path loss kicks in.
-    """
-    if max_val <= 0.0 or total_epochs is None or total_epochs <= 0:
-        return 0.0
-    warmup_epochs = max(1.0, float(warmup_frac) * float(total_epochs))
-    return float(min(float(max_val), float(epoch) / warmup_epochs))
-
-
 def _unwrap_for_submodule(model):
     """Return the underlying MeshGraphNets module, peeling DDP / EMA / compile wrappers.
 
@@ -200,16 +188,14 @@ def log_training_config(config):
               f"lambda_mmd={lam}, beta_aux={b_aux}, alpha_recon={alpha}, "
               f"lambda_det={l_det})")
         if str(config.get('prior_type', '')).lower().strip() == 'gnn_e2e':
-            p_loss = str(config.get('prior_loss_type', 'mc_nll')).lower().strip()
-            p_nll = config.get('prior_nll_weight', 1.0) if p_loss == 'mc_nll' else 0.0
-            p_kl = config.get('prior_kl_reg_weight', 0.02)
-            a_p = config.get('alpha_prior_max', 0.0)
-            print(f"Prior (gnn_e2e): loss={p_loss} nll_weight={p_nll} "
-                  f"kl_anchor={p_kl} alpha_prior_max={a_p}")
-            if float(a_p) > 0.0:
-                print("  ⚠️  alpha_prior_max > 0: single-sample prior reconstruction is "
-                      "variance-collapsing — generated spread will shrink. Use 0.0 "
-                      "for spread modeling.")
+            p_family = str(config.get('prior_family', 'fm')).lower().strip()
+            p_w = config.get('prior_nll_weight', 1.0)
+            if p_family == 'gmm':
+                p_kl = config.get('prior_kl_reg_weight', 0.02)
+                print(f"Prior (gnn_e2e, family=gmm): nll_weight={p_w} kl_anchor={p_kl}")
+            else:
+                print(f"Prior (gnn_e2e, family=fm): fm_weight={p_w} "
+                      f"euler_steps={config.get('prior_fm_steps', 20)}")
     else:
         print("VAE: disabled")
 
@@ -269,47 +255,32 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
     #
     # The prior's job is density matching: fit p(z|graph) to the cloud of
     # posterior latents so inference samples from the territory the decoder was
-    # trained on. Two density terms are available:
-    #   - mc_nll (default): mixture NLL of a FRESH reparameterized posterior
-    #     sample each step. Unbiased estimate of H(q̄, p); fresh resampling
-    #     avoids the component-overfitting failure of fitting fixed means.
-    #   - analytical_kl: closed-form Jensen upper bound. Moment-matches but
-    #     collapses the mixture to a single broad Gaussian; kept as a small
-    #     stability anchor (prior_kl_reg_weight) and as a legacy main objective.
-    #
-    # alpha_prior (single z-sample reconstruction against the one paired target)
-    # is variance-collapsing for spread modeling — the same failure mode as
-    # lambda_det, routed through the prior. It defaults to 0 and must stay 0
-    # when the goal is matching the data's spread.
+    # trained on. The matching objective depends on prior_family:
+    #   - fm (default): conditional flow-matching MSE on a FRESH reparameterized
+    #     posterior sample each step. The regression target averages over
+    #     samples by construction, so there is no component-collapse mode and
+    #     no KL anchor is needed.
+    #   - gmm: mixture NLL of the fresh sample (mc_nll) plus a small
+    #     analytical-KL Jensen-bound anchor (prior_kl_reg_weight) for stability.
+    # Both weights share the prior_nll_weight key. Fresh resampling makes the
+    # target the smoothed posterior cloud rather than fixed points.
     prior_type = str(config.get('prior_type', '')).lower().strip()
     inner_model = _unwrap_for_submodule(model)
     has_gnn_prior = (
         use_vae and prior_type == 'gnn_e2e'
         and getattr(inner_model, 'prior', None) is not None
     )
-    total_epochs = int(config.get('training_epochs', 1))
-    alpha_prior_max = float(config.get('alpha_prior_max', 0.0))
-    alpha_prior_warmup_frac = float(config.get('alpha_prior_warmup_frac', 0.2))
-    alpha_prior_now = (
-        _alpha_prior(epoch, total_epochs, alpha_prior_warmup_frac, alpha_prior_max)
-        if has_gnn_prior else 0.0
+    prior_family = getattr(getattr(inner_model, 'prior', None), 'family', 'gmm')
+    prior_loss_weight = float(config.get('prior_nll_weight', 1.0)) if has_gnn_prior else 0.0
+    prior_kl_reg_weight = (
+        float(config.get('prior_kl_reg_weight', 0.02))
+        if (has_gnn_prior and prior_family == 'gmm') else 0.0
     )
-    prior_loss_type = str(config.get('prior_loss_type', 'mc_nll')).lower().strip()
-    prior_nll_weight = (
-        float(config.get('prior_nll_weight', 1.0))
-        if prior_loss_type == 'mc_nll' else 0.0
-    )
-    prior_kl_reg_weight = float(config.get('prior_kl_reg_weight', 0.02))
-    prior_gumbel_temp = float(config.get('prior_gumbel_temp', 1.0))
-    # Density losses only need the prior's mixture parameters; the (expensive)
-    # second simulator forward is required only for the legacy alpha_prior term.
     compute_prior_path = has_gnn_prior and (
-        alpha_prior_now > 0.0 or prior_kl_reg_weight > 0.0 or prior_nll_weight > 0.0
+        prior_loss_weight > 0.0 or prior_kl_reg_weight > 0.0
     )
-    compute_prior_recon = has_gnn_prior and alpha_prior_now > 0.0
-    total_recon_prior_sum = 0.0
     total_kl_anchor_sum = 0.0
-    total_prior_nll_sum = 0.0
+    total_prior_loss_sum = 0.0
 
     # Clip the prior's gradients separately from the simulator's. The prior
     # density loss can be large early in training (posteriors far from the
@@ -343,8 +314,6 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
             predicted_acc, target_acc, vae_losses, aux_loss_val, prior_outputs = model(
                 graph, debug=debug_internal,
                 compute_prior_path=compute_prior_path,
-                compute_prior_recon=compute_prior_recon,
-                gumbel_temp=prior_gumbel_temp,
             )
             mmd_loss_val = vae_losses['mmd']
             kl_loss_val = vae_losses['kl']
@@ -360,22 +329,13 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
                     predicted_det, target_acc, config.get('recon_loss', 'huber'))
                 det_loss_val, _, _ = _loss_from_errors(errors_det, loss_weights)
 
-            # Legacy prior-path reconstruction (only when explicitly enabled via
-            # alpha_prior_max > 0 — see the warning above).
-            recon_prior_val = predicted_acc.new_zeros(())
-            if prior_outputs is not None and prior_outputs.get('predicted_prior') is not None:
-                errors_prior = _recon_errors(
-                    prior_outputs['predicted_prior'], target_acc,
-                    config.get('recon_loss', 'huber'),
-                )
-                recon_prior_val, _, _ = _loss_from_errors(errors_prior, loss_weights)
-
-        # KL anchor for the prior. Computed in fp32 outside the autocast region
-        # because analytical_prior_kl_loss does exp(log_var_k) and 1/var_k which
-        # underflow in bfloat16. .detach() on μ, logvar so the encoder isn't
-        # dragged by the anchor — only the prior is constrained.
+        # KL anchor for the gmm prior. Computed in fp32 outside the autocast
+        # region because analytical_prior_kl_loss does exp(log_var_k) and
+        # 1/var_k which underflow in bfloat16. .detach() on μ, logvar so the
+        # encoder isn't dragged by the anchor — only the prior is constrained.
         kl_anchor_val = torch.zeros((), device=predicted_acc.device, dtype=torch.float32)
         if (prior_outputs is not None
+                and prior_outputs.get('prior_params') is not None
                 and prior_kl_reg_weight > 0.0
                 and vae_losses.get('mu') is not None):
             kl_anchor_val = analytical_prior_kl_loss(
@@ -384,22 +344,27 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
                 vae_losses['logvar'].detach().float(),
             )
 
-        # Mixture NLL of a FRESH posterior sample (detached, fp32). Resampling
-        # z ~ q(z|y) every step makes the target the smoothed posterior cloud
-        # rather than a fixed set of points, so mixture components can
-        # specialize without collapsing onto individual training samples.
-        # Gradient reaches only the prior (q is detached).
-        prior_nll_val = torch.zeros((), device=predicted_acc.device, dtype=torch.float32)
+        # Prior density-matching loss on a FRESH posterior sample (detached,
+        # fp32). Resampling z ~ q(z|y) every step makes the target the smoothed
+        # posterior cloud rather than a fixed set of points. Gradient reaches
+        # only the prior — q is detached; for fm it also flows into the prior's
+        # trunk via the pooled conditioning vector from the forward pass.
+        prior_loss_val = torch.zeros((), device=predicted_acc.device, dtype=torch.float32)
         if (prior_outputs is not None
-                and prior_nll_weight > 0.0
+                and prior_loss_weight > 0.0
                 and vae_losses.get('mu') is not None):
             mu_q = vae_losses['mu'].detach().float()
             logvar_q = vae_losses['logvar'].detach().float()
             z_fresh = mu_q + torch.exp(0.5 * logvar_q) * torch.randn_like(mu_q)
-            prior_nll_val = mixture_nll(
-                {k: v.float() for k, v in prior_outputs['prior_params'].items()},
-                z_fresh,
-            )
+            if prior_outputs.get('pooled') is not None:
+                prior_loss_val = inner_model.prior.fm_loss(
+                    prior_outputs['pooled'], z_fresh,
+                )
+            else:
+                prior_loss_val = mixture_nll(
+                    {k: v.float() for k, v in prior_outputs['prior_params'].items()},
+                    z_fresh,
+                )
 
         with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
 
@@ -424,14 +389,12 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
                     loss = loss + lambda_det * det_loss_val
                 if free_bits > 0.0:
                     loss = loss + kl_loss_val
-                # Joint GNN E2E prior contribution: density matching (NLL +
-                # small KL anchor); legacy recon term only if explicitly enabled.
-                if prior_outputs is not None and alpha_prior_now > 0.0:
-                    loss = loss + alpha_prior_now * recon_prior_val
+                # Joint GNN E2E prior contribution: density matching (mixture
+                # NLL or flow-matching MSE; + small KL anchor for gmm).
                 if prior_outputs is not None and prior_kl_reg_weight > 0.0:
                     loss = loss + prior_kl_reg_weight * kl_anchor_val
-                if prior_outputs is not None and prior_nll_weight > 0.0:
-                    loss = loss + prior_nll_weight * prior_nll_val
+                if prior_outputs is not None and prior_loss_weight > 0.0:
+                    loss = loss + prior_loss_weight * prior_loss_val
             else:
                 loss = recon_loss
             # Scale loss so accumulated gradients equal the mean within each accumulation window.
@@ -468,9 +431,8 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
             total_det_sum += det_scalar
             mmd_count += 1
             if prior_outputs is not None:
-                total_recon_prior_sum += float(recon_prior_val.item())
                 total_kl_anchor_sum += float(kl_anchor_val.item())
-                total_prior_nll_sum += float(prior_nll_val.item())
+                total_prior_loss_sum += float(prior_loss_val.item())
 
         # Step optimizer at end of accumulation window or final batch
         is_last_batch = (batch_idx == total_batches - 1)
@@ -524,11 +486,10 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
                     postfix['kl'] = f'{kl_val:.2e}'
                     postfix['kl_raw'] = f'{kl_raw_v:.2e}'
                 if prior_outputs is not None:
-                    postfix['nll_p'] = f'{prior_nll_val.item():.2e}'
-                    postfix['kl_a']  = f'{kl_anchor_val.item():.2e}'
-                    if alpha_prior_now > 0.0:
-                        postfix['rec_p'] = f'{recon_prior_val.item():.2e}'
-                        postfix['α_p']   = f'{alpha_prior_now:.2f}'
+                    p_key = 'fm_p' if prior_outputs.get('pooled') is not None else 'nll_p'
+                    postfix[p_key] = f'{prior_loss_val.item():.2e}'
+                    if prior_kl_reg_weight > 0.0:
+                        postfix['kl_a'] = f'{kl_anchor_val.item():.2e}'
                 postfix['total'] = f'{loss.item():.2e}'
             if monitor_gradients:
                 postfix['grad'] = f'{grad_norm.item():.2e}'
@@ -559,10 +520,9 @@ def train_epoch(model, dataloader, optimizer, device, config, epoch, scheduler=N
             result['kl_mean'] = total_kl_sum / mmd_count
             result['kl_raw_mean'] = total_kl_raw_sum / mmd_count
         if has_gnn_prior:
-            result['recon_prior_mean'] = total_recon_prior_sum / mmd_count
-            result['kl_anchor_mean']   = total_kl_anchor_sum / mmd_count
-            result['prior_nll_mean']   = total_prior_nll_sum / mmd_count
-            result['alpha_prior']      = alpha_prior_now
+            result['prior_loss_mean'] = total_prior_loss_sum / mmd_count
+            if prior_kl_reg_weight > 0.0:
+                result['kl_anchor_mean'] = total_kl_anchor_sum / mmd_count
     return result
 
 def _eval_forward_errors(model, graph, use_amp, amp_dtype, use_posterior, recon_loss='huber'):
@@ -754,6 +714,10 @@ def evaluate_vae_learned_prior_epoch(model, dataloader, device, config, epoch=0,
     if getattr(inner, 'prior', None) is None:
         return None
     vae_encoder = getattr(getattr(inner, 'model', None), 'vae_encoder', None)
+    is_fm_prior = getattr(inner.prior, 'family', 'gmm') == 'fm'
+    # fm has no closed-form variance; estimate the per-graph prior spread from
+    # a small sample cloud instead (first sample doubles as the eval z).
+    fm_diag_samples = 8
 
     model.eval()
     loss_weights = _build_loss_weights(config, device)
@@ -782,8 +746,14 @@ def evaluate_vae_learned_prior_epoch(model, dataloader, device, config, epoch=0,
         for graph in pbar:
             graph = _move_graph_to_device(graph, device, config)
             with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
-                prior_params = inner.prior(graph)
-                z_prior = sample_from_mixture(prior_params, temperature=prior_temperature)
+                if is_fm_prior:
+                    z_cloud = inner.prior.sample_n(
+                        graph, fm_diag_samples, temperature=prior_temperature,
+                    )  # [B, S, num_z, D]
+                    z_prior = z_cloud[:, 0]
+                else:
+                    prior_params = inner.prior(graph)
+                    z_prior = sample_from_mixture(prior_params, temperature=prior_temperature)
                 predicted, target, _, _, _ = model(
                     graph, add_noise=False, use_posterior=False, fixed_z=z_prior,
                 )
@@ -804,17 +774,22 @@ def evaluate_vae_learned_prior_epoch(model, dataloader, device, config, epoch=0,
                     mu_q_all.append(mu_q.float().cpu())
                     var_q_all.append(logvar_q.float().exp().cpu())
 
-                # Prior mixture total variance per dim:
-                #   Var = Σ_k π_k (σ_k² + μ_k²) − (Σ_k π_k μ_k)²
-                pi = torch.softmax(prior_params['logits'].float(), dim=-1).unsqueeze(-1)
-                mu_p = prior_params['mu'].float()
-                var_p = (2.0 * prior_params['log_std'].float()).exp()
-                if prior_params.get('cov_factor') is not None:
-                    # per-dim marginal variance: diag(L L^T) + diag part
-                    var_p = var_p + prior_params['cov_factor'].float().pow(2).sum(dim=-1)
-                mean_mix = (pi * mu_p).sum(dim=-2)
-                var_mix = (pi * (var_p + mu_p.pow(2))).sum(dim=-2) - mean_mix.pow(2)
-                prior_var_all.append(var_mix.clamp(min=0).cpu())
+                if is_fm_prior:
+                    # Per-graph prior variance from the sample cloud [B, S, num_z, D].
+                    prior_var_all.append(
+                        z_cloud.float().var(dim=1, unbiased=False).cpu())
+                else:
+                    # Prior mixture total variance per dim:
+                    #   Var = Σ_k π_k (σ_k² + μ_k²) − (Σ_k π_k μ_k)²
+                    pi = torch.softmax(prior_params['logits'].float(), dim=-1).unsqueeze(-1)
+                    mu_p = prior_params['mu'].float()
+                    var_p = (2.0 * prior_params['log_std'].float()).exp()
+                    if prior_params.get('cov_factor') is not None:
+                        # per-dim marginal variance: diag(L L^T) + diag part
+                        var_p = var_p + prior_params['cov_factor'].float().pow(2).sum(dim=-1)
+                    mean_mix = (pi * mu_p).sum(dim=-2)
+                    var_mix = (pi * (var_p + mu_p.pow(2))).sum(dim=-2) - mean_mix.pow(2)
+                    prior_var_all.append(var_mix.clamp(min=0).cpu())
 
             _, batch_loss_sum, batch_loss_count = _loss_from_errors(errors, loss_weights)
             total_loss_sum += batch_loss_sum

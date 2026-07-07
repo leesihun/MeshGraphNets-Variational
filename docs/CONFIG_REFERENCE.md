@@ -138,25 +138,23 @@ same mesh topology. For this objective, keep `lambda_mmd` low (≈ 0.1),
 | `gmm_covariance_type` | GMM | Sklearn covariance type, for example `full`. |
 | `gmm_reg_covar` | GMM | Optional GMM regularization. |
 | `train_conditional_prior` | training | When `use_vae True`, runs the post-hoc conditional prior training at the end of simulator training. Default `True`; set `False` to skip. |
-| `use_conditional_prior` | inference, prior | At inference, load the conditional prior from the checkpoint and sample z from it. Default `True`; falls back to GMM/N(0,I) if the checkpoint lacks `conditional_prior_state_dict`. Set `False` to force GMM/N(0,I). |
-| `prior_mixture_components` | prior | Mixture components predicted by the conditional prior. Default `10`. |
+| `use_conditional_prior` | inference, prior | At inference, sample z from the joint-trained conditional prior (a model submodule). Default `True`; set `False` to force GMM/N(0,I). |
+| `prior_type` | model, training | `gnn_e2e` enables the joint graph-conditional prior submodule (trained alongside the simulator). |
+| `prior_family` | prior | Density family of the gnn_e2e prior: `fm` (conditional flow matching, **default**) or `gmm` (Gaussian mixture, legacy). Persisted in the checkpoint; pre-FM checkpoints load as `gmm` automatically. |
+| `prior_nll_weight` | training | Weight of the prior density-matching objective — flow-matching MSE (`fm`) or mixture NLL (`gmm`). Default `1.0`. |
+| `prior_fm_steps` | prior (fm) | Euler ODE steps when sampling from the FM prior. Default `20`. |
 | `prior_hidden_dim` | prior | Prior hidden width. Defaults to `latent_dim`. |
 | `prior_mp_layers` | prior | Prior graph message-passing layers. Default `3`. |
-| `prior_min_std` | prior | Minimum predicted latent standard deviation. Default `1e-3`. |
-| `prior_epochs` | prior | Post-hoc prior training epochs. Default `200`. |
-| `prior_learningr` | prior | Prior optimizer LR. Defaults to `learningr`. |
-| `prior_batch_size` | prior | Prior batch size. Defaults to `batch_size`. |
-| `prior_num_workers` | prior | Prior DataLoader workers. Default `0`. |
-| `prior_val_interval` | prior | Prior validation interval. Default `10`. |
-| `prior_mc_samples` | prior | Number of posterior `z` samples used as prior-training targets. Default `4`. |
-| `prior_temperature` | inference | Divides mixture logits and scales sampled std by `sqrt(temperature)`. |
-| `resume_prior` | prior | Defaults to `True`; resumes prior weights already stored in checkpoint. |
+| `prior_mixture_components` | prior (gmm) | Mixture components. Default `50`. |
+| `prior_min_std` | prior (gmm) | Minimum predicted component std. Default `0.1`. |
+| `prior_cov_rank` | prior (gmm) | Low-rank covariance rank per component. Default `0` (diagonal). |
+| `prior_kl_reg_weight` | training (gmm) | Small analytical-KL stability anchor. Default `0.02`. Ignored for `fm` (no collapse mode to anchor). |
+| `prior_temperature` | inference | `gmm`: divides mixture logits and scales sampled std by `sqrt(temperature)`. `fm`: scales the initial noise std by `sqrt(temperature)`. |
 
-Current `_b8_all_warpage_input/config_train*.txt` files say "Train VAE-MGN, then
-train post-hoc conditional prior" in comments, but their live keys are `mode train`
-and `fit_latent_gmm True`. That launch trains the simulator and fits the legacy
-GMM. To train the conditional prior, use `mode train_with_prior` for the simulator
-run or run `mode train_prior` against the finished checkpoint.
+Removed legacy keys (deleted with the FM prior introduction): `alpha_prior_max`,
+`alpha_prior_warmup_frac`, `prior_loss_type`, `prior_gumbel_temp`, and the dead
+post-hoc trainer keys (`prior_epochs`, `prior_learningr`, `prior_batch_size`,
+`prior_num_workers`, `prior_val_interval`, `prior_mc_samples`, `resume_prior`).
 
 ## Training And Performance Keys
 

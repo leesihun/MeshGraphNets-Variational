@@ -30,13 +30,15 @@ Implications for VAE design:
 - **use_conditional_prior True** (with `train_with_prior` or `train_prior`) is
   the correct architectural fix for type-to-type generalization: the prior
   `p(z|graph)` maps each part type to its spread distribution at inference time.
-- **alpha_prior_max must be 0.0.** Training the gnn_e2e prior by single-sample
-  reconstruction (`alpha_prior * recon_prior`) is variance-collapsing: the prior
-  cannot know which paired target it will be graded against, so its optimum is a
-  point mass — the same failure mode as `lambda_det`, routed through the prior.
-  The prior is trained by density matching instead: `prior_loss_type mc_nll`
-  (mixture NLL on a fresh detached posterior sample each step) plus a small
-  `prior_kl_reg_weight` analytical-KL anchor.
+- **The prior is trained ONLY by density matching** on a fresh detached
+  posterior sample each step, weighted by `prior_nll_weight`. `prior_family`
+  selects the family: `fm` (default) is a conditional flow-matching prior —
+  velocity-MSE regression, no components, no collapse machinery; `gmm` is the
+  legacy Gaussian mixture — mixture NLL plus a small `prior_kl_reg_weight`
+  analytical-KL anchor. The old single-sample prior reconstruction path
+  (`alpha_prior_max`, Gumbel reparam sampling) was variance-collapsing — the
+  same failure mode as `lambda_det`, routed through the prior — and has been
+  deleted from the code, along with `prior_loss_type` and `prior_gumbel_temp`.
 
 ## Run Commands
 
@@ -54,7 +56,7 @@ python MeshGraphNets_main.py --config _b8_all_warpage_input/config_infer1.txt
 |------|-----------|
 | `train` | `single_worker` or `train_worker`; with `use_vae True`, runs post-hoc conditional prior at the end by default (set `train_conditional_prior False` to skip), then fits legacy GMM if `fit_latent_gmm True`. |
 | `train_with_prior` | Backward-compat alias for `train`. Rewritten to `train` at dispatch. |
-| `train_prior` | `training_profiles.posthoc_prior.train_posthoc_prior`. |
+| `train_prior` | Only valid for `prior_type gmm` (`model.latent_gmm.train_posthoc_gmm`). For `gnn_e2e` the prior trains jointly inside `mode train`. |
 | `inference` | `inference_profiles.rollout.run_rollout`; loads conditional prior by default if present in the checkpoint (set `use_conditional_prior False` to fall back to GMM/N(0,I)). |
 
 `gpu_ids` length controls single process vs DDP unless `parallel_mode model_split`
@@ -69,7 +71,7 @@ is set. `parallel_mode model_split` routes to `parallelism.launcher`.
 | [model/encoder_decoder.py](model/encoder_decoder.py) | Encoder, GnBlock, Decoder. |
 | [model/blocks.py](model/blocks.py) | EdgeBlock, NodeBlock, HybridNodeBlock, UnpoolBlock. |
 | [model/vae.py](model/vae.py) | Graph VAE encoder, MMD, optional free-bits KL. |
-| [model/conditional_prior.py](model/conditional_prior.py) | Mesh-conditioned diagonal Gaussian mixture prior for `z`. |
+| [model/conditional_prior.py](model/conditional_prior.py) | Mesh-conditioned priors for `z`: flow matching (`fm`, default) and Gaussian mixture (`gmm`), shared GNN trunk. |
 | [model/latent_gmm.py](model/latent_gmm.py) | Legacy post-hoc GMM collection, fit, and sampling. |
 | [model/coarsening.py](model/coarsening.py) | BFS and Voronoi coarsening, pool/unpool, `MultiscaleData`. |
 | [general_modules/mesh_dataset.py](general_modules/mesh_dataset.py) | HDF5 loading, split, normalization, positional features, world/multiscale attrs. |
@@ -78,7 +80,6 @@ is set. `parallel_mode model_split` routes to `parallelism.launcher`.
 | [general_modules/multiscale_helpers.py](general_modules/multiscale_helpers.py) | Shared hierarchy build/attach used by dataset and rollout. |
 | [training_profiles/setup.py](training_profiles/setup.py) | Dataset/model/EMA/optimizer/checkpoint helpers. |
 | [training_profiles/training_loop.py](training_profiles/training_loop.py) | Train, validate, VAE prior/posterior eval, test visualization. |
-| [training_profiles/posthoc_prior.py](training_profiles/posthoc_prior.py) | Frozen-simulator conditional-prior training. |
 | [inference_profiles/rollout.py](inference_profiles/rollout.py) | Autoregressive rollout and HDF5 output. |
 | [parallelism/](parallelism) | Experimental model-split training across GPUs. |
 
@@ -132,10 +133,10 @@ For manufacturing spread modeling the recommended training loss weights are:
 | `lambda_det` | 0.0 | Must be zero: det auxiliary loss conflicts with spread objective |
 | `vae_latent_dim` | 32 | Full capacity needed to represent spread across part types |
 | `vae_graph_aware` | True | Enables type-conditional spread encoding |
-| `alpha_prior_max` | 0.0 | Must be zero: single-sample prior recon collapses prior variance |
-| `prior_loss_type` | `mc_nll` | Fits the mixture prior to fresh posterior samples (density matching) |
-| `prior_nll_weight` | 1.0 | Weight of the mixture-NLL prior objective |
-| `prior_kl_reg_weight` | 0.05 | Small analytical-KL stability anchor for the prior |
+| `prior_family` | `fm` | Flow-matching prior (default): expressive density matching with no component-collapse modes; models all num_z slots jointly |
+| `prior_nll_weight` | 1.0 | Weight of the prior objective (FM velocity-MSE, or mixture NLL for `gmm`) |
+| `prior_fm_steps` | 20 | Euler ODE steps for FM prior sampling |
+| `prior_kl_reg_weight` | 0.05 | gmm family only: small analytical-KL stability anchor (ignored for `fm`) |
 
 Validation prints a per-slot `[PriorDiag]` line (posterior cloud std vs prior
 std). A `spread_ratio` near 1 is healthy; near 0 means the prior collapsed and
