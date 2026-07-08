@@ -14,7 +14,7 @@ This sweep attacks smoothing with more capacity + an extremely sharp posterior:
   cell3 bigcap+sharp : 64/192, pmin=0.001  (cap+, sharp+)
   cell4 sharp        : 32/128, pmin=0.001  (cap-, sharp+)  -- completes the 2x2
 pmin=0.001 is a near-zero sigma_q floor -> sharpest decoder; watch for the
-sigma_q-collapse failure ([PriorDiag] spread_ratio / ValidQ).
+sigma_q-collapse failure ([PriorDiag] spread_ratio / Valid).
 
 GPU7 is down. cells 1-3 use pairs (0,1)/(2,3)/(4,5); cell4 reuses (0,1) in a
 second wave (after cell1). config_train1..4 (+ infer).

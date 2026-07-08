@@ -20,7 +20,6 @@ from training_profiles.setup import (
 from training_profiles.training_loop import (
     evaluate_vae_learned_prior_epoch,
     evaluate_vae_posterior_epoch,
-    evaluate_vae_prior_epoch,
     log_training_config,
     test_model,
     train_epoch,
@@ -121,8 +120,9 @@ def single_worker(config, config_filename='config.txt'):
 
     modelname = config.get('modelpath')
     use_vae = config.get('use_vae', False)
-    vae_valid_prior_samples = int(config.get('vae_valid_prior_samples', 8)) if use_vae else 1
-    if vae_valid_prior_samples < 1:
+    # Number of prior samples per graph used for the CRPS validation score
+    # (consumed inside evaluate_vae_learned_prior_epoch); validate it here.
+    if use_vae and int(config.get('vae_valid_prior_samples', 8)) < 1:
         raise ValueError("vae_valid_prior_samples must be >= 1")
 
     last_valid_loss = float('inf')
@@ -145,29 +145,22 @@ def single_worker(config, config_filename='config.txt'):
             if do_val:
                 if use_vae:
                     valid_metrics = evaluate_vae_posterior_epoch(
-                        eval_model, val_loader, device, config, epoch, progress_name='ValidQ'
+                        eval_model, val_loader, device, config, epoch, progress_name='Valid'
                     )
-                    valid_prior_metrics = evaluate_vae_prior_epoch(
-                        eval_model, val_loader, device, config, epoch,
-                        num_prior_samples=vae_valid_prior_samples,
-                        progress_name=f'ValidPrior@{vae_valid_prior_samples}'
-                    )
-                    # Inference-mirroring eval: z from the learned p(z|graph),
-                    # plus the prior-vs-posterior spread diagnostic.
-                    # None when the model has no learned prior.
+                    # Inference-mirroring eval: z from the learned p(z|graph).
+                    # Produces the CRPS score (and the [PriorDiag] spread
+                    # diagnostic). None when the model has no learned prior.
                     valid_learned_prior_metrics = evaluate_vae_learned_prior_epoch(
                         eval_model, val_loader, device, config, epoch,
-                        progress_name='ValidLearnedPrior'
+                        progress_name='CRPS'
                     )
                 else:
                     valid_metrics      = validate_epoch(eval_model, val_loader, device, config, epoch)
-                    valid_prior_metrics = None
                     valid_learned_prior_metrics = None
                 valid_loss = valid_metrics['mean']
             else:
                 valid_loss = last_valid_loss  # reuse last known for checkpoint metadata
                 valid_metrics = {}
-                valid_prior_metrics = None
                 valid_learned_prior_metrics = None
 
             if use_vae:
@@ -177,42 +170,32 @@ def single_worker(config, config_filename='config.txt'):
                 if do_val:
                     valid_mmd   = valid_metrics.get('mmd_mean', 0.0)
                     valid_total = valid_metrics.get('total_mean', valid_loss)
-                    valid_prior_loss = valid_prior_metrics['mean']
-                    prior_gap = valid_prior_loss - valid_loss
-                    learned_prior_str = ''
-                    if valid_learned_prior_metrics is not None:
-                        learned_prior_str = (
-                            f" | ValidLearnedPrior recon={valid_learned_prior_metrics['mean']:.2e}"
-                        )
-                        if 'spread_ratio' in valid_learned_prior_metrics:
-                            learned_prior_str += (
-                                f" spread_ratio={valid_learned_prior_metrics['spread_ratio']}"
-                            )
+                    crps_str = ''
+                    if (valid_learned_prior_metrics is not None
+                            and 'crps' in valid_learned_prior_metrics):
+                        crps_str = f" | CRPS  {valid_learned_prior_metrics['crps']:.2e}"
                     print(
                         f"Epoch {epoch}/{total_epochs} LR: {current_lr:.2e} | "
-                        f"TrainOpt  recon={train_loss:.2e} mmd={train_mmd:.2e} aux={train_aux:.2e} total={train_total:.2e} | "
-                        f"ValidQ    recon={valid_loss:.2e} mmd={valid_mmd:.2e} total={valid_total:.2e} | "
-                        f"ValidPrior@{vae_valid_prior_samples} recon={valid_prior_loss:.2e} gap={prior_gap:.2e}"
-                        f"{learned_prior_str}"
+                        f"Train  recon={train_loss:.2e} mmd={train_mmd:.2e} aux={train_aux:.2e} total={train_total:.2e} | "
+                        f"Valid  recon={valid_loss:.2e} mmd={valid_mmd:.2e} total={valid_total:.2e}"
+                        f"{crps_str}"
                     )
                 else:
-                    valid_prior_loss = None
                     print(
                         f"Epoch {epoch}/{total_epochs} LR: {current_lr:.2e} | "
-                        f"TrainOpt  recon={train_loss:.2e} mmd={train_mmd:.2e} aux={train_aux:.2e} total={train_total:.2e}"
+                        f"Train  recon={train_loss:.2e} mmd={train_mmd:.2e} aux={train_aux:.2e} total={train_total:.2e}"
                     )
             else:
-                valid_prior_loss = None
                 if do_val:
                     print(
                         f"Epoch {epoch}/{total_epochs} "
-                        f"TrainOpt: {train_loss:.2e} "
+                        f"Train: {train_loss:.2e} "
                         f"Valid: {valid_loss:.2e} LR: {current_lr:.2e}"
                     )
                 else:
                     print(
                         f"Epoch {epoch}/{total_epochs} "
-                        f"TrainOpt: {train_loss:.2e} LR: {current_lr:.2e}"
+                        f"Train: {train_loss:.2e} LR: {current_lr:.2e}"
                     )
 
             if do_val:
@@ -222,8 +205,6 @@ def single_worker(config, config_filename='config.txt'):
                 epoch, model, ema_model, optimizer, scheduler,
                 train_loss, valid_loss, config, train_dataset, modelname,
                 use_vae=use_vae,
-                valid_prior_loss=valid_prior_loss if use_vae else None,
-                vae_valid_prior_samples=vae_valid_prior_samples if use_vae else None,
             )
             print(f"  -> Model saved at epoch {epoch} with valid loss {valid_loss:.2e}")
 
@@ -232,22 +213,17 @@ def single_worker(config, config_filename='config.txt'):
                     elapsed = time.time() - start_time
                     if use_vae:
                         val_str = (
-                            f"ValidQ recon={valid_loss:.4e} mmd={valid_metrics.get('mmd_mean',0):.4e} "
-                            f"total={valid_metrics.get('total_mean',valid_loss):.4e} | "
-                            f"ValidPrior@{vae_valid_prior_samples} recon={valid_prior_loss:.4e} "
-                            f"gap={prior_gap:.4e}"
-                        ) if do_val else "ValidQ skipped"
-                        if do_val and valid_learned_prior_metrics is not None:
+                            f"Valid recon={valid_loss:.4e} mmd={valid_metrics.get('mmd_mean',0):.4e} "
+                            f"total={valid_metrics.get('total_mean',valid_loss):.4e}"
+                        ) if do_val else "Valid skipped"
+                        if (do_val and valid_learned_prior_metrics is not None
+                                and 'crps' in valid_learned_prior_metrics):
                             val_str += (
-                                f" | ValidLearnedPrior recon={valid_learned_prior_metrics['mean']:.4e}"
+                                f" | CRPS {valid_learned_prior_metrics['crps']:.4e}"
                             )
-                            if 'spread_ratio' in valid_learned_prior_metrics:
-                                val_str += (
-                                    f" spread_ratio={valid_learned_prior_metrics['spread_ratio']}"
-                                )
                         f.write(
                             f"Elapsed: {elapsed:.2f}s Epoch {epoch} LR: {current_lr:.4e} | "
-                            f"TrainOpt recon={train_loss:.4e} mmd={train_metrics.get('mmd_mean',0):.4e} "
+                            f"Train recon={train_loss:.4e} mmd={train_metrics.get('mmd_mean',0):.4e} "
                             f"total={train_metrics.get('total_mean',train_loss):.4e} | "
                             f"{val_str}\n"
                         )
@@ -255,7 +231,7 @@ def single_worker(config, config_filename='config.txt'):
                         val_str = f"Valid {valid_loss:.4e}" if do_val else "Valid skipped"
                         f.write(
                             f"Elapsed: {elapsed:.2f}s "
-                            f"Epoch {epoch} TrainOpt {train_loss:.4e} "
+                            f"Epoch {epoch} Train {train_loss:.4e} "
                             f"{val_str} LR: {current_lr:.4e}\n"
                         )
 

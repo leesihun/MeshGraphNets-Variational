@@ -115,6 +115,35 @@ def _recon_errors(predicted, target, recon_loss='huber'):
     return torch.nn.functional.huber_loss(predicted, target, reduction='none', delta=1.0)
 
 
+def _crps_from_samples(samples, target):
+    """Fair (unbiased) CRPS estimator, per element.
+
+    CRPS is the standard proper scoring rule for a probabilistic forecast scored
+    against a single observation: it is minimized exactly when the generated
+    distribution equals the true one, penalizing both a wrong mean AND wrong
+    spread (too narrow OR too wide). This makes it the right validation metric
+    for spread modeling, where recon-only metrics reward mean collapse.
+
+        CRPS ≈ mean_s |x_s - y|  −  1/(2 S (S-1)) Σ_s Σ_j |x_s - x_j|
+
+    The second (fair) normalization removes the finite-sample bias of the naive
+    1/(2 S²) form, which otherwise rewards under-dispersion at small S.
+
+    samples: [S, N, F] prior-sampled predictions. target: [N, F]. Returns [N, F].
+    Uses absolute (L1) distance by definition, independent of `recon_loss`.
+    """
+    S = samples.shape[0]
+    accuracy = (samples - target.unsqueeze(0)).abs().mean(dim=0)  # [N, F]
+    if S < 2:
+        return accuracy
+    # Pairwise mean abs difference, looped over s to bound memory at [S, N, F].
+    pair_sum = torch.zeros_like(accuracy)
+    for s in range(S):
+        pair_sum += (samples[s].unsqueeze(0) - samples).abs().sum(dim=0)
+    spread = pair_sum / (2.0 * S * (S - 1))
+    return accuracy - spread
+
+
 def _extremity_weights(target, batch, extreme_weight, zc=2):
     """Per-node weight upweighting nodes whose TARGET z_disp is extreme (peaks/
     valleys), so the posterior reconstruction does not smooth them — this raises
@@ -538,12 +567,7 @@ def _eval_forward_errors(model, graph, use_amp, amp_dtype, use_posterior, recon_
 
 
 def _evaluate_epoch(model, dataloader, device, config, epoch=0, *,
-                    use_posterior=None, num_prior_samples=1, progress_name='Validation'):
-    if num_prior_samples < 1:
-        raise ValueError("num_prior_samples must be >= 1")
-    if use_posterior is not False and num_prior_samples != 1:
-        raise ValueError("num_prior_samples > 1 is only valid for prior evaluation")
-
+                    use_posterior=None, progress_name='Validation'):
     model.eval()
 
     verbose = config.get('verbose', False)
@@ -576,24 +600,10 @@ def _evaluate_epoch(model, dataloader, device, config, epoch=0, *,
 
             graph = _move_graph_to_device(graph, device, config)
 
-            if use_vae and use_posterior is False and num_prior_samples > 1:
-                errors_sum = None
-                for _ in range(num_prior_samples):
-                    sample_errors, _ = _eval_forward_errors(
-                        model, graph, use_amp, amp_dtype, use_posterior=False,
-                        recon_loss=config.get('recon_loss', 'huber'),
-                    )
-                    if errors_sum is None:
-                        errors_sum = sample_errors
-                    else:
-                        errors_sum += sample_errors
-                errors = errors_sum / num_prior_samples
-                mmd_loss_val = errors.new_zeros(())
-            else:
-                errors, mmd_loss_val = _eval_forward_errors(
-                    model, graph, use_amp, amp_dtype, use_posterior=use_posterior,
-                    recon_loss=config.get('recon_loss', 'huber'),
-                )
+            errors, mmd_loss_val = _eval_forward_errors(
+                model, graph, use_amp, amp_dtype, use_posterior=use_posterior,
+                recon_loss=config.get('recon_loss', 'huber'),
+            )
 
             recon_loss, batch_loss_sum, batch_loss_count = _loss_from_errors(errors, loss_weights)
             if use_vae:
@@ -659,7 +669,6 @@ def validate_epoch(model, dataloader, device, config, epoch=0):
         config,
         epoch,
         use_posterior=None,
-        num_prior_samples=1,
         progress_name='Validation',
     )
 
@@ -672,23 +681,6 @@ def evaluate_vae_posterior_epoch(model, dataloader, device, config, epoch=0, pro
         config,
         epoch,
         use_posterior=True,
-        num_prior_samples=1,
-        progress_name=progress_name,
-    )
-
-
-def evaluate_vae_prior_epoch(model, dataloader, device, config, epoch=0, *,
-                             num_prior_samples, progress_name=None):
-    if progress_name is None:
-        progress_name = f'ValidationPrior@{num_prior_samples}'
-    return _evaluate_epoch(
-        model,
-        dataloader,
-        device,
-        config,
-        epoch,
-        use_posterior=False,
-        num_prior_samples=num_prior_samples,
         progress_name=progress_name,
     )
 
@@ -715,9 +707,10 @@ def evaluate_vae_learned_prior_epoch(model, dataloader, device, config, epoch=0,
         return None
     vae_encoder = getattr(getattr(inner, 'model', None), 'vae_encoder', None)
     is_fm_prior = getattr(inner.prior, 'family', 'gmm') == 'fm'
-    # fm has no closed-form variance; estimate the per-graph prior spread from
-    # a small sample cloud instead (first sample doubles as the eval z).
-    fm_diag_samples = 8
+    # Prior samples drawn per graph, used for (a) the CRPS estimate and (b) the
+    # prior-spread diagnostic (fm has no closed-form variance, so it is estimated
+    # from this sample cloud). Sample 0 doubles as the recon eval z.
+    num_prior_samples = int(config.get('vae_valid_prior_samples', 8))
 
     model.eval()
     loss_weights = _build_loss_weights(config, device)
@@ -727,6 +720,8 @@ def evaluate_vae_learned_prior_epoch(model, dataloader, device, config, epoch=0,
 
     total_loss_sum = 0.0
     total_loss_count = 0
+    total_crps_sum = 0.0
+    total_crps_count = 0
     mu_q_all = []          # posterior means per sample [B, num_z, D]
     var_q_all = []         # posterior variances per sample [B, num_z, D]
     prior_var_all = []     # prior mixture total variance per graph [B, num_z, D]
@@ -748,15 +743,26 @@ def evaluate_vae_learned_prior_epoch(model, dataloader, device, config, epoch=0,
             with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
                 if is_fm_prior:
                     z_cloud = inner.prior.sample_n(
-                        graph, fm_diag_samples, temperature=prior_temperature,
+                        graph, num_prior_samples, temperature=prior_temperature,
                     )  # [B, S, num_z, D]
-                    z_prior = z_cloud[:, 0]
                 else:
                     prior_params = inner.prior(graph)
-                    z_prior = sample_from_mixture(prior_params, temperature=prior_temperature)
-                predicted, target, _, _, _ = model(
-                    graph, add_noise=False, use_posterior=False, fixed_z=z_prior,
-                )
+                    z_cloud = torch.stack(
+                        [sample_from_mixture(prior_params, temperature=prior_temperature)
+                         for _ in range(num_prior_samples)],
+                        dim=1,
+                    )  # [B, S, num_z, D]
+                # Forward every prior sample: sample 0 is the recon eval z, and
+                # all S feed the CRPS estimate (mirrors inference sampling).
+                pred_samples = []
+                target = None
+                for s in range(num_prior_samples):
+                    predicted, target, _, _, _ = model(
+                        graph, add_noise=False, use_posterior=False,
+                        fixed_z=z_cloud[:, s],
+                    )
+                    pred_samples.append(predicted.float())
+                predicted = pred_samples[0]
                 errors = _recon_errors(
                     predicted, target, config.get('recon_loss', 'huber'),
                 )
@@ -795,6 +801,11 @@ def evaluate_vae_learned_prior_epoch(model, dataloader, device, config, epoch=0,
             total_loss_sum += batch_loss_sum
             total_loss_count += batch_loss_count
 
+            crps_elem = _crps_from_samples(torch.stack(pred_samples, dim=0), target.float())
+            _, crps_sum, crps_count = _loss_from_errors(crps_elem, loss_weights)
+            total_crps_sum += crps_sum
+            total_crps_count += crps_count
+
             if _track_tail:
                 try:
                     if predicted.shape[1] > _zc:
@@ -818,6 +829,7 @@ def evaluate_vae_learned_prior_epoch(model, dataloader, device, config, epoch=0,
         'mean': total_loss_sum / max(total_loss_count, 1),
         'sum': total_loss_sum,
         'count': total_loss_count,
+        'crps': total_crps_sum / max(total_crps_count, 1),
     }
 
     if mu_q_all and prior_var_all:

@@ -38,13 +38,13 @@ outputs/b8_all/train1.log
 Current VAE logs look like:
 
 ```text
-Elapsed: 123.45s Epoch 10 LR: 1.0000e-04 | TrainOpt recon=... mmd=... total=... | ValidQ recon=... mmd=... total=... | ValidPrior@... recon=... gap=...
+Elapsed: 123.45s Epoch 10 LR: 1.0000e-04 | Train recon=... mmd=... total=... | Valid recon=... mmd=... total=... | CRPS ...
 ```
 
 Current non-VAE logs look like:
 
 ```text
-Elapsed: 123.45s Epoch 10 TrainOpt 1.2345e-02 Valid 1.5678e-02 LR: 1.0000e-04
+Elapsed: 123.45s Epoch 10 Train 1.2345e-02 Valid 1.5678e-02 LR: 1.0000e-04
 ```
 
 ## Loss Plotters Are Legacy

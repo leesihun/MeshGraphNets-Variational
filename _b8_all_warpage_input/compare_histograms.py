@@ -199,6 +199,16 @@ def main() -> None:
               f">{100 * (1 - q):.0f}% per distribution): GT {n_gt0:,}->{gt.size:,}, "
               f"gen {n_gen0:,}->{gen.size:,}")
 
+    # Save spread values to CSV alongside the histogram PNG
+    csv_path = Path(out_path).with_suffix(".csv")
+    with open(csv_path, "w", newline="") as _cf:
+        _cf.write("type,spread\n")
+        for _v in gt:
+            _cf.write(f"gt,{_v}\n")
+        for _v in gen:
+            _cf.write(f"gen,{_v}\n")
+    print(f"Saved spread CSV:   {csv_path}")
+
     if args.clip_quantile > 0:
         q = args.clip_quantile
         lo = float(min(np.quantile(gt, q), np.quantile(gen, q)))

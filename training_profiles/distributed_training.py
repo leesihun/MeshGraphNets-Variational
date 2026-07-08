@@ -5,7 +5,6 @@ import time
 import datetime
 import traceback
 
-import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -27,7 +26,6 @@ from training_profiles.setup import (
 from training_profiles.training_loop import (
     evaluate_vae_learned_prior_epoch,
     evaluate_vae_posterior_epoch,
-    evaluate_vae_prior_epoch,
     log_training_config,
     test_model,
     train_epoch,
@@ -162,12 +160,6 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
         shuffle=True,
         pin_memory=pin_memory
     )
-    if rank == 0:
-        train_eval_subset_size = min(len(train_dataset), int(config.get('train_eval_subset_size', 128)))
-        train_eval_rng = np.random.default_rng(split_seed)
-    else:
-        train_eval_subset_size = None
-        train_eval_rng = None
     if torch.cuda.is_available() and rank == 0:
         print(f'After dataloader creation: {torch.cuda.memory_allocated()/1e9:.2f}GB')
 
@@ -236,8 +228,9 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
 
     modelname = config.get('modelpath')
     use_vae = config.get('use_vae', False)
-    vae_valid_prior_samples = int(config.get('vae_valid_prior_samples', 8)) if use_vae else 1
-    if vae_valid_prior_samples < 1:
+    # Number of prior samples per graph used for the CRPS validation score
+    # (consumed inside evaluate_vae_learned_prior_epoch); validate it here.
+    if use_vae and int(config.get('vae_valid_prior_samples', 8)) < 1:
         raise ValueError("vae_valid_prior_samples must be >= 1")
 
     interrupted = False
@@ -280,55 +273,26 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
         if rank == 0:
             eval_model = ema_model.module if ema_model is not None else model
 
-            # Resample train_eval subset each epoch for an unbiased training loss estimate
-            train_eval_indices = train_eval_rng.choice(
-                len(train_dataset), size=train_eval_subset_size, replace=False
-            ).tolist()
-            train_eval_loader = DataLoader(
-                Subset(train_dataset, train_eval_indices),
-                batch_size=config['batch_size'],
-                shuffle=False,
-                num_workers=num_workers,
-                pin_memory=pin_memory,
-                prefetch_factor=1 if num_workers > 0 else None,
-                multiprocessing_context=mp_context,
-            )
             if use_vae:
-                train_eval_metrics = evaluate_vae_posterior_epoch(
-                    eval_model, train_eval_loader, device, config, epoch,
-                    progress_name='TrainEvalQ'
-                )
                 valid_metrics = evaluate_vae_posterior_epoch(
                     eval_model, val_loader, device, config, epoch,
-                    progress_name='ValidQ'
+                    progress_name='Valid'
                 )
-                valid_prior_metrics = evaluate_vae_prior_epoch(
-                    eval_model, val_loader, device, config, epoch,
-                    num_prior_samples=vae_valid_prior_samples,
-                    progress_name=f'ValidPrior@{vae_valid_prior_samples}'
-                )
-                # Inference-mirroring eval: z from the learned p(z|graph),
-                # plus the prior-vs-posterior spread diagnostic.
-                # None when the model has no learned prior.
+                # Inference-mirroring eval: z from the learned p(z|graph).
+                # Produces the CRPS score (and the [PriorDiag] spread
+                # diagnostic). None when the model has no learned prior.
                 valid_learned_prior_metrics = evaluate_vae_learned_prior_epoch(
                     eval_model, val_loader, device, config, epoch,
-                    progress_name='ValidLearnedPrior'
+                    progress_name='CRPS'
                 )
             else:
-                train_eval_metrics = validate_epoch(model, train_eval_loader, device, config, epoch)
                 valid_metrics = validate_epoch(eval_model, val_loader, device, config, epoch)
-                valid_prior_metrics = None
                 valid_learned_prior_metrics = None
-            train_eval_loss = train_eval_metrics['mean']
             valid_loss = valid_metrics['mean']
         else:
-            train_eval_loss = 0.0
             valid_loss = 0.0
-        train_eval_loss_tensor = torch.tensor([train_eval_loss], device=device)
         valid_loss_tensor = torch.tensor([valid_loss], device=device)
-        dist.broadcast(train_eval_loss_tensor, src=0)
         dist.broadcast(valid_loss_tensor, src=0)
-        train_eval_loss = train_eval_loss_tensor.item()
         valid_loss = valid_loss_tensor.item()
 
         stop_flag = torch.tensor([1.0 if _stop_event.is_set() else 0.0], device=device)
@@ -346,32 +310,20 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
         current_lr = optimizer.param_groups[0]['lr']
         if rank == 0:
             if use_vae:
-                train_eval_mmd = train_eval_metrics.get('mmd_mean', 0.0)
-                train_eval_total = train_eval_metrics.get('total_mean', train_eval_loss)
-                valid_prior_loss = valid_prior_metrics['mean']
-                prior_gap = valid_prior_loss - valid_loss
-                learned_prior_str = ''
-                if valid_learned_prior_metrics is not None:
-                    learned_prior_str = (
-                        f" | ValidLearnedPrior recon={valid_learned_prior_metrics['mean']:.2e}"
-                    )
-                    if 'spread_ratio' in valid_learned_prior_metrics:
-                        learned_prior_str += (
-                            f" spread_ratio={valid_learned_prior_metrics['spread_ratio']}"
-                        )
+                crps_str = ''
+                if (valid_learned_prior_metrics is not None
+                        and 'crps' in valid_learned_prior_metrics):
+                    crps_str = f" | CRPS  {valid_learned_prior_metrics['crps']:.2e}"
                 print(
                     f"Epoch {epoch}/{config['training_epochs']} LR: {current_lr:.2e} | "
-                    f"TrainOpt  recon={train_loss:.2e} mmd={train_metrics.get('mmd_mean', 0.0):.2e} total={train_metrics.get('total_mean', train_loss):.2e} | "
-                    f"TrainEvalQ recon={train_eval_loss:.2e} mmd={train_eval_mmd:.2e} total={train_eval_total:.2e} | "
-                    f"ValidQ    recon={valid_loss:.2e} mmd={valid_metrics.get('mmd_mean', 0.0):.2e} total={valid_metrics.get('total_mean', valid_loss):.2e} | "
-                    f"ValidPrior@{vae_valid_prior_samples} recon={valid_prior_loss:.2e} gap={prior_gap:.2e}"
-                    f"{learned_prior_str}"
+                    f"Train  recon={train_loss:.2e} mmd={train_metrics.get('mmd_mean', 0.0):.2e} total={train_metrics.get('total_mean', train_loss):.2e} | "
+                    f"Valid  recon={valid_loss:.2e} mmd={valid_metrics.get('mmd_mean', 0.0):.2e} total={valid_metrics.get('total_mean', valid_loss):.2e}"
+                    f"{crps_str}"
                 )
             else:
                 print(
                     f"Epoch {epoch}/{config['training_epochs']} "
-                    f"TrainOpt: {train_loss:.2e} "
-                    f"TrainEval: {train_eval_loss:.2e} "
+                    f"Train: {train_loss:.2e} "
                     f"Valid: {valid_loss:.2e} "
                     f"LR: {current_lr:.2e}"
                 )
@@ -384,8 +336,6 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
                 epoch, ddp_model.module, ema_model, optimizer, scheduler,
                 train_loss, valid_loss, config, train_dataset, modelname,
                 use_vae=use_vae,
-                valid_prior_loss=valid_prior_loss if use_vae else None,
-                vae_valid_prior_samples=vae_valid_prior_samples if use_vae else None,
             )
             print(f"  -> Model saved at epoch {epoch} with valid loss {valid_loss:.2e}")
 
@@ -395,17 +345,14 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
                     f.write(
                         f"Elapsed: {time.time() - start_time:.2f}s "
                         f"Epoch {epoch} LR: {current_lr:.4e} | "
-                        f"TrainOpt recon={train_loss:.4e} mmd={train_metrics.get('mmd_mean', 0.0):.4e} total={train_metrics.get('total_mean', train_loss):.4e} | "
-                        f"TrainEvalQ recon={train_eval_loss:.4e} mmd={train_eval_metrics.get('mmd_mean', 0.0):.4e} total={train_eval_metrics.get('total_mean', train_eval_loss):.4e} | "
-                        f"ValidQ recon={valid_loss:.4e} mmd={valid_metrics.get('mmd_mean', 0.0):.4e} total={valid_metrics.get('total_mean', valid_loss):.4e} | "
-                        f"ValidPrior@{vae_valid_prior_samples} recon={valid_prior_loss:.4e} gap={prior_gap:.4e}"
-                        f"{learned_prior_str}\n"
+                        f"Train recon={train_loss:.4e} mmd={train_metrics.get('mmd_mean', 0.0):.4e} total={train_metrics.get('total_mean', train_loss):.4e} | "
+                        f"Valid recon={valid_loss:.4e} mmd={valid_metrics.get('mmd_mean', 0.0):.4e} total={valid_metrics.get('total_mean', valid_loss):.4e}"
+                        f"{crps_str}\n"
                     )
                 else:
                     f.write(
                         f"Elapsed: {time.time() - start_time:.2f}s "
-                        f"Epoch {epoch} TrainOpt {train_loss:.4e} "
-                        f"TrainEval {train_eval_loss:.4e} "
+                        f"Epoch {epoch} Train {train_loss:.4e} "
                         f"Valid {valid_loss:.4e} LR: {current_lr:.4e}\n"
                     )
 

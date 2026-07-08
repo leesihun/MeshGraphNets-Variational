@@ -50,7 +50,7 @@ PYTHON="${PYTHON:-python}"
 ONLY="${ONLY:-both}"
 DIAG="${DIAG:-0}"
 TRIM="${TRIM:-0}"   # e.g. 0.02 -> drop bottom/top 2% of each distribution in the histogram compare
-BASELINES="${BASELINES:-1 2 3 4 5 6 7}"
+BASELINES="${BASELINES:-1 2 3 4 5 6 7 8}" 
 DATASETS="${DATASETS:-main sec}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -123,6 +123,14 @@ run_one() {
                 | tee "$LOG_ROOT/infer_${tag}.log"; then
             echo "[$tag] inference FAILED — see $LOG_ROOT/infer_${tag}.log" >&2
             return 1
+        fi
+
+        echo ""
+        echo "[$tag] MESH PLOTS  rollout_dir=$rollout_dir"
+        if ! "$PYTHON" _b8_all_warpage_input/plot_rollout_meshes.py \
+                --rollout_dir "$rollout_dir" 2>&1 \
+                | tee "$LOG_ROOT/plot_${tag}.log"; then
+            echo "[$tag] mesh plotting FAILED (non-fatal) — see $LOG_ROOT/plot_${tag}.log" >&2
         fi
     fi
 
