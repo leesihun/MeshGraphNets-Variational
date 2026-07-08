@@ -12,28 +12,26 @@ set size, enabling extrapolation of spread structure across part variants.
 The architecture is a MeshGraphNets-style graph neural network with optional
 hierarchical V-cycle processing, optional world edges, and an MMD-VAE latent
 branch that injects a graph-level stochastic code `z` into every processor
-block. A mesh-conditioned post-hoc prior `p(z|graph)` maps each part type
-to its spread distribution at inference time.
+block. A mesh-conditioned prior `p(z|graph)`, trained jointly with the VAE,
+maps each part type to its spread distribution at inference time.
 
 The executable entry point is [MeshGraphNets_main.py](MeshGraphNets_main.py).
 
 ## Current Runtime Truth
 
-The code has four modes, selected inside the config file:
+The code has two modes, selected inside the config file:
 
 | Mode | What runs |
 |------|-----------|
-| `train` | Train the simulator. If `use_vae True` and `fit_latent_gmm True`, fit legacy GMM after training. If `train_conditional_prior True`, also train the conditional prior after training. |
-| `train_with_prior` | Same simulator training path as `train`, but the launcher sets `train_conditional_prior True` before training. |
-| `train_prior` | Load an existing VAE-MGN checkpoint and train only the mesh-conditioned prior into that checkpoint. |
+| `train` | Train the simulator. With `use_vae True`, the mesh-conditioned prior (`prior_type gnn_e2e`) trains jointly in the same loop. |
 | `inference` | Run autoregressive rollout from an HDF5 initial-condition dataset. |
 
 Inference samples VAE latents in this priority order:
 
-1. Mesh-conditioned prior, only when `use_vae True`, `use_conditional_prior True`,
-   and the checkpoint contains `conditional_prior_state_dict`.
-2. Legacy checkpoint GMM, when present.
-3. Standard normal `N(0, I)`.
+1. Mesh-conditioned prior, when `use_vae True`, `use_conditional_prior True`,
+   and the checkpoint carries a prior (joint-trained submodule, or a legacy
+   `conditional_prior_state_dict`).
+2. Standard normal `N(0, I)`.
 
 Important caveat: rollout loads `checkpoint['model_config']` and lets those keys
 override the inference config before it decides whether `use_conditional_prior` is
@@ -43,25 +41,14 @@ to train or refresh the checkpoint with the conditional-prior keys present.
 
 ## Quick Start
 
-Historical VAE/GMM workflow:
-
 ```bash
-python MeshGraphNets_main.py --config _warpage_input/config_train5.txt
-python MeshGraphNets_main.py --config _warpage_input/config_infer4.txt
+python MeshGraphNets_main.py --config _b8_all_warpage_input/config_train1.txt
+python MeshGraphNets_main.py --config _b8_all_warpage_input/config_infer1_main.txt
 ```
 
-Current B8 all-warpage inference configs request the mesh-conditioned prior:
-
-```bash
-python MeshGraphNets_main.py --config _b8_all_warpage_input/config_infer1.txt
-python MeshGraphNets_main.py --config _b8_all_warpage_input/config_infer2.txt
-```
-
-The paired `_b8_all_warpage_input/config_train1.txt` and `config_train2.txt` files
-are currently `mode train` and still contain legacy GMM keys. To produce a checkpoint
-that contains the conditional prior, use either `mode train_with_prior` for the
-simulator training run or run a separate `mode train_prior` config against a trained
-VAE checkpoint.
+Training a config with `use_vae True` and `prior_type gnn_e2e` produces a
+checkpoint that already contains the conditional prior; inference configs then
+sample from it via `use_conditional_prior True`.
 
 ## Architecture
 
@@ -98,23 +85,23 @@ heads omit final LayerNorm.
 
 When `use_vae True`, [model/vae.py](model/vae.py) encodes the training target
 delta `y` into a graph-level latent `z`. The sampled `z` is broadcast to nodes and
-fused into each processor block. Training uses reconstruction Huber loss plus MMD
-and auxiliary latent losses. Optional `free_bits` adds a KL floor as a collapse
-safeguard.
+fused into each processor block. Training uses reconstruction loss (Huber or MSE
+via `recon_loss`) plus MMD and the auxiliary latent loss.
 
 For manufacturing spread modeling the key tuning levers are:
 - `lambda_mmd 0.1` — keep low; z must retain structured spread, not collapse to N(0,I).
 - `beta_aux 1.0` — anchors z to per-graph output statistics; prevents mode collapse.
-- `lambda_det 0.0` — deterministic auxiliary loss must be disabled for spread modeling.
+- `posterior_min_std 0.05` — floors sigma_q so the prior cannot memorize point masses.
 - `vae_graph_aware True` — posterior encoder sees graph inputs alongside target y,
   enabling type-conditional spread encoding across part variants.
 
-The post-hoc conditional prior is [model/conditional_prior.py](model/conditional_prior.py):
-a graph encoder predicts mixture logits, means, and diagonal log-stds for
-`p(z | graph)`. [training_profiles/posthoc_prior.py](training_profiles/posthoc_prior.py)
-trains it from frozen VAE posterior samples and saves it into the same checkpoint.
-For spread modeling this prior is essential: it routes each part type to its own
-spread distribution at inference time rather than sampling from a global N(0,I).
+The conditional prior is [model/conditional_prior.py](model/conditional_prior.py):
+a shared graph trunk conditions either a flow-matching velocity field
+(`prior_family fm`, default) or a Gaussian mixture head (`prior_family gmm`) for
+`p(z | graph)`. It trains jointly with the VAE by density matching on fresh
+posterior samples. For spread modeling this prior is essential: it routes each
+part type to its own spread distribution at inference time rather than sampling
+from a global N(0,I).
 
 ## Data
 
@@ -168,7 +155,7 @@ Training uses:
 
 | Component | Current code |
 |-----------|--------------|
-| Loss | Huber on normalized deltas, optional normalized feature weights |
+| Loss | Huber or MSE (`recon_loss`) on normalized deltas, optional normalized feature weights |
 | Optimizer | Adam, fused on CUDA |
 | Schedule | Linear warmup then `CosineAnnealingWarmRestarts` |
 | Grad clip | `max_norm=3.0` |

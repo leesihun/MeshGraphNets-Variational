@@ -67,7 +67,6 @@ LearningR            0.0001
 Latent_dim           {ldm}
 num_workers          4
 std_noise            0.01
-residual_scale       1
 augment_geometry     True
 grad_accum_steps     1
 
@@ -95,13 +94,11 @@ coarsening_type     voronoi_seedmean
 voronoi_clusters    2000, 500
 multiscale_levels   2
 mp_per_level        4, 8, 12, 8, 4
-bipartite_unpool    True
 
 % VAE (MMD-InfoVAE)
 use_vae          True
 vae_latent_dim   {ld}
 recon_loss       mse
-extreme_weight   0
 alpha_recon      100
 lambda_mmd       0.1
 vae_graph_aware  True
@@ -147,7 +144,6 @@ LearningR            0.0001
 Latent_dim           {ldm}
 num_workers          4
 std_noise            0.01
-residual_scale       1
 
 % Memory / performance
 use_checkpointing    False
@@ -171,7 +167,6 @@ coarsening_type     voronoi_seedmean
 voronoi_clusters    2000, 500
 multiscale_levels   2
 mp_per_level        4, 8, 12, 8, 4
-bipartite_unpool    True
 
 % VAE (MMD-InfoVAE)
 use_vae          True

@@ -19,8 +19,7 @@ The authoritative modules are:
 | Mode | Runtime path |
 | --- | --- |
 | `train` | simulator training through `single_training.py` or DDP in `distributed_training.py` |
-| `train_with_prior` | simulator training, then post-hoc conditional-prior training |
-| `train_prior` | post-hoc conditional-prior training against an existing checkpoint |
+
 | `inference` | rollout through `inference_profiles/rollout.py` |
 
 With multiple `gpu_ids`, the default path is DDP data parallelism. Setting
@@ -95,8 +94,7 @@ Each `GnBlock` does:
 3. Node update from current node state plus summed incoming mesh edge messages.
 4. If world edges are enabled, node update also receives summed incoming
    world-edge messages through `HybridNodeBlock`.
-5. Residual node and edge updates scaled by `residual_scale`.
-6. Optional PairNorm on node features when `use_pairnorm True`.
+5. Residual node and edge updates (unscaled: `x + delta`).
 
 Aggregation is `sum`, matching the NVIDIA PhysicsNeMo deforming-plate style in
 the local comments.
@@ -138,7 +136,7 @@ The forward pass is:
    from `2 * latent_dim` to `latent_dim`.
 9. Run post-blocks and decode.
 
-If `bipartite_unpool True`, unpooling is a learned `UnpoolBlock` over
+Unpooling is always a learned `UnpoolBlock` over
 `unpool_edge_index_i` using coarse state, fine skip state, and relative position.
 Otherwise, coarse node states are broadcast to fine nodes by cluster assignment.
 
@@ -174,7 +172,7 @@ global latent `z` into the simulator processor.
 7. Reparameterize to sample `z`.
 
 The posterior regularizer used in training is MMD between sampled posterior `z`
-and `N(0,I)`. Optional free-bits KL can be enabled with `free_bits > 0`.
+and `N(0,I)`.
 
 ### Latent Injection
 
@@ -197,43 +195,37 @@ The auxiliary decoder predicts per-graph target mean and standard deviation from
 
 ## Conditional Prior
 
-`model/conditional_prior.py::ConditionalMixturePrior` is a post-hoc prior network
-for VAE checkpoints.
+`model/conditional_prior.py` provides the mesh-conditioned prior `p(z|graph)`,
+trained **jointly** with the simulator when `use_vae True` and
+`prior_type gnn_e2e`. It lives as the `prior` submodule of `MeshGraphNets`, so
+DDP and EMA wrap it together with the simulator and it is saved inside the
+normal `model_state_dict`.
 
-It uses the same node input accounting as the simulator:
+A shared graph trunk uses the same node input accounting as the simulator:
 
 ```text
 input_var + positional_features + optional num_node_types
 ```
 
-Its edge input is also `edge_var`, which must be 8. The prior:
+Its edge input is also `edge_var`, which must be 8. The trunk encodes node and
+edge features, runs `prior_mp_layers` graph blocks, and pools with attentional
+aggregation into one conditioning vector per graph. `prior_family` selects the
+density head:
 
-1. Encodes node and edge features.
-2. Runs `prior_mp_layers` graph blocks.
-3. Pools with `GlobalAttention`.
-4. Predicts mixture logits, means, and log standard deviations for
-   `prior_mixture_components` Gaussian components in latent-z space.
+- `fm` (default): a conditional flow-matching velocity field. Training is MSE
+  regression on straight-line interpolation paths toward fresh detached
+  posterior samples; sampling integrates an Euler ODE for `prior_fm_steps`
+  steps. Temperature scales the initial noise std by `sqrt(temperature)`.
+- `gmm`: mixture logits, means, and log-stds for `prior_mixture_components`
+  Gaussian components (optionally low-rank covariance via `prior_cov_rank`).
+  Training is mixture NLL plus a small `prior_kl_reg_weight` analytical-KL
+  anchor. Temperature divides logits and scales stds by `sqrt(temperature)`.
 
-`training_profiles/posthoc_prior.py` freezes the simulator, samples target
-posterior latents from the simulator VAE encoder, optimizes mixture negative
-log-likelihood, and appends these checkpoint keys:
-
-- `conditional_prior_state_dict`
-- `conditional_prior_config`
-- `conditional_prior_metrics`
-
-At inference, `rollout.py` uses the conditional prior only when all of these are
-true after checkpoint model_config overrides:
-
-- `use_vae True`
-- `use_conditional_prior True`
-- checkpoint contains `conditional_prior_state_dict`
-
-If that path is not active, VAE inference falls back to the legacy GMM artifact
-when present; otherwise it samples `N(0,I)`.
-
-Sampling temperature divides mixture logits and scales component standard
-deviations by `sqrt(temperature)`.
+At inference, `rollout.py` samples from the conditional prior when
+`use_vae True` and `use_conditional_prior True` hold after checkpoint
+model_config overrides, and the checkpoint carries a prior (the joint-trained
+submodule, or a legacy separately-saved `conditional_prior_state_dict`).
+Otherwise it samples `N(0,I)`.
 
 ## Training Objective
 
@@ -259,7 +251,6 @@ With VAE:
 loss = alpha_recon * reconstruction_loss
      + lambda_mmd * mmd_loss          # aggregate posterior ↔ N(0,I); keep LOW (≈0.1)
      + beta_aux * auxiliary_loss      # z → graph output stats anchor; keep HIGH (≈1.0)
-     + optional free_bits_kl
 ```
 
 **Spread modeling guidance for loss weights:**
@@ -270,10 +261,9 @@ loss = alpha_recon * reconstruction_loss
 - `beta_aux` should remain high (≈ 1.0). The auxiliary decoder forces `z` to
   predict per-graph output mean and standard deviation. Without this anchor the
   encoder collapses all spread into a small z subspace (mode collapse).
-- `lambda_det` must be 0.0. The deterministic auxiliary pass (second forward with
-  z = 0) was designed to prevent posterior shortcuts in single-mode problems. For
-  spread modeling it conflicts directly with the objective by punishing z for
-  carrying information the graph cannot predict alone.
+- The deterministic z=0 auxiliary pass (`lambda_det`) was removed from the code:
+  it conflicts directly with the spread objective by punishing z for carrying
+  information the graph cannot predict alone. Do not reintroduce it.
 
 Other training behavior:
 

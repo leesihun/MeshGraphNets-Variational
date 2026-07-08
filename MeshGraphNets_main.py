@@ -2,14 +2,21 @@
 import os
 # Must be set before h5py is imported (transitively via data_loader/mesh_dataset)
 os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
+# Expandable CUDA memory segments: prevents OOM-with-free-memory on variable-size graphs.
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
+import torch
+# TF32: ~3x faster fp32 matmuls on Ampere/Hopper with negligible precision loss.
+# Affects the FM-prior velocity net and MMD loss which run in fp32 outside autocast.
+torch.set_float32_matmul_precision('high')
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 import argparse
 import socket
 import torch.multiprocessing as mp
 from torch.multiprocessing.spawn import ProcessExitedException
 from general_modules.load_config import load_config
-from general_modules.data_loader import load_data
-from model.MeshGraphNets import MeshGraphNets
 from training_profiles.distributed_training import train_worker
 from training_profiles.single_training import single_worker
 from inference_profiles.rollout import run_rollout
@@ -40,10 +47,6 @@ def main():
     config = load_config(args.config)
 
     run_mode = config.get('mode')
-    # Backward-compat alias: `train_with_prior` is now equivalent to `train`
-    # since `train_conditional_prior` defaults to True.
-    if run_mode == 'train_with_prior':
-        run_mode = 'train'
     model = config.get('model')
 
     print('\n'*2)
@@ -78,21 +81,7 @@ def main():
     # Display the current absolute path
     print(f"Current absolute path: {os.path.abspath('.')}")
 
-    if run_mode == 'train_prior':
-        from training_profiles.setup import resolve_prior_type
-        prior_type = resolve_prior_type(config)
-        if prior_type == 'gmm':
-            from model.latent_gmm import train_posthoc_gmm
-            train_posthoc_gmm(config, args.config)
-        else:
-            print(
-                f"`mode train_prior` is only valid for `prior_type=gmm`. "
-                f"For `prior_type={prior_type}` the prior is trained jointly with "
-                f"the VAE — use `mode train` instead."
-            )
-            return
-
-    elif run_mode == 'inference':
+    if run_mode == 'inference':
         # Inference mode: autoregressive rollout
         run_rollout(config, args.config)
 

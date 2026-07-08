@@ -59,7 +59,6 @@ def build_multiscale_hierarchy(
     multiscale_levels: int,
     coarsening_types: Sequence[str],
     voronoi_clusters: Sequence[int],
-    bipartite_unpool: bool = False,
 ) -> List[dict]:
     """
     Build coarsening topology for a single sample.
@@ -74,7 +73,7 @@ def build_multiscale_hierarchy(
         'seeds':  [n_c]          fine-node id chosen as cluster representative
                                  (BFS even-depth ids; FPS-Voronoi seeds)
         'mode':   'inherit' | 'centroid' | 'seedmean'  per-level pool/position mode
-        'up_ei':  [2, E_up]      bipartite unpool edges (only if bipartite_unpool)
+        'up_ei':  [2, E_up]      bipartite unpool edges
     """
     hierarchy: List[dict] = []
     current_ei, current_n = edge_index, num_nodes
@@ -88,9 +87,10 @@ def build_multiscale_hierarchy(
             num_clusters=n_clusters, ref_pos=level_ref_pos,
         )
         mode = _coarsening_mode(method)
-        entry = {'ftc': ftc, 'c_ei': c_ei, 'n_c': n_c, 'seeds': seeds, 'mode': mode}
-        if bipartite_unpool:
-            entry['up_ei'] = build_unpool_edges(ftc, c_ei, n_c)
+        entry = {
+            'ftc': ftc, 'c_ei': c_ei, 'n_c': n_c, 'seeds': seeds, 'mode': mode,
+            'up_ei': build_unpool_edges(ftc, c_ei, n_c),
+        }
         hierarchy.append(entry)
 
         if n_c <= 1 or c_ei.shape[1] == 0:

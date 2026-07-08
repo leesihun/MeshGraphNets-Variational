@@ -9,29 +9,16 @@ def init_weights(m):
             init.zeros_(m.bias)
 
 
-def build_mlp(in_size, hidden_size, out_size, layer_norm=True, activation='silu'):
-    """
-    Two-hidden-layer MLP following the MeshGraphNets architecture.
+def build_mlp(in_size, hidden_size, out_size, layer_norm=True):
+    """Two-hidden-layer SiLU MLP following the MeshGraphNets architecture.
+
     LayerNorm is appended on the output when layer_norm=True (all non-decoder uses).
     """
-    if activation == 'relu':
-        activation_fn = nn.ReLU
-    elif activation == 'gelu':
-        activation_fn = nn.GELU
-    elif activation == 'silu':
-        activation_fn = nn.SiLU
-    elif activation == 'tanh':
-        activation_fn = nn.Tanh
-    elif activation == 'sigmoid':
-        activation_fn = nn.Sigmoid
-    else:
-        raise ValueError(f'Invalid activation function: {activation}')
-
     layers = [
         nn.Linear(in_size, hidden_size),
-        activation_fn(),
+        nn.SiLU(),
         nn.Linear(hidden_size, hidden_size),
-        activation_fn(),
+        nn.SiLU(),
         nn.Linear(hidden_size, out_size),
     ]
     if layer_norm:

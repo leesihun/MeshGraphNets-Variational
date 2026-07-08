@@ -5,7 +5,6 @@ Both `single_training.py` and `distributed_training.py` use these builders to
 avoid maintaining duplicate dataset/model/optimizer/checkpoint logic.
 """
 
-import glob
 import os
 import time
 
@@ -150,34 +149,24 @@ def build_normalization_dict(train_dataset) -> dict:
 
 
 def resolve_prior_type(config) -> str:
-    """Resolve `prior_type` from config, applying back-compat legacy shim.
+    """Normalize `prior_type` in config and return it.
 
-    The new design uses a single `prior_type` key with values 'gmm' or 'gnn_e2e'.
-    Legacy configs used `fit_latent_gmm` (bool) and `train_conditional_prior` (bool).
-    For those, we infer:
-      - `gmm`        if fit_latent_gmm=True and train_conditional_prior is False
-      - `gnn_e2e`    otherwise (the default in the new design)
+    'gnn_e2e' (the default) trains a graph-conditional prior jointly with the
+    VAE; its density family is selected by `prior_family` ('fm' or 'gmm').
+    The legacy post-hoc sklearn GMM path (`prior_type gmm`) has been removed.
 
     Writes the resolved value back into `config['prior_type']` so downstream code
     (including MeshGraphNets.__init__) reads a consistent string.
     """
-    pt = config.get('prior_type')
-    if pt:
-        pt_norm = str(pt).lower().strip()
-        config['prior_type'] = pt_norm
-        return pt_norm
-
-    # Legacy fallback
-    has_legacy = ('fit_latent_gmm' in config) or ('train_conditional_prior' in config)
-    if has_legacy:
-        print("DEPRECATION: `fit_latent_gmm` / `train_conditional_prior` are legacy "
-              "keys. Use `prior_type` ('gmm' or 'gnn_e2e') instead.")
-    if config.get('fit_latent_gmm', False) and not config.get('train_conditional_prior', True):
-        resolved = 'gmm'
-    else:
-        resolved = 'gnn_e2e'
-    config['prior_type'] = resolved
-    return resolved
+    pt_norm = str(config.get('prior_type') or 'gnn_e2e').lower().strip()
+    if pt_norm == 'gmm':
+        raise ValueError(
+            "prior_type 'gmm' (post-hoc sklearn GMM) has been removed. Use "
+            "prior_type 'gnn_e2e' with prior_family 'gmm' for a graph-"
+            "conditional mixture prior."
+        )
+    config['prior_type'] = pt_norm
+    return pt_norm
 
 
 def build_model_config(config) -> dict:
@@ -191,15 +180,11 @@ def build_model_config(config) -> dict:
         'use_node_types':    config.get('use_node_types', False),
         'num_node_types':    config.get('num_node_types', 0),
         'positional_features': config.get('positional_features', 0),
-        'positional_encoding': config.get('positional_encoding', 'rwpe'),
         'use_world_edges':   config.get('use_world_edges', False),
         'use_checkpointing': config.get('use_checkpointing', False),
         'use_multiscale':    config.get('use_multiscale', False),
         'multiscale_levels': config.get('multiscale_levels', 1),
         'mp_per_level':      config.get('mp_per_level', None),
-        'fine_mp_pre':       config.get('fine_mp_pre', 5),
-        'coarse_mp_num':     config.get('coarse_mp_num', 5),
-        'fine_mp_post':      config.get('fine_mp_post', 5),
         'coarsening_type':   config.get('coarsening_type', 'bfs'),
         'voronoi_clusters':  config.get('voronoi_clusters', None),
         'use_vae':           config.get('use_vae', False),
@@ -246,9 +231,6 @@ def save_checkpoint(
     config,
     train_dataset,
     modelpath: str,
-    use_vae: bool = False,
-    valid_prior_loss: float = None,
-    vae_valid_prior_samples: int = None,
 ) -> None:
     """Build and write a checkpoint dict to `modelpath`."""
     save_dict = {
@@ -261,9 +243,6 @@ def save_checkpoint(
         'normalization':       build_normalization_dict(train_dataset),
         'model_config':        build_model_config(config),
     }
-    if use_vae and valid_prior_loss is not None:
-        save_dict['valid_prior_loss']    = valid_prior_loss
-        save_dict['valid_prior_samples'] = vae_valid_prior_samples
     if ema_model is not None:
         save_dict['ema_state_dict'] = ema_model.state_dict()
     torch.save(save_dict, modelpath)
@@ -272,33 +251,6 @@ def save_checkpoint(
 # ---------------------------------------------------------------------------
 # Post-training helpers
 # ---------------------------------------------------------------------------
-
-def analyze_debug_files(log_dir: str) -> None:
-    """Print a summary of any debug_*.npz files written during training."""
-    if not log_dir:
-        return
-    debug_files = sorted(glob.glob(os.path.join(log_dir, 'debug_*.npz')))
-    if not debug_files:
-        return
-
-    print("\n" + "=" * 60)
-    print("DEBUG OUTPUT ANALYSIS (first 5 epochs)")
-    print("=" * 60)
-    for f in debug_files[:5]:
-        try:
-            data = np.load(f)
-            fname = os.path.basename(f)
-            print(f"\n{fname}")
-            print(f"  Input (x):      mean={data['x_mean']}  std={data['x_std']}")
-            print(f"  Target (y):     mean={data['y_mean']}  std={data['y_std']}")
-            print(f"  Prediction:     mean={data['pred_mean']}  std={data['pred_std']}")
-            ratio = data['pred_std'] / (data['y_std'] + 1e-8)
-            print(f"  Pred/Target std ratio: {ratio}")
-            if np.any(ratio < 0.1):
-                print("    ^ WARNING: Pred much smaller than target!")
-        except Exception as e:
-            print(f"  Error reading {f}: {e}")
-
 
 def cleanup_dataloaders(*loaders) -> None:
     """Explicitly shut down DataLoader persistent workers before process exit.
@@ -328,15 +280,13 @@ def cleanup_dataloaders(*loaders) -> None:
 
 
 def init_log_file(config, config_filename: str):
-    """Create the epoch log file and return (log_file, log_dir), or (None, None)."""
+    """Create the epoch log file (with the config embedded) and return its path, or None."""
     log_file_dir = config.get('log_file_dir')
     if not log_file_dir:
-        return None, None
+        return None
 
     log_file = 'outputs/' + log_file_dir
-    log_dir = os.path.dirname(log_file)
-    os.makedirs(log_dir, exist_ok=True)
-    config['log_dir'] = log_dir
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
 
     with open(log_file, 'w') as f:
         f.write("Training epoch log file\n")
@@ -344,4 +294,4 @@ def init_log_file(config, config_filename: str):
         f.write(f"Log file absolute path: {os.path.abspath(log_file)}\n")
         with open(config_filename, 'r') as fc:
             f.write(fc.read())
-    return log_file, log_dir
+    return log_file

@@ -23,7 +23,6 @@ LearningR	0.0001  # Scaled by sqrt(8/1) from 0.0001 for larger batch size
 Latent_dim	128	# MeshGraphNets latent dimension
 num_workers 8
 std_noise   0.01
-residual_scale  1  # Scale factor for residual connections (1.0 = full residual, matches NVIDIA/DeepMind)
 augment_geometry True   # Random Z-rotation + reflection augmentation (training only)
 grad_accum_steps    1
 '
@@ -50,19 +49,14 @@ plot_feature_idx    -1  # Feature index to visualize in plots (-1 = last feature
 % Multi-Scale / Hierarchical Parameters (BFS Bi-Stride, ICML 2023)
 use_multiscale      True
 % Multi-BFS + Voronoi
-coarsening_type     voronoi
+coarsening_type     voronoi_centroid
 voronoi_clusters    200
 multiscale_levels   1
 mp_per_level        4, 12, 4
-bipartite_unpool    True    # Learned bipartite MP unpool (False = broadcast)
 '
 % Variational Autoencoder (MMD-VAE / InfoVAE) Parameters
 use_vae             True   # Enable conditional VAE (encodes target delta during training)
-vae_latent_dim      256      # Global latent z dimension
+vae_latent_dim      4      # Global latent z dimension
 alpha_recon         1    # Reconstruction loss weight
 lambda_mmd          0.1    # MMD(q(z), N(0,I)) weight; matches aggregate posterior to prior
 '
-% Post-hoc GMM latent prior (fit after training; used at inference if present in checkpoint)
-fit_latent_gmm      True   # Fit GMM on posterior means after training
-gmm_components      10     # Number of Gaussian mixture components
-gmm_covariance_type full   # 'full' | 'diag' | 'tied' | 'spherical'

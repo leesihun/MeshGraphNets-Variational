@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 
-import os
-
 def load_config(config_path):
     """Load configuration config.txt"""
     config = {}

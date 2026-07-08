@@ -7,6 +7,7 @@ from model.mlp import build_mlp
 
 
 class Encoder(nn.Module):
+    """Encodes raw node/edge features into the latent dimension."""
 
     def __init__(self, edge_input_size, node_input_size, latent_dim, use_world_edges=False):
         super().__init__()
@@ -30,12 +31,15 @@ class Encoder(nn.Module):
 
 
 class GnBlock(nn.Module):
+    """One message-passing step: edge update, node update, residual add.
 
-    def __init__(self, config, latent_dim, use_world_edges=False):
+    With use_world_edges=True a second edge block processes world (collision)
+    edges and the node block aggregates mesh and world messages separately.
+    """
+
+    def __init__(self, latent_dim, use_world_edges=False):
         super().__init__()
         self.use_world_edges = use_world_edges
-        self.residual_scale = config.get('residual_scale', 1.0)
-        self.use_pairnorm = config.get('use_pairnorm', False)
 
         eb_input_dim = 3 * latent_dim
         self.eb_module = EdgeBlock(custom_func=build_mlp(eb_input_dim, latent_dim, latent_dim))
@@ -78,15 +82,10 @@ class GnBlock(nn.Module):
             )
         node_graph = self.nb_module(node_graph)
 
-        x = x_input + self.residual_scale * node_graph.x
-        if self.use_pairnorm:
-            x_centered = x - x.mean(dim=0, keepdim=True)
-            rms = (x_centered.norm(p=2) / (x.shape[0] ** 0.5)) + 1e-8
-            x = x_centered / rms
-
-        edge_attr = graph.edge_attr + self.residual_scale * edge_mlp_out
+        x = x_input + node_graph.x
+        edge_attr = graph.edge_attr + edge_mlp_out
         updated_world_edge_attr = (
-            (world_edge_attr + self.residual_scale * world_edge_mlp_out)
+            (world_edge_attr + world_edge_mlp_out)
             if world_edge_mlp_out is not None else world_edge_attr
         )
 
@@ -104,6 +103,7 @@ class GnBlock(nn.Module):
 
 
 class Decoder(nn.Module):
+    """Decodes latent node features to physical outputs. No LayerNorm on output."""
 
     def __init__(self, latent_dim, node_output_size):
         super().__init__()

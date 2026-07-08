@@ -2,307 +2,21 @@ import h5py
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from typing import Dict, Tuple, List
+from typing import Dict, List
 from torch_geometric.data import Data
-import multiprocessing as mp
 
+from general_modules.dataset_stats import compute_normalization_stats, finalize_moments
 from general_modules.edge_features import EDGE_FEATURE_DIM, compute_edge_attr
+from general_modules.positional_features import compute_positional_features
 from general_modules.world_edges import HAS_TORCH_CLUSTER, compute_world_edges
 
 # Multiscale coarsening (optional — only imported when use_multiscale=True)
 try:
     from model.coarsening import MultiscaleData, compute_coarse_centroids
-    from general_modules.multiscale_helpers import (
-        attach_coarse_levels_to_graph,
-        build_multiscale_hierarchy,
-    )
+    from general_modules.multiscale_helpers import attach_coarse_levels_to_graph
     HAS_COARSENING = True
 except ImportError:
     HAS_COARSENING = False
-
-def _compute_rwpe(edge_index, N, num_rwpe):
-    """RWPE: random walk return probabilities (purely topological).
-
-    Returns diagonals of RW^k for k = 2, 4, 8, 16, 32.
-    """
-    from scipy import sparse
-
-    src, dst = edge_index[0], edge_index[1]
-    degree = np.zeros(N, dtype=np.float64)
-    np.add.at(degree, src, 1)
-    degree_inv = 1.0 / np.maximum(degree, 1)
-
-    vals = degree_inv[src].astype(np.float64)
-    RW = sparse.csr_matrix((vals, (src, dst)), shape=(N, N))
-
-    features = []
-    k_schedule = [2, 4, 8, 16, 32]
-    RW_power = RW @ RW  # start at k=2
-    prev_k = 2
-    for k in k_schedule:
-        if len(features) >= num_rwpe:
-            break
-        for _ in range(k - prev_k):
-            RW_power = RW_power @ RW
-        prev_k = k
-        diag = np.array(RW_power.diagonal()).flatten()
-        features.append(diag.astype(np.float32))
-
-    return features
-
-
-def _compute_lpe(edge_index, N, num_lpe):
-    """LPE: Laplacian Positional Encoding (Dwivedi & Bresson, 2021).
-
-    Computes the k smallest non-trivial eigenvectors of the symmetric
-    normalized graph Laplacian: L_sym = I - D^{-1/2} A D^{-1/2}.
-
-    More expressive than RWPE for global structure — tells each node
-    "where am I in the graph" rather than just "how loopy is my neighborhood".
-
-    Sign ambiguity is resolved by making the largest-magnitude component positive.
-    """
-    from scipy import sparse
-    from scipy.sparse.linalg import eigsh
-
-    src, dst = edge_index[0], edge_index[1]
-
-    # Adjacency matrix (bidirectional edges already present)
-    data = np.ones(len(src), dtype=np.float64)
-    A = sparse.csr_matrix((data, (src, dst)), shape=(N, N))
-
-    # Symmetric normalized Laplacian: L_sym = I - D^{-1/2} A D^{-1/2}
-    degree = np.array(A.sum(axis=1)).flatten()
-    d_inv_sqrt = 1.0 / np.sqrt(np.maximum(degree, 1e-12))
-    D_inv_sqrt = sparse.diags(d_inv_sqrt)
-    L_sym = sparse.eye(N) - D_inv_sqrt @ A @ D_inv_sqrt
-
-    # Compute k+1 smallest eigenvectors, then drop the trivial constant one
-    k = min(num_lpe + 1, N - 2)
-    try:
-        eigenvalues, eigenvectors = eigsh(L_sym, k=k, which='SM')
-        # Sort by eigenvalue (eigsh doesn't guarantee order)
-        order = np.argsort(eigenvalues)
-        eigenvectors = eigenvectors[:, order]
-        # Skip the first eigenvector (constant, eigenvalue ~0)
-        eigenvectors = eigenvectors[:, 1:]
-    except Exception:
-        # Fallback for degenerate graphs
-        eigenvectors = np.zeros((N, num_lpe), dtype=np.float32)
-
-    # Deterministic sign: make largest-magnitude component positive per eigenvector
-    for i in range(eigenvectors.shape[1]):
-        max_idx = np.argmax(np.abs(eigenvectors[:, i]))
-        if eigenvectors[max_idx, i] < 0:
-            eigenvectors[:, i] *= -1
-
-    # Pad if fewer eigenvectors than requested (small/disconnected graphs)
-    if eigenvectors.shape[1] < num_lpe:
-        pad = np.zeros((N, num_lpe - eigenvectors.shape[1]), dtype=np.float32)
-        eigenvectors = np.hstack([eigenvectors, pad])
-    else:
-        eigenvectors = eigenvectors[:, :num_lpe]
-
-    return [eigenvectors[:, i].astype(np.float32) for i in range(eigenvectors.shape[1])]
-
-
-def _compute_positional_features(pos, edge_index, num_features, encoding='rwpe'):
-    """Compute rotation-invariant positional node features.
-
-    Appended to physical node features to give each node a unique identity
-    while preserving rotation/translation invariance. Used for both T=1 and T>1.
-
-    Features (in priority order):
-        1. Distance from centroid     — global position context
-        2. Mean neighbor edge length  — local mesh density / feature size
-        3+ Encoding-dependent:
-           - 'rwpe': Random walk return probabilities (k=2,4,8,16,32)
-           - 'lpe':  Laplacian eigenvectors (global graph structure)
-
-    Args:
-        encoding: 'rwpe' (default), 'lpe', or 'rwpe+lpe' (both, split evenly)
-    """
-    N = pos.shape[0]
-    src, dst = edge_index[0], edge_index[1]
-    features = []
-
-    # 1. Distance from centroid (rotation-invariant: ||R(p-c)|| = ||p-c||)
-    centroid = pos.mean(axis=0)
-    dist_centroid = np.linalg.norm(pos - centroid, axis=1)
-    features.append(dist_centroid)
-
-    if num_features >= 2:
-        # 2. Mean neighbor edge length (rotation-invariant: ||R(p_j-p_i)|| = ||p_j-p_i||)
-        edge_lengths = np.linalg.norm(pos[dst] - pos[src], axis=1)
-        edge_len_sum = np.zeros(N, dtype=np.float64)
-        edge_len_count = np.zeros(N, dtype=np.float64)
-        np.add.at(edge_len_sum, dst, edge_lengths)
-        np.add.at(edge_len_count, dst, 1)
-        mean_edge_len = edge_len_sum / np.maximum(edge_len_count, 1)
-        features.append(mean_edge_len.astype(np.float32))
-
-    if num_features >= 3:
-        remaining = num_features - len(features)
-        encoding = encoding.lower().strip()
-
-        if encoding == 'lpe':
-            features.extend(_compute_lpe(edge_index, N, remaining))
-        elif encoding == 'rwpe+lpe':
-            n_rwpe = remaining // 2
-            n_lpe = remaining - n_rwpe
-            features.extend(_compute_rwpe(edge_index, N, n_rwpe))
-            features.extend(_compute_lpe(edge_index, N, n_lpe))
-        else:  # 'rwpe' (default)
-            features.extend(_compute_rwpe(edge_index, N, remaining))
-
-    return np.column_stack(features[:num_features]).astype(np.float32)
-
-
-def _finalize_moments(feature_sum, feature_sumsq, count):
-    """Finalize element-weighted mean/std from sums and squared sums."""
-    if count <= 0:
-        raise ValueError("Cannot finalize normalization statistics with count <= 0")
-    mean = (feature_sum / count).astype(np.float32)
-    meansq = (feature_sumsq / count).astype(np.float32)
-    var = np.maximum(meansq - mean ** 2, 0.0)
-    std = np.sqrt(var).astype(np.float32)
-    return mean, np.maximum(std, 1e-8)
-
-
-def _process_sample_chunk(h5_file: str, sample_ids: List[int], input_dim: int,
-                          output_dim: int, num_timesteps: int,
-                          num_pos_features: int = 0,
-                          positional_encoding: str = 'rwpe') -> Dict:
-    """
-    Worker function to process a chunk of samples.
-
-    Accumulates element-weighted statistics over all nodes, edges, and deltas
-    in the provided sample subset. This matches MeshGraphNets' online training
-    normalizers more closely than per-sample averaging.
-
-    Args:
-        h5_file: Path to HDF5 dataset file
-        sample_ids: List of sample IDs to process
-        input_dim: Number of input features (typically 4)
-        output_dim: Number of output features (typically 4)
-        num_timesteps: Number of timesteps in the dataset
-        num_pos_features: Number of positional features to append (0 = none)
-
-    Returns:
-        Dictionary with element-wise sums for node/edge/delta features plus
-        delta min/max.
-    """
-    total_node_dim = input_dim + num_pos_features
-    node_sum = np.zeros(total_node_dim, dtype=np.float64)
-    node_sumsq = np.zeros(total_node_dim, dtype=np.float64)
-    node_count = 0
-
-    edge_sum = np.zeros(EDGE_FEATURE_DIM, dtype=np.float64)
-    edge_sumsq = np.zeros(EDGE_FEATURE_DIM, dtype=np.float64)
-    edge_count = 0
-
-    delta_sum = np.zeros(output_dim, dtype=np.float64)
-    delta_sumsq = np.zeros(output_dim, dtype=np.float64)
-    delta_count = 0
-    delta_min = np.full(output_dim, np.inf, dtype=np.float64)
-    delta_max = np.full(output_dim, -np.inf, dtype=np.float64)
-
-    try:
-        with h5py.File(h5_file, 'r') as f:
-            for sid in sample_ids:
-                try:
-                    data = f[f'data/{sid}/nodal_data'][:]  # [features, time, nodes]
-                    mesh_edge = f[f'data/{sid}/mesh_edge'][:]  # [2, edges]
-
-                    max_timesteps_for_stats = 500
-                    if num_timesteps > 1:
-                        num_samples_t = min(max_timesteps_for_stats, num_timesteps)
-                        timesteps = np.linspace(0, num_timesteps - 1, num_samples_t, dtype=int)
-                    else:
-                        timesteps = [0]
-
-                    edge_idx = np.concatenate([mesh_edge, mesh_edge[[1, 0], :]], axis=1)
-
-                    # Positional features depend on topology only — compute once per sample
-                    pos_feat = None
-                    if num_pos_features > 0:
-                        ref_pos_0 = data[:3, 0, :].T
-                        pos_feat = _compute_positional_features(ref_pos_0, edge_idx, num_pos_features, positional_encoding)
-
-                    for t in timesteps:
-                        ref_pos = data[:3, t, :].T  # [N, 3]
-
-                        if num_timesteps == 1:
-                            # Static: physical features are zeros (model sees zeros)
-                            node_feat = np.zeros((data.shape[2], input_dim), dtype=np.float64)
-                            deformed_pos = ref_pos  # no displacement
-                        else:
-                            node_feat = data[3:3+input_dim, t, :].T  # [N, input_dim]
-                            deformed_pos = ref_pos + data[3:6, t, :].T
-
-                        # Append positional features
-                        if pos_feat is not None:
-                            node_feat = np.concatenate([node_feat, pos_feat], axis=1)
-
-                        node_sum += np.sum(node_feat, axis=0)
-                        node_sumsq += np.sum(node_feat ** 2, axis=0)
-                        node_count += node_feat.shape[0]
-
-                        edge_feat = compute_edge_attr(ref_pos, deformed_pos, edge_idx)
-                        edge_sum += np.sum(edge_feat, axis=0)
-                        edge_sumsq += np.sum(edge_feat ** 2, axis=0)
-                        edge_count += edge_feat.shape[0]
-
-                    # Delta features
-                    if num_timesteps > 1:
-                        num_delta_samples = min(max_timesteps_for_stats, num_timesteps - 1)
-                        delta_timesteps = np.linspace(0, num_timesteps - 2, num_delta_samples, dtype=int)
-                        for t in delta_timesteps:
-                            delta = (
-                                data[3:3 + output_dim, t + 1, :] -
-                                data[3:3 + output_dim, t, :]
-                            ).T
-                            delta_sum += np.sum(delta, axis=0)
-                            delta_sumsq += np.sum(delta ** 2, axis=0)
-                            delta_min = np.minimum(delta_min, np.min(delta, axis=0))
-                            delta_max = np.maximum(delta_max, np.max(delta, axis=0))
-                            delta_count += delta.shape[0]
-                    else:
-                        delta = data[3:3 + output_dim, 0, :].T
-                        delta_sum += np.sum(delta, axis=0)
-                        delta_sumsq += np.sum(delta ** 2, axis=0)
-                        delta_min = np.minimum(delta_min, np.min(delta, axis=0))
-                        delta_max = np.maximum(delta_max, np.max(delta, axis=0))
-                        delta_count += delta.shape[0]
-
-                except Exception as e:
-                    print(f"Warning: Failed to process sample {sid}: {e}")
-                    continue
-
-        return {
-            'node_sum': node_sum, 'node_sumsq': node_sumsq, 'node_count': node_count,
-            'edge_sum': edge_sum, 'edge_sumsq': edge_sumsq, 'edge_count': edge_count,
-            'delta_sum': delta_sum, 'delta_sumsq': delta_sumsq, 'delta_count': delta_count,
-            'delta_min': delta_min, 'delta_max': delta_max,
-            'num_samples_processed': len(sample_ids),
-        }
-
-    except Exception as e:
-        print(f"Error in worker process: {e}")
-        return {
-            'node_sum': np.zeros(input_dim, dtype=np.float64),
-            'node_sumsq': np.zeros(input_dim, dtype=np.float64),
-            'node_count': 0,
-            'edge_sum': np.zeros(EDGE_FEATURE_DIM, dtype=np.float64),
-            'edge_sumsq': np.zeros(EDGE_FEATURE_DIM, dtype=np.float64),
-            'edge_count': 0,
-            'delta_sum': np.zeros(output_dim, dtype=np.float64),
-            'delta_sumsq': np.zeros(output_dim, dtype=np.float64),
-            'delta_count': 0,
-            'delta_min': np.full(output_dim, np.inf, dtype=np.float64),
-            'delta_max': np.full(output_dim, -np.inf, dtype=np.float64),
-            'num_samples_processed': 0,
-        }
 
 
 class MeshGraphDataset(Dataset):
@@ -314,7 +28,6 @@ class MeshGraphDataset(Dataset):
         self.input_dim = config.get('input_var')  # Physical features only (4)
         self.output_dim = config.get('output_var')  # Physical features only (4)
         self.num_pos_features = int(config.get('positional_features', 0))
-        self.positional_encoding = str(config.get('positional_encoding', 'rwpe')).lower().strip()
         configured_edge_dim = int(config.get('edge_var', EDGE_FEATURE_DIM))
         if configured_edge_dim != EDGE_FEATURE_DIM:
             raise ValueError(
@@ -352,35 +65,26 @@ class MeshGraphDataset(Dataset):
         self.multiscale_levels = int(config.get('multiscale_levels', 1))
         self.coarse_edge_means: List = []   # per-level: [mean_level_0, mean_level_1, ...]
         self.coarse_edge_stds: List = []    # per-level: [std_level_0, std_level_1, ...]
-        self._coarse_cache_max = int(config.get('coarse_cache_per_worker', 500))
-        self._coarse_cache: Dict = {}  # {sample_id: list[dict]} — fallback when disk cache off
-        # Static cache (positional features) has its OWN small cap, decoupled from
-        # _coarse_cache_max: tying it to a large hierarchy cap blew up RAM on big meshes.
+        # Small bounded per-worker cache for positional features (used only when
+        # the on-disk cache is absent, i.e. non-multiscale runs).
         self._static_cache_max = int(config.get('static_cache_per_worker', 64))
-        self._static_cache: Dict = {}  # {sample_id: x_pos} — fallback when disk cache off
+        self._static_cache: Dict = {}  # {sample_id: x_pos}
         # On-disk hierarchy/positional cache (built once, streamed by all workers).
         self._ms_cache_path = None
         self._ms_reader = None
 
         # Per-level coarsening method.
-        # Accepted: 'bfs', 'voronoi', 'voronoi_centroid', 'voronoi_inherit', 'voronoi_seedmean'.
-        # 'voronoi' is normalised to 'voronoi_centroid' so downstream code sees
-        # only canonical values.
-        _accepted_methods = ('bfs', 'voronoi_centroid', 'voronoi_inherit', 'voronoi_seedmean')
+        from model.coarsening import ACCEPTED_COARSEN_METHODS
         raw_ct = config.get('coarsening_type', 'bfs')
         if isinstance(raw_ct, list):
             self.coarsening_types = [str(t).strip().lower() for t in raw_ct]
         else:
             self.coarsening_types = [str(raw_ct).strip().lower()]
-        self.coarsening_types = [
-            'voronoi_centroid' if t == 'voronoi' else t for t in self.coarsening_types
-        ]
         for t in self.coarsening_types:
-            if t not in _accepted_methods:
+            if t not in ACCEPTED_COARSEN_METHODS:
                 raise ValueError(
                     f"Unknown coarsening method '{t}' in coarsening_type. "
-                    f"Accepted: 'bfs', 'voronoi' (alias for 'voronoi_centroid'), "
-                    f"'voronoi_centroid', 'voronoi_inherit', 'voronoi_seedmean'."
+                    f"Accepted: {ACCEPTED_COARSEN_METHODS}."
                 )
         # Expand single value to all levels
         if len(self.coarsening_types) == 1 and self.multiscale_levels > 1:
@@ -397,8 +101,6 @@ class MeshGraphDataset(Dataset):
         # Expand single value to all levels
         if len(self.voronoi_clusters) == 1 and self.multiscale_levels > 1:
             self.voronoi_clusters = self.voronoi_clusters * self.multiscale_levels
-
-        self.bipartite_unpool = config.get('bipartite_unpool', False)
 
         print(f"Loading MeshGraphDataset: {h5_file}")
         print(f"  input_dim: {self.input_dim}, output_dim: {self.output_dim}, edge_dim: {self.edge_dim}")
@@ -446,7 +148,7 @@ class MeshGraphDataset(Dataset):
         # Hierarchies are pure functions of mesh topology + reference geometry, so
         # one shared file serves every split, worker, and concurrent job — keeping
         # FPS off the hot path and per-worker RAM flat.
-        if self.use_multiscale and config.get('use_hierarchy_disk_cache', True):
+        if self.use_multiscale:
             if not HAS_COARSENING:
                 raise ImportError("use_multiscale=True requires model/coarsening.py (import failed)")
             from general_modules.multiscale_cache import ensure_cache
@@ -652,7 +354,6 @@ class MeshGraphDataset(Dataset):
         subset.input_dim = self.input_dim
         subset.output_dim = self.output_dim
         subset.num_pos_features = self.num_pos_features
-        subset.positional_encoding = self.positional_encoding
         subset.edge_dim = self.edge_dim
         subset.sample_ids = list(sample_ids)
         subset.num_timesteps = self.num_timesteps
@@ -676,12 +377,9 @@ class MeshGraphDataset(Dataset):
         subset.multiscale_levels = self.multiscale_levels
         subset.coarsening_types = self.coarsening_types
         subset.voronoi_clusters = self.voronoi_clusters
-        subset.bipartite_unpool = self.bipartite_unpool
         subset.coarse_edge_means = []
         subset.coarse_edge_stds = []
-        subset._coarse_cache = {}
         subset._static_cache = {}
-        subset._coarse_cache_max = self._coarse_cache_max
         subset._static_cache_max = self._static_cache_max
         # Share the parent's on-disk cache (covers all sample_ids); reader is
         # process-local and opened lazily per worker.
@@ -710,153 +408,51 @@ class MeshGraphDataset(Dataset):
         """Compute train-split z-score statistics for node, edge, and delta features."""
         print('Computing z-score normalization statistics...')
 
-        num_samples = len(self.sample_ids)
+        stats = compute_normalization_stats(
+            self.h5_file, self.sample_ids, self.input_dim, self.output_dim,
+            self.num_timesteps, self.num_pos_features,
+            use_parallel=self.config.get('use_parallel_stats', True),
+        )
 
-        # Check if parallel processing is enabled and beneficial
-        use_parallel = self.config.get('use_parallel_stats', True)  # Default: enabled
-        min_samples_for_parallel = 10  # Don't parallelize for small datasets
-
-        # Determine number of workers
-        if use_parallel and num_samples >= min_samples_for_parallel:
-            # Cap at 8: spawn-context pool workers each re-import torch, so a
-            # large pool risks OOM-killed workers and a permanent starmap hang.
-            num_workers = max(1, min(8, int(mp.cpu_count() * 0.45)))
-        else:
-            num_workers = 1
-
-        if num_workers > 1:
-            print(f'  Using parallel processing: {num_workers} workers for {num_samples} samples')
-            stats = self._compute_stats_parallel(num_workers, num_samples)
-        else:
-            if not use_parallel:
-                print(f'  Parallel processing disabled (use_parallel_stats=False)')
-            else:
-                print(f'  Using serial processing ({num_samples} samples, threshold={min_samples_for_parallel})')
-            stats = self._compute_stats_serial(num_samples)
-
-        # Finalize element-weighted statistics
-        self.node_mean, self.node_std = _finalize_moments(
+        self.node_mean, self.node_std = finalize_moments(
             stats['node_sum'], stats['node_sumsq'], stats['node_count'])
-        self.edge_mean, self.edge_std = _finalize_moments(
+        self.edge_mean, self.edge_std = finalize_moments(
             stats['edge_sum'], stats['edge_sumsq'], stats['edge_count'])
+        self.delta_mean, self.delta_std = finalize_moments(
+            stats['delta_sum'], stats['delta_sumsq'], stats['delta_count'])
 
         print(f'  Node features - mean: {self.node_mean}, std: {self.node_std}')
         print(f'  Edge features - mean: {self.edge_mean}, std: {self.edge_std}')
-
-        # Finalize delta statistics
-        self.delta_mean, self.delta_std = _finalize_moments(
-            stats['delta_sum'], stats['delta_sumsq'], stats['delta_count'])
-        delta_min = stats['delta_min'].astype(np.float32)
-        delta_max = stats['delta_max'].astype(np.float32)
-
         print(f'  Delta features - mean: {self.delta_mean}, std: {self.delta_std}')
-        print(f'  Delta features - min: {delta_min}, max: {delta_max}')
+        print(f"  Delta features - min: {stats['delta_min'].astype(np.float32)}, "
+              f"max: {stats['delta_max'].astype(np.float32)}")
 
-        # Sanity checks for normalization
+        self._warn_on_degenerate_stats()
+
+    def _warn_on_degenerate_stats(self) -> None:
+        """Print warnings for suspicious normalization statistics."""
         print('\n  === Normalization Sanity Checks ===')
         warnings = []
-
-        # Check for extreme std values
         if np.any(self.node_std > 100):
-            warnings.append(f"  ⚠️  WARNING: Very large node std detected (> 100): {self.node_std[self.node_std > 100]}")
+            warnings.append(f"  WARNING: Very large node std (> 100): {self.node_std[self.node_std > 100]}")
         if np.any(self.node_std < 0.01):
-            warnings.append(f"  ⚠️  WARNING: Very small node std detected (< 0.01): {self.node_std[self.node_std < 0.01]}")
-
+            warnings.append(f"  WARNING: Very small node std (< 0.01): {self.node_std[self.node_std < 0.01]}")
         if np.any(self.delta_std > 100):
-            warnings.append(f"  ⚠️  WARNING: Very large delta std detected (> 100): {self.delta_std[self.delta_std > 100]}")
+            warnings.append(f"  WARNING: Very large delta std (> 100): {self.delta_std[self.delta_std > 100]}")
         if np.any(self.delta_std < 0.01):
-            warnings.append(f"  ⚠️  WARNING: Very small delta std detected (< 0.01): {self.delta_std[self.delta_std < 0.01]}")
-
-        # Check for extreme mean values
+            warnings.append(f"  WARNING: Very small delta std (< 0.01): {self.delta_std[self.delta_std < 0.01]}")
         if np.any(np.abs(self.node_mean) > 10):
-            warnings.append(f"  ⚠️  WARNING: Large node mean detected (|mean| > 10): {self.node_mean[np.abs(self.node_mean) > 10]}")
+            warnings.append(f"  WARNING: Large node mean (|mean| > 10): {self.node_mean[np.abs(self.node_mean) > 10]}")
         if np.any(np.abs(self.delta_mean) > 10):
-            warnings.append(f"  ⚠️  WARNING: Large delta mean detected (|mean| > 10): {self.delta_mean[np.abs(self.delta_mean) > 10]}")
-
-        # Check for near-zero variance (constant features)
+            warnings.append(f"  WARNING: Large delta mean (|mean| > 10): {self.delta_mean[np.abs(self.delta_mean) > 10]}")
         if np.any(self.node_std < 1e-6):
-            warnings.append(f"  ⚠️  CRITICAL: Near-zero node variance detected - feature is constant!")
+            warnings.append("  CRITICAL: Near-zero node variance - feature is constant!")
         if np.any(self.delta_std < 1e-6):
-            warnings.append(f"  ⚠️  CRITICAL: Near-zero delta variance detected - targets are constant!")
-
-        if warnings:
-            for w in warnings:
-                print(w)
-        else:
-            print('  ✓ All normalization statistics look reasonable')
-
-    def _compute_stats_serial(self, num_samples: int) -> Dict:
-        """Serial statistics over the current split."""
-        return _process_sample_chunk(
-            self.h5_file,
-            self.sample_ids[:num_samples],
-            self.input_dim,
-            self.output_dim,
-            self.num_timesteps,
-            self.num_pos_features,
-            self.positional_encoding,
-        )
-
-    def _compute_stats_parallel(self, num_workers: int, num_samples: int) -> Dict:
-        """Parallel statistics — workers return element-wise sums, master merges them."""
-        chunk_size = max(1, num_samples // num_workers)
-        sample_chunks = []
-        for i in range(0, num_samples, chunk_size):
-            sample_chunks.append(self.sample_ids[i:i+chunk_size])
-
-        try:
-            with mp.Pool(num_workers) as pool:
-                worker_args = [
-                    (self.h5_file, chunk, self.input_dim, self.output_dim, self.num_timesteps,
-                     self.num_pos_features, self.positional_encoding)
-                    for chunk in sample_chunks
-                ]
-                results = pool.starmap(_process_sample_chunk, worker_args)
-
-            # Merge per-sample sums from all workers — simple addition
-            node_sum = np.zeros(self.input_dim, dtype=np.float64)
-            node_sumsq = np.zeros(self.input_dim, dtype=np.float64)
-            node_count = 0
-            edge_sum = np.zeros(self.edge_dim, dtype=np.float64)
-            edge_sumsq = np.zeros(self.edge_dim, dtype=np.float64)
-            edge_count = 0
-            delta_sum = np.zeros(self.output_dim, dtype=np.float64)
-            delta_sumsq = np.zeros(self.output_dim, dtype=np.float64)
-            delta_count = 0
-            delta_min = np.full(self.output_dim, np.inf, dtype=np.float64)
-            delta_max = np.full(self.output_dim, -np.inf, dtype=np.float64)
-
-            total_processed = 0
-            for result in results:
-                if result['num_samples_processed'] > 0:
-                    node_sum += result['node_sum']
-                    node_sumsq += result['node_sumsq']
-                    node_count += result['node_count']
-                    edge_sum += result['edge_sum']
-                    edge_sumsq += result['edge_sumsq']
-                    edge_count += result['edge_count']
-                    delta_sum += result['delta_sum']
-                    delta_sumsq += result['delta_sumsq']
-                    delta_count += result['delta_count']
-                    np.minimum(delta_min, result['delta_min'], out=delta_min)
-                    np.maximum(delta_max, result['delta_max'], out=delta_max)
-                    total_processed += result['num_samples_processed']
-
-            print(f'  Successfully processed {total_processed}/{num_samples} samples')
-
-            if total_processed == 0:
-                raise RuntimeError("No samples were successfully processed in parallel mode")
-
-            return {
-                'node_sum': node_sum, 'node_sumsq': node_sumsq, 'node_count': node_count,
-                'edge_sum': edge_sum, 'edge_sumsq': edge_sumsq, 'edge_count': edge_count,
-                'delta_sum': delta_sum, 'delta_sumsq': delta_sumsq, 'delta_count': delta_count,
-                'delta_min': delta_min, 'delta_max': delta_max,
-            }
-
-        except Exception as e:
-            print(f'  Warning: Parallel processing failed ({e}), falling back to serial processing')
-            return self._compute_stats_serial(num_samples)
+            warnings.append("  CRITICAL: Near-zero delta variance - targets are constant!")
+        for w in warnings:
+            print(w)
+        if not warnings:
+            print('  All normalization statistics look reasonable')
 
     def _compute_coarse_edge_stats(self) -> None:
         """
@@ -903,17 +499,9 @@ class MeshGraphDataset(Dataset):
                 first_pos_data = data_h5[:3, 0, :]  # [3, nodes] — ref xyz
                 level_ref_pos = first_pos_data.T     # [N, 3]
 
-                # Reuse the shared on-disk cache when present (avoids re-running
-                # FPS for every train sample during this stats pass).
-                reader = self._get_ms_reader()
-                if reader is not None and reader.has(sid):
-                    hierarchy = reader.get_hierarchy(sid)
-                else:
-                    hierarchy = build_multiscale_hierarchy(
-                        edge_idx, num_nodes, level_ref_pos,
-                        L, self.coarsening_types, self.voronoi_clusters,
-                        bipartite_unpool=self.bipartite_unpool,
-                    )
+                # Hierarchies come from the shared on-disk cache, built for all
+                # sample_ids at dataset construction time.
+                hierarchy = self._get_ms_reader().get_hierarchy(sid)
                 actual_levels = len(hierarchy)
 
                 # Collect coarse edge stats per level — 10 timesteps is sufficient
@@ -964,7 +552,7 @@ class MeshGraphDataset(Dataset):
                 self.coarse_edge_means.append(self.edge_mean.copy())
                 self.coarse_edge_stds.append(self.edge_std.copy())
             else:
-                mean, std = _finalize_moments(level_sum[level], level_sumsq[level], level_count[level])
+                mean, std = finalize_moments(level_sum[level], level_sumsq[level], level_count[level])
                 self.coarse_edge_means.append(mean)
                 self.coarse_edge_stds.append(std)
                 print(f'  Level {level} coarse edge stats: mean={mean}, std={std}')
@@ -1075,9 +663,7 @@ class MeshGraphDataset(Dataset):
             return cached
 
         ref_pos_0 = data[:3, 0, :].T
-        xp = _compute_positional_features(
-            ref_pos_0, edge_index, self.num_pos_features, self.positional_encoding
-        )
+        xp = compute_positional_features(ref_pos_0, edge_index, self.num_pos_features)
         if self._static_cache_max > 0:
             if len(cache) >= self._static_cache_max:
                 cache.pop(next(iter(cache)))
@@ -1085,11 +671,10 @@ class MeshGraphDataset(Dataset):
         return xp
 
     def __getstate__(self):
-        """Exclude unpicklable HDF5 handle when pickling (for DataLoader workers)."""
+        """Exclude unpicklable HDF5 handles when pickling (for DataLoader workers)."""
         state = self.__dict__.copy()
         state['_h5_handle'] = None
         state['_ms_reader'] = None      # h5 handle is not picklable; workers reopen lazily
-        state['_coarse_cache'] = {}    # workers start with empty cache; they build lazily
         state['_static_cache'] = {}
         return state
 
@@ -1281,27 +866,10 @@ class MeshGraphDataset(Dataset):
             graph_data.world_edge_index = torch.zeros((2, 0), dtype=torch.long)
             graph_data.world_edge_attr = torch.zeros((0, self.edge_dim), dtype=torch.float32)
 
-        # Attach per-level coarsening data (only when use_multiscale=True)
+        # Attach per-level coarsening data (only when use_multiscale=True).
+        # Hierarchies always come from the shared on-disk cache.
         if self.use_multiscale:
-            # Prefer the shared on-disk cache (built once, streamed by every worker).
-            # Fall back to on-the-fly build + bounded RAM cache when disabled.
-            reader = self._get_ms_reader()
-            if reader is not None:
-                hierarchy = reader.get_hierarchy(sample_id)
-            else:
-                if sample_id not in self._coarse_cache:
-                    raw_edge_idx = edge_index.numpy()  # already bidirectional [2, 2M]
-                    level_ref_pos = pos.numpy()         # [N, 3] for Euclidean FPS
-                    hierarchy = build_multiscale_hierarchy(
-                        raw_edge_idx, pos.shape[0], level_ref_pos,
-                        self.multiscale_levels, self.coarsening_types, self.voronoi_clusters,
-                        bipartite_unpool=self.bipartite_unpool,
-                    )
-                    # LRU-style eviction: evict oldest entry if over capacity
-                    if len(self._coarse_cache) >= self._coarse_cache_max:
-                        self._coarse_cache.pop(next(iter(self._coarse_cache)))
-                    self._coarse_cache[sample_id] = hierarchy
-                hierarchy = self._coarse_cache[sample_id]
+            hierarchy = self._get_ms_reader().get_hierarchy(sample_id)
 
             world_ei_for_coarse = (
                 graph_data.world_edge_index.numpy()

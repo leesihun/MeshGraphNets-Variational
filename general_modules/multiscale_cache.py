@@ -63,7 +63,6 @@ def _coarse_params(config: dict) -> dict:
         types = [str(t).strip().lower() for t in raw_ct]
     else:
         types = [str(raw_ct).strip().lower()]
-    types = ['voronoi_centroid' if t == 'voronoi' else t for t in types]
     if len(types) == 1 and levels > 1:
         types = types * levels
 
@@ -81,15 +80,11 @@ def _coarse_params(config: dict) -> dict:
         'levels': levels,
         'types': types,
         'clusters': clusters,
-        'bipartite': bool(config.get('bipartite_unpool', False)),
     }
 
 
 def _pos_params(config: dict) -> dict:
-    return {
-        'num': int(config.get('positional_features', 0)),
-        'encoding': str(config.get('positional_encoding', 'rwpe')).lower().strip(),
-    }
+    return {'num': int(config.get('positional_features', 0))}
 
 
 def _signature(h5_file: str, coarse_params: dict, pos_params: dict) -> dict:
@@ -196,14 +191,12 @@ def _build_one(sid: int):
     hierarchy = build_multiscale_hierarchy(
         edge_index, num_nodes, ref_pos,
         cp['levels'], cp['types'], cp['clusters'],
-        bipartite_unpool=cp['bipartite'],
     )
 
     x_pos = None
     if pp['num'] > 0:
-        # Deferred import avoids an import cycle (mesh_dataset imports this module).
-        from general_modules.mesh_dataset import _compute_positional_features
-        x_pos = _compute_positional_features(ref_pos, edge_index, pp['num'], pp['encoding'])
+        from general_modules.positional_features import compute_positional_features
+        x_pos = compute_positional_features(ref_pos, edge_index, pp['num'])
 
     return int(sid), hierarchy, x_pos
 
@@ -299,12 +292,8 @@ def ensure_cache(h5_file: str, sample_ids, config: dict):
     """Return a path to a valid hierarchy cache, building it if needed.
 
     Coordinated across concurrent jobs by an exclusive lock file: exactly one
-    process builds, the rest poll until the finished file appears. Returns
-    ``None`` if disk caching is disabled.
+    process builds, the rest poll until the finished file appears.
     """
-    if not config.get('use_hierarchy_disk_cache', True):
-        return None
-
     coarse_params = _coarse_params(config)
     pos_params = _pos_params(config)
     signature = _signature(h5_file, coarse_params, pos_params)

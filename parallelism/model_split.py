@@ -56,7 +56,7 @@ from torch_geometric.data import Data
 from torch_geometric.utils import scatter
 
 from general_modules.edge_features import EDGE_FEATURE_DIM
-from model.coarsening import pool_features, unpool_features
+from model.coarsening import pool_features
 from model.encoder_decoder import Decoder, Encoder, GnBlock
 from model.mlp import build_mlp
 from model.vae import GNNVariationalEncoder
@@ -370,10 +370,10 @@ def _unpack_bundle_indexed(
 def _parse_mp_per_level(config: dict, L: int) -> List[int]:
     mp = config.get('mp_per_level', None)
     if mp is None:
-        fine_pre  = int(config.get('fine_mp_pre', 5))
-        coarse_mp = int(config.get('coarse_mp_num', 5))
-        fine_post = int(config.get('fine_mp_post', 5))
-        mp = [fine_pre] + [coarse_mp] + [fine_post]
+        raise ValueError(
+            "use_multiscale=True requires mp_per_level "
+            "(2 * multiscale_levels + 1 entries)"
+        )
     if not isinstance(mp, list):
         mp = [int(mp)]
     else:
@@ -480,9 +480,6 @@ class _StageInner(nn.Module):
         mp_per_level: Optional[List[int]] = None,
     ):
         super().__init__()
-        coarse_config = dict(config)
-        coarse_config['use_world_edges'] = False
-
         if is_first:
             self.encoder = Encoder(
                 edge_input_size, node_input_size, latent_dim,
@@ -497,11 +494,11 @@ class _StageInner(nn.Module):
             self.processer_list = nn.ModuleDict()
             for i in my_blocks:
                 self.processer_list[str(i)] = GnBlock(
-                    config, latent_dim, use_world_edges=use_world_edges)
+                    latent_dim, use_world_edges=use_world_edges)
         else:
             assert L > 0 and mp_per_level is not None
             self._build_multiscale_blocks(
-                ops_sequence, config, coarse_config, latent_dim,
+                ops_sequence, config, latent_dim,
                 edge_input_size, use_world_edges, L, mp_per_level,
             )
 
@@ -514,7 +511,7 @@ class _StageInner(nn.Module):
             )
 
     # ------------------------------------------------------------------
-    def _build_multiscale_blocks(self, ops_sequence, config, coarse_config,
+    def _build_multiscale_blocks(self, ops_sequence, config,
                                   latent_dim, edge_input_size, use_world_edges,
                                   L, mp_per_level):
         pre_dict: Dict[str, Dict[str, nn.Module]] = {}
@@ -524,7 +521,6 @@ class _StageInner(nn.Module):
         skip_proj_dict: Dict[str, nn.Module] = {}
         unpool_dict: Dict[str, nn.Module] = {}
 
-        bipartite_unpool = bool(config.get('bipartite_unpool', False))
         use_coarse_we = bool(config.get('coarse_world_edges', False)) and use_world_edges
 
         for op in ops_sequence:
@@ -536,16 +532,13 @@ class _StageInner(nn.Module):
                     if lv not in pre_dict:
                         pre_dict[lv] = {}
                     use_we = use_world_edges if (level == 0 or use_coarse_we) else False
-                    cfg = config if use_we else coarse_config
                     if li not in pre_dict[lv]:
-                        pre_dict[lv][li] = GnBlock(cfg, latent_dim, use_world_edges=use_we)
+                        pre_dict[lv][li] = GnBlock(latent_dim, use_world_edges=use_we)
                 elif kind == 'coarsest':
                     li = str(local_idx)
                     if li not in coarsest_dict:
                         coarsest_dict[li] = GnBlock(
-                            config if use_coarse_we else coarse_config,
-                            latent_dim,
-                            use_world_edges=use_coarse_we,
+                            latent_dim, use_world_edges=use_coarse_we,
                         )
                 elif kind == 'post':
                     lv = str(level)
@@ -553,9 +546,8 @@ class _StageInner(nn.Module):
                     if lv not in post_dict:
                         post_dict[lv] = {}
                     use_we = use_world_edges if (level == 0 or use_coarse_we) else False
-                    cfg = config if use_we else coarse_config
                     if li not in post_dict[lv]:
-                        post_dict[lv][li] = GnBlock(cfg, latent_dim, use_world_edges=use_we)
+                        post_dict[lv][li] = GnBlock(latent_dim, use_world_edges=use_we)
             elif op[0] == 'save_pool':
                 level = op[1]
                 lv = str(level)
@@ -566,7 +558,7 @@ class _StageInner(nn.Module):
                 lv = str(level)
                 if lv not in skip_proj_dict:
                     skip_proj_dict[lv] = nn.Linear(2 * latent_dim, latent_dim)
-                if bipartite_unpool and lv not in unpool_dict:
+                if lv not in unpool_dict:
                     from model.blocks import UnpoolBlock
                     unpool_dict[lv] = UnpoolBlock(latent_dim, build_mlp)
 
@@ -830,14 +822,13 @@ class ModelSplitStage(nn.Module):
         wei = getattr(encoded, 'world_edge_index', None) if self.use_world_edges else None
         return encoded.x, encoded.edge_attr, encoded.edge_index, wea, wei
 
-    def encode_vae(self, graph, use_zero_z: bool = False) -> Tuple:
+    def encode_vae(self, graph) -> Tuple:
         """Run VAE encoder on graph (stage 0 only).
 
         Returns (z_per_node, z_full, vae_losses, aux_loss).
           z_per_node  [N, vae_dim]         — fine-level (slot 0) per-node z for immediate use.
           z_full      [B, num_z, vae_dim]  — full latent for per-level slot selection in multiscale.
                                              None when num_z == 1 (no extra bundle tensor needed).
-        When use_zero_z=True, z is all-zeros with empty losses (deterministic auxiliary pass).
         """
         if not (self.is_first and self.use_vae):
             raise RuntimeError("encode_vae() called on wrong stage")
@@ -854,15 +845,8 @@ class ModelSplitStage(nn.Module):
                     else torch.zeros(N, dtype=torch.long, device=device))
         B = int(batch_bc.max().item()) + 1 if original_batch is not None else 1
         zero_f = torch.zeros((), device=device, dtype=torch.float32)
-        empty_losses = {'mmd': zero_f, 'kl': zero_f, 'kl_raw': zero_f}
+        empty_losses = {'mmd': zero_f}
 
-        if use_zero_z:
-            z = torch.zeros(B, self._num_z, self._vae_latent_dim, device=device, dtype=dtype)
-            z_per_node = z[:, 0, :][batch_bc]
-            z_full = z if (self.use_multiscale and self._num_z > 1) else None
-            return z_per_node, z_full, empty_losses, zero_f.to(dtype=dtype)
-
-        vae_free_bits   = float(self.config.get('free_bits', 0.0))
         vae_graph_aware = bool(self.config.get('vae_graph_aware', False))
 
         use_posterior = self.training and original_y is not None
@@ -871,10 +855,7 @@ class ModelSplitStage(nn.Module):
                 original_y, original_ei, original_ea, batch_bc,
                 x=(original_x if vae_graph_aware else None),
             )
-            mmd = GNNVariationalEncoder.mmd_loss(z.float())
-            kl_clamped, kl_raw = GNNVariationalEncoder.kl_loss(
-                mu.float(), logvar.float(), free_bits=vae_free_bits)
-            vae_losses = {'mmd': mmd, 'kl': kl_clamped, 'kl_raw': kl_raw}
+            vae_losses = {'mmd': GNNVariationalEncoder.mmd_loss(z.float())}
         else:
             z = torch.randn(B, self._num_z, self._vae_latent_dim, device=device, dtype=dtype)
             vae_losses = empty_losses
@@ -941,13 +922,10 @@ class ModelSplitStage(nn.Module):
         seed_idx = getattr(graph, f'coarse_seed_idx_{level}', None)
         if seed_idx is not None:
             ld['seeds'] = seed_idx
-        if bool(self.config.get('bipartite_unpool', False)):
-            up_ei = getattr(graph, f'unpool_edge_index_{level}', None)
-            if up_ei is not None:
-                ld['up_ei'] = up_ei
-                ld['coarse_centroid'] = getattr(graph, f'coarse_centroid_{level}', None)
-                ld['fine_pos'] = (graph.pos if level == 0
-                                  else getattr(graph, f'coarse_centroid_{level - 1}', None))
+        ld['up_ei'] = graph[f'unpool_edge_index_{level}']
+        ld['coarse_centroid'] = getattr(graph, f'coarse_centroid_{level}', None)
+        ld['fine_pos'] = (graph.pos if level == 0
+                          else getattr(graph, f'coarse_centroid_{level - 1}', None))
         return ld
 
     def run_local_blocks_multiscale(
@@ -974,7 +952,6 @@ class ModelSplitStage(nn.Module):
             current_graph.world_edge_attr  = world_edge_attr
             current_graph.world_edge_index = world_edge_index
 
-        bipartite_unpool = bool(self.config.get('bipartite_unpool', False))
         level_idx = current_level_idx  # tracks current coarsening depth
 
         # Track batch assignment at the current coarsening level so we can
@@ -1057,20 +1034,14 @@ class ModelSplitStage(nn.Module):
                 ld = self._extract_level_data(graph, unpool_level)
                 skip = skip_stack[-1]
 
-                up_ei = ld.get('up_ei')
-                if (bipartite_unpool and hasattr(self.model, 'unpool_blocks')
-                        and up_ei is not None
-                        and ld.get('coarse_centroid') is not None
-                        and ld.get('fine_pos') is not None):
-                    rel_pos = ld['fine_pos'][up_ei[1]] - ld['coarse_centroid'][up_ei[0]]
-                    h_up = self.model.unpool_blocks[str(unpool_level)](
-                        h_coarse=current_graph.x,
-                        h_fine_skip=skip['x'],
-                        unpool_edge_index=up_ei,
-                        rel_pos=rel_pos,
-                    )
-                else:
-                    h_up = unpool_features(current_graph.x, ld['ftc'])
+                up_ei = ld['up_ei']
+                rel_pos = ld['fine_pos'][up_ei[1]] - ld['coarse_centroid'][up_ei[0]]
+                h_up = self.model.unpool_blocks[str(unpool_level)](
+                    h_coarse=current_graph.x,
+                    h_fine_skip=skip['x'],
+                    unpool_edge_index=up_ei,
+                    rel_pos=rel_pos,
+                )
 
                 h_merged = self.model.skip_projs[str(unpool_level)](
                     torch.cat([skip['x'], h_up], dim=-1))

@@ -4,7 +4,7 @@ from contextlib import nullcontext
 import torch
 import torch.nn as nn
 from torch_geometric.data import Data
-from torch_geometric.nn import GlobalAttention
+from torch_geometric.nn import AttentionalAggregation
 
 from model.encoder_decoder import GnBlock
 from model.mlp import build_mlp, init_weights
@@ -42,15 +42,12 @@ class _ConditionalPriorBase(nn.Module):
 
         self.node_encoder = build_mlp(base_input_size, self.hidden_dim, self.hidden_dim)
         self.edge_encoder = build_mlp(edge_input_size, self.hidden_dim, self.hidden_dim)
-        block_config = {
-            'residual_scale': config.get('residual_scale', 1.0),
-            'use_pairnorm': config.get('prior_use_pairnorm', False),
-        }
         self.mp_layers = nn.ModuleList([
-            GnBlock(block_config, self.hidden_dim, use_world_edges=False)
+            GnBlock(self.hidden_dim, use_world_edges=False)
             for _ in range(self.num_mp_layers)
         ])
-        self.pool = GlobalAttention(nn.Linear(self.hidden_dim, 1))
+        # State-dict compatible with the deprecated GlobalAttention (same gate_nn keys).
+        self.pool = AttentionalAggregation(nn.Linear(self.hidden_dim, 1))
 
     def condition(self, graph):
         """Encode graph → pooled conditioning vector [B, hidden_dim]."""
@@ -424,5 +421,4 @@ def build_prior_config(config):
         'prior_mixture_components': config.get('prior_mixture_components', 50),
         'prior_min_std': config.get('prior_min_std', 0.1),
         'prior_cov_rank': config.get('prior_cov_rank', 0),
-        'residual_scale': config.get('residual_scale', 1.0),
     }

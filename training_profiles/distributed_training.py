@@ -9,11 +9,9 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
-from torch.utils.data import Subset
 from torch_geometric.loader import DataLoader
 
 from training_profiles.setup import (
-    analyze_debug_files,
     build_dataset_splits,
     build_model_and_ema,
     build_optimizer_scheduler,
@@ -27,7 +25,7 @@ from training_profiles.training_loop import (
     evaluate_vae_learned_prior_epoch,
     evaluate_vae_posterior_epoch,
     log_training_config,
-    test_model,
+    run_periodic_test,
     train_epoch,
     validate_epoch,
 )
@@ -147,7 +145,7 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
             num_workers=num_workers,
             pin_memory=pin_memory,
             persistent_workers=num_workers > 0,
-            prefetch_factor=1 if num_workers > 0 else None,
+            prefetch_factor=2 if num_workers > 0 else None,
             multiprocessing_context=mp_context,
         )
     else:
@@ -191,6 +189,7 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
     if rank == 0:
         log_model_summary(ddp_model, config, ema_model)
 
+    best_valid_loss = float('inf')
     last_valid_loss = float('inf')
     last_saved_epoch = -1
 
@@ -219,9 +218,9 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
 
     start_time = time.time()
 
-    log_file, log_dir = None, None
+    log_file = None
     if rank == 0:
-        log_file, log_dir = init_log_file(config, config_filename)
+        log_file = init_log_file(config, config_filename)
 
     # Synchronize all processes before starting training
     dist.barrier(device_ids=[gpu_id])
@@ -328,16 +327,25 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
                     f"LR: {current_lr:.2e}"
                 )
 
-        # Only rank 0 saves checkpoints
+        # Only rank 0 saves checkpoints — only when validation improves or on last epoch.
         if rank == 0:
-            last_valid_loss = valid_loss
-            last_saved_epoch = epoch
-            save_checkpoint(
-                epoch, ddp_model.module, ema_model, optimizer, scheduler,
-                train_loss, valid_loss, config, train_dataset, modelname,
-                use_vae=use_vae,
-            )
-            print(f"  -> Model saved at epoch {epoch} with valid loss {valid_loss:.2e}")
+            last_epoch = epoch == config.get('training_epochs') - 1
+            is_best = valid_loss < best_valid_loss
+            if is_best or last_epoch:
+                if is_best:
+                    best_valid_loss = valid_loss
+                last_valid_loss = valid_loss
+                last_saved_epoch = epoch
+                save_checkpoint(
+                    epoch, ddp_model.module, ema_model, optimizer, scheduler,
+                    train_loss, valid_loss, config, train_dataset, modelname,
+                )
+                reason = []
+                if is_best:
+                    reason.append(f"new best ({valid_loss:.2e})")
+                if last_epoch:
+                    reason.append("last epoch")
+                print(f"  -> Model saved at epoch {epoch}: {', '.join(reason)}")
 
         if log_file and rank == 0: 
             with open(log_file, 'a') as f:
@@ -364,23 +372,7 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
         last_epoch = epoch == config.get('training_epochs') - 1
         if epoch % test_interval == 0 or last_epoch:
             if rank == 0:
-                _test_start = time.time()
-                test_loss = test_model(eval_model, test_loader, device, config, epoch, train_dataset)
-                print(f"  Test completed in {time.time() - _test_start:.1f}s")
-
-                # Optionally visualize training set reconstruction (same batch indices)
-                if config.get('display_trainset', True):
-                    train_viz_indices = config.get('test_batch_idx', [0, 1, 2, 3, 4, 5, 6, 7])
-                    train_viz_indices = [i for i in train_viz_indices if i < len(train_dataset)]
-                    if train_viz_indices:
-                        train_viz_loader = DataLoader(
-                            Subset(train_dataset, train_viz_indices),
-                            batch_size=1, shuffle=False, pin_memory=pin_memory
-                        )
-                        viz_config = dict(config)
-                        viz_config['test_batch_idx'] = list(range(len(train_viz_indices)))
-                        train_viz_loss = test_model(eval_model, train_viz_loader, device, viz_config, epoch, train_dataset, output_prefix='train')
-                        print(f"  Train reconstruction loss: {train_viz_loss:.2e}")
+                run_periodic_test(eval_model, test_loader, device, config, epoch, train_dataset)
             dist.barrier(device_ids=[gpu_id])
 
     if rank == 0:
@@ -388,17 +380,6 @@ def _train_worker_inner(rank, world_size, config, gpu_ids, config_filename):
             print(f"\nTraining interrupted. Last model saved at epoch {last_saved_epoch} with validation loss {last_valid_loss:.2e}")
         else:
             print(f"\nTraining finished. Last model saved at epoch {last_saved_epoch} with validation loss {last_valid_loss:.2e}")
-
-    # Post-hoc step: only the 'gmm' mode trains anything after the main loop.
-    # 'gnn_e2e' is fully joint — its prior was already trained inside train_epoch.
-    if rank == 0 and config.get('use_vae', False) and prior_type == 'gmm':
-        from model.latent_gmm import run_posthoc_gmm_fitting
-        gmm_model = ema_model.module if ema_model is not None else model
-        run_posthoc_gmm_fitting(gmm_model, train_dataset, config, device, modelname)
-
-    # Analyze debug files if they exist
-    if rank == 0:
-        analyze_debug_files(log_dir)
 
     cleanup_dataloaders(train_loader, val_loader, test_loader)
 

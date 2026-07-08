@@ -21,31 +21,28 @@ Implications for VAE design:
   reflects genuine spread structure, not noise.
 - **beta_aux (≈ 1.0)** anchors z to per-graph output statistics and prevents
   posterior/mode collapse. Do not reduce it.
-- **lambda_det must be 0.0.** The deterministic auxiliary loss (second forward
-  with z=0) was introduced to fight posterior shortcuts in single-mode problems.
-  It conflicts with the spread-modeling objective and must not be used.
 - **vae_graph_aware True** lets the posterior encoder see graph input features
   alongside target y, enabling type-conditional spread encoding. Recommended
   when data contains multiple manufactured part types.
-- **use_conditional_prior True** (with `train_with_prior` or `train_prior`) is
-  the correct architectural fix for type-to-type generalization: the prior
-  `p(z|graph)` maps each part type to its spread distribution at inference time.
+- **The conditional prior `p(z|graph)`** is the architectural fix for
+  type-to-type generalization: it maps each part type to its spread
+  distribution at inference time. It trains jointly with the VAE
+  (`prior_type gnn_e2e`, the default when `use_vae True`).
 - **The prior is trained ONLY by density matching** on a fresh detached
   posterior sample each step, weighted by `prior_nll_weight`. `prior_family`
   selects the family: `fm` (default) is a conditional flow-matching prior —
-  velocity-MSE regression, no components, no collapse machinery; `gmm` is the
-  legacy Gaussian mixture — mixture NLL plus a small `prior_kl_reg_weight`
-  analytical-KL anchor. The old single-sample prior reconstruction path
-  (`alpha_prior_max`, Gumbel reparam sampling) was variance-collapsing — the
-  same failure mode as `lambda_det`, routed through the prior — and has been
-  deleted from the code, along with `prior_loss_type` and `prior_gumbel_temp`.
+  velocity-MSE regression, no components, no collapse machinery; `gmm` is a
+  graph-conditional Gaussian mixture — mixture NLL plus a small
+  `prior_kl_reg_weight` analytical-KL anchor. Variance-collapsing objectives
+  (deterministic z=0 auxiliary loss `lambda_det`, single-sample prior
+  reconstruction `alpha_prior_max`) were removed from the code entirely — do
+  not reintroduce them.
 
 ## Run Commands
 
 ```bash
 python MeshGraphNets_main.py --config _warpage_input/config_train5.txt
-python MeshGraphNets_main.py --config _warpage_input/config_infer4.txt
-python MeshGraphNets_main.py --config _b8_all_warpage_input/config_infer1.txt
+python MeshGraphNets_main.py --config _b8_all_warpage_input/config_infer1_main.txt
 ```
 
 `mode` is inside the config. `--config` only picks the file.
@@ -54,10 +51,8 @@ python MeshGraphNets_main.py --config _b8_all_warpage_input/config_infer1.txt
 
 | Mode | Code path |
 |------|-----------|
-| `train` | `single_worker` or `train_worker`; with `use_vae True`, runs post-hoc conditional prior at the end by default (set `train_conditional_prior False` to skip), then fits legacy GMM if `fit_latent_gmm True`. |
-| `train_with_prior` | Backward-compat alias for `train`. Rewritten to `train` at dispatch. |
-| `train_prior` | Only valid for `prior_type gmm` (`model.latent_gmm.train_posthoc_gmm`). For `gnn_e2e` the prior trains jointly inside `mode train`. |
-| `inference` | `inference_profiles.rollout.run_rollout`; loads conditional prior by default if present in the checkpoint (set `use_conditional_prior False` to fall back to GMM/N(0,I)). |
+| `train` | `single_worker` or `train_worker`; with `use_vae True` the conditional prior trains jointly inside the epoch loop. |
+| `inference` | `inference_profiles.rollout.run_rollout`; samples z from the conditional prior in the checkpoint (set `use_conditional_prior False` to fall back to N(0,I)). |
 
 `gpu_ids` length controls single process vs DDP unless `parallel_mode model_split`
 is set. `parallel_mode model_split` routes to `parallelism.launcher`.
@@ -70,14 +65,15 @@ is set. `parallel_mode model_split` routes to `parallelism.launcher`.
 | [model/MeshGraphNets.py](model/MeshGraphNets.py) | Top-level model, flat/multiscale processor, VAE latent fusion. |
 | [model/encoder_decoder.py](model/encoder_decoder.py) | Encoder, GnBlock, Decoder. |
 | [model/blocks.py](model/blocks.py) | EdgeBlock, NodeBlock, HybridNodeBlock, UnpoolBlock. |
-| [model/vae.py](model/vae.py) | Graph VAE encoder, MMD, optional free-bits KL. |
+| [model/vae.py](model/vae.py) | Graph VAE encoder and MMD regularizer. |
 | [model/conditional_prior.py](model/conditional_prior.py) | Mesh-conditioned priors for `z`: flow matching (`fm`, default) and Gaussian mixture (`gmm`), shared GNN trunk. |
-| [model/latent_gmm.py](model/latent_gmm.py) | Legacy post-hoc GMM collection, fit, and sampling. |
-| [model/coarsening.py](model/coarsening.py) | BFS and Voronoi coarsening, pool/unpool, `MultiscaleData`. |
-| [general_modules/mesh_dataset.py](general_modules/mesh_dataset.py) | HDF5 loading, split, normalization, positional features, world/multiscale attrs. |
+| [model/coarsening.py](model/coarsening.py) | BFS and Voronoi coarsening, pooling, `MultiscaleData`. |
+| [general_modules/mesh_dataset.py](general_modules/mesh_dataset.py) | HDF5 loading, split, normalization, world/multiscale attrs. |
+| [general_modules/positional_features.py](general_modules/positional_features.py) | Rotation-invariant positional node features (centroid dist, edge length, RWPE). |
 | [general_modules/edge_features.py](general_modules/edge_features.py) | 8-D reference/deformed edge features. |
 | [general_modules/world_edges.py](general_modules/world_edges.py) | scipy KDTree or torch-cluster world-edge construction. |
 | [general_modules/multiscale_helpers.py](general_modules/multiscale_helpers.py) | Shared hierarchy build/attach used by dataset and rollout. |
+| [general_modules/multiscale_cache.py](general_modules/multiscale_cache.py) | Shared on-disk hierarchy/positional cache (mandatory for multiscale). |
 | [training_profiles/setup.py](training_profiles/setup.py) | Dataset/model/EMA/optimizer/checkpoint helpers. |
 | [training_profiles/training_loop.py](training_profiles/training_loop.py) | Train, validate, VAE prior/posterior eval, test visualization. |
 | [inference_profiles/rollout.py](inference_profiles/rollout.py) | Autoregressive rollout and HDF5 output. |
@@ -91,20 +87,22 @@ is set. `parallel_mode model_split` routes to `parallelism.launcher`.
 - LayerNorm is appended once at the MLP output when `layer_norm=True`.
 - Decoder output has no LayerNorm. For time-transient runs, decoder final weights
   are scaled by `0.01` at initialization.
-- Node aggregation is sum.
+- Node aggregation is sum. GnBlock residual connections are unscaled (x + Δx).
 - World edges use a separate edge encoder/block and a hybrid node block that
   aggregates mesh and world messages separately.
-- Multiscale V-cycle has no global gated encoder skip in the live code. It uses
-  per-level skip states merged by `Linear(2 * latent_dim, latent_dim)`.
+- Multiscale requires `mp_per_level` (2·L+1 entries) and always uses the learned
+  bipartite unpool (`UnpoolBlock`); the broadcast unpool was removed. Per-level
+  skip states are merged by `Linear(2 * latent_dim, latent_dim)`.
+- Multiscale hierarchies always come from the shared on-disk cache
+  (`*.mscache.*.h5` next to the dataset); there is no in-RAM fallback.
 - `coarsening_type` accepts `bfs`, `voronoi_centroid`, `voronoi_inherit`, and
-  `voronoi_seedmean` as canonical per-level values. `voronoi` is a back-compat
-  alias for `voronoi_centroid`. Inherit mode pools by gathering the FPS seed
-  feature (coarse node *is* the seed); centroid mode pools by scatter mean;
-  seedmean uses FPS seed positions as coarse anchors (on-manifold geometry) but
-  scatter-mean pool — it does **not** write `coarse_seed_idx_{i}` and uses the
-  existing centroid pool path in the model. Mixing modes per level is supported.
-  Stats are mode-specific, so a checkpoint trained in one mode cannot be loaded
-  into the other.
+  `voronoi_seedmean` per level (the bare `voronoi` alias was removed). Inherit
+  mode pools by gathering the FPS seed feature (coarse node *is* the seed);
+  centroid mode pools by scatter mean; seedmean uses FPS seed positions as
+  coarse anchors (on-manifold geometry) but scatter-mean pool — it does **not**
+  write `coarse_seed_idx_{i}`. Mixing modes per level is supported. Stats are
+  mode-specific, so a checkpoint trained in one mode cannot be loaded into
+  another.
 
 ## Data Facts
 
@@ -121,8 +119,8 @@ is set. `parallel_mode model_split` routes to `parallelism.launcher`.
 ## VAE And Priors
 
 Training with `use_vae True` uses posterior `q(z | y)` and fuses sampled `z` into
-every processor block. Validation logs both posterior reconstruction and prior
-sampling reconstruction.
+every processor block. Validation logs posterior reconstruction plus a
+learned-prior CRPS pass that mirrors inference sampling.
 
 For manufacturing spread modeling the recommended training loss weights are:
 
@@ -130,8 +128,8 @@ For manufacturing spread modeling the recommended training loss weights are:
 |-----------|-------|--------|
 | `lambda_mmd` | 0.1 | Low: z must encode structured spread, not collapse to N(0,I) |
 | `beta_aux` | 1.0 | High: anchors z to graph output statistics, prevents collapse |
-| `lambda_det` | 0.0 | Must be zero: det auxiliary loss conflicts with spread objective |
-| `vae_latent_dim` | 32 | Full capacity needed to represent spread across part types |
+| `posterior_min_std` | 0.05 | Floor on σ_q; prevents the prior from memorizing point masses |
+| `vae_latent_dim` | 32–64 | Full capacity needed to represent spread across part types |
 | `vae_graph_aware` | True | Enables type-conditional spread encoding |
 | `prior_family` | `fm` | Flow-matching prior (default): expressive density matching with no component-collapse modes; models all num_z slots jointly |
 | `prior_nll_weight` | 1.0 | Weight of the prior objective (FM velocity-MSE, or mixture NLL for `gmm`) |
@@ -140,25 +138,16 @@ For manufacturing spread modeling the recommended training loss weights are:
 
 Validation prints a per-slot `[PriorDiag]` line (posterior cloud std vs prior
 std). A `spread_ratio` near 1 is healthy; near 0 means the prior collapsed and
-generated samples will have far too little spread. The `ValidLearnedPrior`
-metric mirrors inference (z sampled from the learned `p(z|graph)`); the older
-`ValidPrior@K` metric samples z from N(0,I) and is NOT representative when a
-learned prior exists.
+generated samples will have far too little spread. The CRPS metric mirrors
+inference (z sampled from the learned `p(z|graph)`).
 
-Post-training priors:
-
-- Conditional prior: `conditional_prior_state_dict`,
-  `conditional_prior_config`, `conditional_prior_metrics`.
-- Legacy GMM: `gmm_params`.
-
-Rollout tries conditional prior, then GMM, then `N(0, I)`. Because rollout applies
-checkpoint `model_config` before reading `use_conditional_prior`, a checkpoint saved
-with that key false can suppress the conditional prior even if the inference config
-sets it true.
-
-For spread modeling, the conditional prior is strongly preferred over GMM or N(0,I):
-it maps each graph (part type + boundary conditions) to its own spread distribution
-at inference time, enabling realistic extrapolation across part variants.
+Rollout samples z from the joint-trained conditional prior in the checkpoint
+(legacy separately-saved `conditional_prior_state_dict` checkpoints still load),
+falling back to `N(0, I)` when none exists. Because rollout applies checkpoint
+`model_config` before reading `use_conditional_prior`, a checkpoint saved with
+that key false can suppress the conditional prior even if the inference config
+sets it true. The post-hoc sklearn GMM prior (`model/latent_gmm.py`,
+`mode train_prior`, `fit_latent_gmm`) was removed.
 
 ## Documentation Notes
 

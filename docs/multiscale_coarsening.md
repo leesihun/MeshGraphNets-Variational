@@ -17,11 +17,11 @@ more coarsened graph levels.
 | --- | --- |
 | `use_multiscale` | Enables multiscale graph data and the V-cycle processor. |
 | `multiscale_levels` | Number of coarse levels. |
-| `coarsening_type` | `bfs`, `voronoi`, `voronoi_centroid`, `voronoi_inherit`, `voronoi_seedmean`, or a comma list with one method per level. |
+| `coarsening_type` | `bfs`, `voronoi_centroid`, `voronoi_inherit`, `voronoi_seedmean`, or a comma list with one method per level. |
 | `voronoi_clusters` | Cluster count for Voronoi levels; scalar or comma list. |
 | `mp_per_level` | Processor block counts. Must have `2 * multiscale_levels + 1` entries. |
-| `bipartite_unpool` | Enables learned coarse-to-fine unpooling. |
-| `coarse_cache_per_worker` | Limits each worker's hierarchy cache. |
+
+
 
 For `multiscale_levels = L`, `mp_per_level` is interpreted as:
 
@@ -58,11 +58,11 @@ model and DataLoader, including:
 
 - coarse edge attributes computed with the same 8-D edge layout as mesh edges
 - coarse centroids for each level
-- optional bipartite unpool edges from coarse nodes to fine nodes
+- bipartite unpool edges from coarse nodes to fine nodes
 
 The dataset attaches these tensors as `fine_to_coarse_i`,
-`coarse_edge_index_i`, `coarse_edge_attr_i`, `num_coarse_i`, and, when
-`bipartite_unpool True`, `unpool_edge_index_i` and `coarse_centroid_i`.
+`coarse_edge_index_i`, `coarse_edge_attr_i`, `num_coarse_i`,
+`unpool_edge_index_i`, and `coarse_centroid_i`.
 
 ## BFS Bi-Stride
 
@@ -101,7 +101,6 @@ example the `_b8_all_warpage_input` configs with `voronoi_clusters 200`.
 | Value | Behavior |
 | --- | --- |
 | `bfs` | BFS bi-stride coarsening. Pool = scatter mean over BFS clusters. Coarse position = cluster centroid. |
-| `voronoi` | Back-compat alias for `voronoi_centroid`. |
 | `voronoi_centroid` | FPS-Voronoi. Coarse position = cluster centroid; pool = scatter mean over members. Default voronoi behavior. |
 | `voronoi_inherit` | FPS-Voronoi. Coarse node *is* the FPS seed: coarse position = seed position (a real mesh node), pool degenerates to a gather `x[seeds]`. Coarse edges are still the boundary edges between Voronoi cells. |
 | `voronoi_seedmean` | FPS-Voronoi. Coarse position = FPS seed position (real mesh node, on-manifold); pool = scatter mean over cluster members. Combines seed-anchored geometry with full-weighting pool. Does **not** write `coarse_seed_idx_{i}`; uses the existing centroid (scatter-mean) pool path in the model. |
@@ -180,13 +179,10 @@ a per-level linear projection from concatenated skip and upsampled features:
 Linear(2 * latent_dim -> latent_dim)
 ```
 
-## Unpooling Modes
+## Unpooling
 
-With `bipartite_unpool False`, `unpool_features` broadcasts each coarse node
-state to fine nodes using `fine_to_coarse`.
-
-With `bipartite_unpool True`, `UnpoolBlock` runs learned message passing over
-`unpool_edge_index_i`:
+Unpooling is always the learned bipartite `UnpoolBlock`, which runs message
+passing over `unpool_edge_index_i`:
 
 ```text
 message = MLP(coarse_state, fine_skip_state, relative_position)
@@ -223,4 +219,5 @@ Common multiscale errors are usually shape or config mismatches:
 - Voronoi levels need a valid `voronoi_clusters` value.
 - Missing `fine_to_coarse_i` or `coarse_edge_attr_i` means hierarchy attachment
   did not run for that graph.
-- Very large `coarse_cache_per_worker` values increase host RAM pressure.
+- A stale `*.mscache.*.h5` after config changes rebuilds automatically (the
+  signature hash changes); delete the `.lock` file if a previous build crashed.

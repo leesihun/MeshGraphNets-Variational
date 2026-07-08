@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch_geometric.utils import scatter
 from torch_geometric.data import Data
 
@@ -7,32 +8,28 @@ from torch_geometric.data import Data
 class EdgeBlock(nn.Module):
 
     def __init__(self, custom_func:nn.Module):
-        
+
         super(EdgeBlock, self).__init__()
         self.net = custom_func
 
 
     def forward(self, graph):
 
-        node_attr = graph.x 
+        node_attr = graph.x
         senders_idx, receivers_idx = graph.edge_index
         edge_attr = graph.edge_attr
 
-        edges_to_collect = []
-
-        senders_attr = node_attr[senders_idx]   # sender nodal features 
-        receivers_attr = node_attr[receivers_idx]# Receiver nodal features
-
-        edges_to_collect.append(senders_attr)
-        edges_to_collect.append(receivers_attr)
-        edges_to_collect.append(edge_attr) # edge features
-
-        # All three features are concatenated along the feature dimension
-
-        collected_edges = torch.cat(edges_to_collect, dim=1)
-        
-        edge_attr = self.net(collected_edges)   
-        # Update edge features via Edge block w.r.t. sender, receiver nodal attribute and its edge attribute
+        # Split-linear: project node features at [N, D] scale before gathering to
+        # [E, D], instead of gathering first and projecting at [E, 3D] scale.
+        # Equivalent because Linear(cat(s, r, e)) = s@W_s + r@W_r + e@W_e.
+        # Eliminates the [E, 3D] activation that autograd saves for backward in
+        # every GnBlock, cutting activation VRAM roughly in half. State-dict unchanged.
+        first = self.net[0]   # nn.Linear(3D, D)
+        D = node_attr.shape[-1]
+        h_s = F.linear(node_attr, first.weight[:, :D])                    # [N, D]
+        h_r = F.linear(node_attr, first.weight[:, D:2 * D])               # [N, D]
+        h_e = F.linear(edge_attr, first.weight[:, 2 * D:], first.bias)    # [E, D]
+        edge_attr = self.net[1:](h_s[senders_idx] + h_r[receivers_idx] + h_e)
 
         return Data(x=node_attr, edge_attr=edge_attr, edge_index=graph.edge_index)
 
