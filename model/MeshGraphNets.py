@@ -232,6 +232,9 @@ class EncoderProcessorDecoder(nn.Module):
 
     def _build_vae_components(self, config):
         self.vae_latent_dim = int(config.get('vae_latent_dim', 32))
+        # MMD kernel bandwidth mode: 'fixed' (legacy constant sigmas, saturates at
+        # high vae_latent_dim) or 'median' (dimension-adaptive median heuristic).
+        self.mmd_bandwidth = str(config.get('mmd_bandwidth', 'fixed')).lower().strip()
         vae_mp_layers = int(config.get('vae_mp_layers', 5))
         self.vae_graph_aware = bool(config.get('vae_graph_aware', False))
         self.vae_posterior_min_std = float(config.get('posterior_min_std', 0))
@@ -311,7 +314,7 @@ class EncoderProcessorDecoder(nn.Module):
                 original_y, original_edge_index, original_edge_attr, batch,
                 x=(original_x if self.vae_graph_aware else None),
             )
-            mmd = GNNVariationalEncoder.mmd_loss(z.float())
+            mmd = GNNVariationalEncoder.mmd_loss(z.float(), bandwidth=self.mmd_bandwidth)
             return z, {'mmd': mmd, 'mu': mu, 'logvar': logvar}
         B = int(original_batch.max().item()) + 1 if original_batch is not None else 1
         z = torch.randn(B, self.num_z, self.vae_latent_dim, device=device, dtype=dtype)

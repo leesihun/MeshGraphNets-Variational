@@ -1,48 +1,67 @@
-"""Generate the anti-smoothing (capacity + sharp-posterior) sweep.
+"""Generate the 4-factor FM sweep (vae_latent_dim x mmd_bandwidth x
+prior_hidden_dim x lambda_mmd), 8 single-GPU cells.
 
-Generated warpage is uniformly ~0.75 of GT width AND the shape is off (trimming
-tails didn't help -> VAE smoothing toward the conditional mean, not an artifact).
-This sweep attacks smoothing with more capacity + an extremely sharp posterior:
+Strategy: prior_temperature (fixed 1.0 here) will calibrate the spread SCALE
+post-hoc at inference, so this training sweep is judged on SCALE-INVARIANT
+quality — centering (Gen_mu vs GT_mu), distribution shape (kurtosis + unit-scaled
+Wasserstein/KS), and prior health ([PriorDiag] spread_ratio) — NOT raw Wasserstein.
 
-  feature_loss_weights = 1/1/1, Training_epochs = 2000, 2-GPU DDP per run.
-  Base = L=2, mp 4/8/12/8/4, voronoi 2000/500, cov_rank=8, alpha_recon=100, mse,
-  extreme_weight=0, beta_aux=1.0.
+Four 2-level factors in 8 runs = a resolution-IV half fraction (generator
+D = ABC, i.e. I = ABCD). Main effects A,B,C,D are clear of 2-factor
+interactions; 2fi's alias in pairs (AB=CD, AC=BD, AD=BC). Read the four main
+effects as 4-vs-4 averages; treat interactions cautiously.
 
-2x2 factorial: capacity {32/128, 64/192} x posterior_min_std {0.05, 0.001}.
-  cell1 control      : 32/128, pmin=0.05   (cap-, sharp-)
-  cell2 bigcap       : 64/192, pmin=0.05   (cap+, sharp-)
-  cell3 bigcap+sharp : 64/192, pmin=0.001  (cap+, sharp+)
-  cell4 sharp        : 32/128, pmin=0.001  (cap-, sharp+)  -- completes the 2x2
-pmin=0.001 is a near-zero sigma_q floor -> sharpest decoder; watch for the
-sigma_q-collapse failure ([PriorDiag] spread_ratio / Valid).
+  A = vae_latent_dim    {64, 256}      latent capacity (centering + structure)
+  B = mmd_bandwidth      {fixed, median} aggregate-posterior SHAPE at high dim
+  C = prior_hidden_dim   {192, 384}     FM-prior fidelity (targets the main<->sec gap)
+  D = lambda_mmd         {0.05, 0.2}    MMD shaping strength (straddles the 0.1 default)
 
-GPU7 is down. cells 1-3 use pairs (0,1)/(2,3)/(4,5); cell4 reuses (0,1) in a
-second wave (after cell1). config_train1..4 (+ infer).
+FM prior only. alpha_recon = 1000 (fixed): pushes recon fidelity hard; safe
+because temperature restores spread downstream. Caveat: alpha_recon=1000 heavily
+dominates the loss, so the MMD-related main effects (B, D) may read small simply
+because MMD is swamped — interpret a null B/D effect in that light.
+
+Base: L=2 Voronoi V-cycle, mp 4/8/12/8/4, voronoi 2000/500, mse, ew=0,
+beta_aux=1.0, posterior_min_std=0.05, Latent_dim=128, Training_epochs=2000.
+One GPU per cell (gpu_ids 0..7). config_train1..8 (+ main/sec infer per cell).
 """
 import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 EPOCHS = 2000
+LDM = 128        # model Latent_dim (fixed)
+ALPHA_RECON = 1000
 
-# n, train gpus (2-GPU DDP), infer gpu, vae_latent_dim, Latent_dim(model), posterior_min_std, tag
+# Resolution-IV 2^(4-1), generator D = ABC.
+#   A vae_latent_dim (-=64,+=256)  B mmd_bandwidth (-=fixed,+=median)
+#   C prior_hidden_dim (-=192,+=384)  D lambda_mmd (-=0.05,+=0.2)
+# n, gpu, vae_latent_dim, mmd_bandwidth, prior_hidden_dim, lambda_mmd
 cells = [
-    dict(n=1, gpus="0,1", igpu=0, ld=32, ldm=128, pmin=0.05,  tag="control"),
-    dict(n=2, gpus="2,3", igpu=2, ld=64, ldm=192, pmin=0.05,  tag="bigcap"),
-    dict(n=3, gpus="4,5", igpu=4, ld=64, ldm=192, pmin=0.001, tag="bigcap_sharp"),
-    dict(n=4, gpus="0,1", igpu=0, ld=32, ldm=128, pmin=0.001, tag="sharp"),  # wave 2 (after cell1)
+    dict(n=1, gpu=0, ld=64,  bw="fixed",  phd=192, lam=0.05),
+    dict(n=2, gpu=1, ld=256, bw="fixed",  phd=192, lam=0.2),
+    dict(n=3, gpu=2, ld=64,  bw="median", phd=192, lam=0.2),
+    dict(n=4, gpu=3, ld=256, bw="median", phd=192, lam=0.05),
+    dict(n=5, gpu=4, ld=64,  bw="fixed",  phd=384, lam=0.2),
+    dict(n=6, gpu=5, ld=256, bw="fixed",  phd=384, lam=0.05),
+    dict(n=7, gpu=6, ld=64,  bw="median", phd=384, lam=0.05),
+    dict(n=8, gpu=7, ld=256, bw="median", phd=384, lam=0.2),
 ]
 
 
+def make_tag(c):
+    return f"z{c['ld']}_{c['bw']}_ph{c['phd']}_l{str(c['lam']).replace('.', 'p')}"
+
+
 TRAIN_TMPL = """% ============================================================
-% ANTI-SMOOTHING sweep cell {n}: {tag}
-% vae_latent_dim={ld}, Latent_dim={ldm}, posterior_min_std={pmin}
-% feature_loss_weights 1/1/1, Training_epochs 2000, 2-GPU DDP. Base L=2,
-% voronoi 2000/500, cov_rank=8, mse, ew=0.
+% FM 4-factor sweep cell {n}: {tag}
+% vae_latent_dim={ld}, mmd_bandwidth={bw}, prior_hidden_dim={phd}, lambda_mmd={lam}
+% alpha_recon={alpha} (fixed), Latent_dim={ldm}, Training_epochs={epochs}, single-GPU.
+% Base L=2, voronoi 2000/500, mse, ew=0, beta_aux=1.0, posterior_min_std=0.05.
 % ============================================================
 model   MeshGraphNets-V
 mode    train
-gpu_ids {gpus}
+gpu_ids {gpu}
 log_file_dir    b8_all/train{n}_{tag}.log
 modelpath       ./outputs/b8_all/warpage_train{n}_{tag}.pth
 
@@ -71,7 +90,7 @@ augment_geometry     True
 grad_accum_steps     1
 
 % Memory / performance
-use_checkpointing    False   # faster; set True if OOM (esp. bigcap cells 2/3)
+use_checkpointing    False   # faster; set True if OOM (esp. z256 / prior_hidden_dim 384)
 use_amp              True
 use_ema              True
 ema_decay            0.99
@@ -99,27 +118,29 @@ mp_per_level        4, 8, 12, 8, 4
 use_vae          True
 vae_latent_dim   {ld}
 recon_loss       mse
-alpha_recon      100
-lambda_mmd       0.1
+alpha_recon      {alpha}
+lambda_mmd       {lam}
+mmd_bandwidth    {bw}
 vae_graph_aware  True
 beta_aux         1.0
-posterior_min_std {pmin}
+posterior_min_std 0.05
 
-% Prior - gnn_e2e joint training; prior_family fm = conditional flow matching (default).
+% Prior - gnn_e2e joint training; prior_family fm = conditional flow matching.
 prior_type               gnn_e2e
 use_conditional_prior    True
 prior_family             fm
 prior_nll_weight         1.0
 prior_fm_steps           20
 prior_mp_layers          5
-prior_hidden_dim         192
+prior_hidden_dim         {phd}
 prior_temperature        1.0
 """
 
-INFER_TMPL = """% Inference for cell {n}: {tag} (vae_latent_dim={ld}, Latent_dim={ldm})
+INFER_TMPL = """% Inference for cell {n}: {tag} ({which})
+% vae_latent_dim={ld}, prior_hidden_dim={phd}, Latent_dim={ldm}
 model   MeshGraphNets-V
 mode    inference
-gpu_ids {igpu}
+gpu_ids {gpu}
 log_file_dir         b8_all/infer_train{n}_{which}.log
 modelpath            ./outputs/b8_all/warpage_train{n}_{tag}.pth
 inference_output_dir outputs/b8_all/infer_train{n}_{which}
@@ -172,8 +193,6 @@ mp_per_level        4, 8, 12, 8, 4
 use_vae          True
 vae_latent_dim   {ld}
 recon_loss       mse
-alpha_recon      100
-lambda_mmd       0.1
 vae_graph_aware  True
 
 % Prior - sample z from the learned conditional prior p(z|graph)
@@ -182,8 +201,8 @@ use_conditional_prior    True
 prior_family             fm
 prior_fm_steps           20
 prior_mp_layers          5
-prior_hidden_dim         192
-prior_temperature        1.0   # raise (e.g. 1.3) to widen generated spread without retraining
+prior_hidden_dim         {phd}
+prior_temperature        1.0   # Phase 2: sweep this at inference to calibrate spread scale
 """
 
 INFER_DATASETS = {
@@ -199,8 +218,9 @@ def write(path, text):
 
 written = []
 for c in cells:
-    fields = dict(n=c["n"], gpus=c["gpus"], igpu=c["igpu"], ld=c["ld"],
-                  ldm=c["ldm"], pmin=c["pmin"], tag=c["tag"], epochs=EPOCHS)
+    tag = make_tag(c)
+    fields = dict(n=c["n"], gpu=c["gpu"], ld=c["ld"], bw=c["bw"], phd=c["phd"],
+                  lam=c["lam"], ldm=LDM, alpha=ALPHA_RECON, tag=tag, epochs=EPOCHS)
     tpath = os.path.join(HERE, f"config_train{c['n']}.txt")
     write(tpath, TRAIN_TMPL.format(**fields))
     written.append(os.path.basename(tpath))

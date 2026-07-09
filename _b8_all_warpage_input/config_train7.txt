@@ -1,14 +1,14 @@
 % ============================================================
-% FM 4-factor sweep cell 4: z256_median_ph192_l0p05
-% vae_latent_dim=256, mmd_bandwidth=median, prior_hidden_dim=192, lambda_mmd=0.05
+% FM 4-factor sweep cell 7: z64_median_ph384_l0p05
+% vae_latent_dim=64, mmd_bandwidth=median, prior_hidden_dim=384, lambda_mmd=0.05
 % alpha_recon=1000 (fixed), Latent_dim=128, Training_epochs=2000, single-GPU.
 % Base L=2, voronoi 2000/500, mse, ew=0, beta_aux=1.0, posterior_min_std=0.05.
 % ============================================================
 model   MeshGraphNets-V
 mode    train
-gpu_ids 3
-log_file_dir    b8_all/train4_z256_median_ph192_l0p05.log
-modelpath       ./outputs/b8_all/warpage_train4_z256_median_ph192_l0p05.pth
+gpu_ids 6
+log_file_dir    b8_all/train7_z64_median_ph384_l0p05.log
+modelpath       ./outputs/b8_all/warpage_train7_z64_median_ph384_l0p05.pth
 
 % Datasets
 dataset_dir     ./dataset/b8_main_sec_dataset_traincopy.h5
@@ -61,7 +61,7 @@ mp_per_level        4, 8, 12, 8, 4
 
 % VAE (MMD-InfoVAE)
 use_vae          True
-vae_latent_dim   256
+vae_latent_dim   64
 recon_loss       mse
 alpha_recon      1000
 lambda_mmd       0.05
@@ -77,5 +77,5 @@ prior_family             fm
 prior_nll_weight         1.0
 prior_fm_steps           20
 prior_mp_layers          5
-prior_hidden_dim         192
+prior_hidden_dim         384
 prior_temperature        1.0

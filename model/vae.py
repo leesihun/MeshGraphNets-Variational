@@ -93,7 +93,7 @@ class GNNVariationalEncoder(nn.Module):
         return z, mu, logvar
 
     @staticmethod
-    def mmd_loss(z_posterior, kernel_sigmas=(0.5, 1.0, 2.0, 4.0, 8.0)):
+    def mmd_loss(z_posterior, kernel_sigmas=(0.5, 1.0, 2.0, 4.0, 8.0), bandwidth='fixed'):
         """Multi-scale RBF MMD² between z_posterior and N(0, I).
 
         Implements the InfoVAE objective (Zhao et al. 2019): match the aggregate
@@ -108,7 +108,16 @@ class GNNVariationalEncoder(nn.Module):
             z_posterior:    [B, D] or [B, num_z, D] reparameterized samples from q(z|x).
                             For per-level z, MMD is computed independently per slot and
                             averaged so each slot is regularised against N(0,I) on its own.
-            kernel_sigmas:  RBF bandwidths to sum over.
+            kernel_sigmas:  RBF bandwidths to sum over (used only for bandwidth='fixed').
+            bandwidth:      'fixed'  — constant `kernel_sigmas`. These are tuned for
+                              ~64-D z and SATURATE at high vae_latent_dim: pairwise
+                              squared distances grow ~2D, so every RBF kernel → 0 and
+                              the penalty (and its gradient) vanishes, silently
+                              disabling the regularizer.
+                            'median' — dimension-adaptive. Sets the base 2σ² from the
+                              median pairwise squared distance each step and keeps the
+                              multi-scale multipliers, so the kernel stays in its
+                              sensitive regime at any latent dim.
 
         Returns:
             Scalar MMD² estimate (biased V-statistic). Non-negative.
@@ -118,7 +127,7 @@ class GNNVariationalEncoder(nn.Module):
             num_z = z_posterior.shape[1]
             for i in range(num_z):
                 mmd_acc = mmd_acc + GNNVariationalEncoder.mmd_loss(
-                    z_posterior[:, i, :], kernel_sigmas=kernel_sigmas
+                    z_posterior[:, i, :], kernel_sigmas=kernel_sigmas, bandwidth=bandwidth
                 )
             return mmd_acc / num_z
 
@@ -128,12 +137,18 @@ class GNNVariationalEncoder(nn.Module):
         xx = torch.cdist(z_posterior, z_posterior).pow(2)
         yy = torch.cdist(z_prior, z_prior).pow(2)
         xy = torch.cdist(z_posterior, z_prior).pow(2)
+        if str(bandwidth).lower().strip() == 'median':
+            # Median-heuristic base scale (detached: the bandwidth is a constant,
+            # not backpropped). The cross term xy has no trivial self-distances.
+            med = torch.clamp(torch.median(xy.detach()), min=1e-6)
+            two_sigma_sqs = [med * m for m in (0.25, 0.5, 1.0, 2.0, 4.0)]
+        else:
+            two_sigma_sqs = [z_posterior.new_tensor(2.0 * s * s) for s in kernel_sigmas]
         mmd_total = z_posterior.new_zeros(())
-        for sigma in kernel_sigmas:
-            two_sigma_sq = 2.0 * sigma * sigma
+        for two_sigma_sq in two_sigma_sqs:
             mmd_total = mmd_total + (
                 torch.exp(-xx / two_sigma_sq).mean()
                 + torch.exp(-yy / two_sigma_sq).mean()
                 - 2.0 * torch.exp(-xy / two_sigma_sq).mean()
             )
-        return mmd_total / len(kernel_sigmas)
+        return mmd_total / len(two_sigma_sqs)
