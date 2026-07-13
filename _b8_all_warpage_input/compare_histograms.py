@@ -51,23 +51,39 @@ def _eval_spreads(h5_path: str) -> np.ndarray:
     return np.asarray(spreads, dtype=np.float64)
 
 
-def _rollout_spreads(rollout_dir: str) -> np.ndarray:
+def _rollout_spread_one(h5_path: str) -> float:
+    with h5py.File(h5_path, "r") as f:
+        # Each rollout file contains exactly one sample under /data
+        sample_id = next(iter(f["data"].keys()))
+        return _sample_spread(f[f"data/{sample_id}/nodal_data"])
+
+
+def _rollout_spreads(rollout_dir: str, jobs: int = 1) -> np.ndarray:
     """Return one spread value per generated rollout file."""
     files = sorted(glob.glob(os.path.join(rollout_dir, "rollout_sample*.h5")))
     if not files:
         raise FileNotFoundError(
             f"No rollout_sample*.h5 files found in {rollout_dir}"
         )
+    jobs = max(1, int(jobs))
     print(f"Found {len(files):,} rollout files in {rollout_dir}")
+    print(f"Loading rollout spreads with {jobs} worker(s)")
     spreads = np.empty(len(files), dtype=np.float64)
     report_every = max(1, len(files) // 20)
-    for i, fp in enumerate(files):
-        with h5py.File(fp, "r") as f:
-            # Each rollout file contains exactly one sample under /data
-            sample_id = next(iter(f["data"].keys()))
-            spreads[i] = _sample_spread(f[f"data/{sample_id}/nodal_data"])
-        if (i + 1) % report_every == 0 or i + 1 == len(files):
-            print(f"  loaded {i + 1:,}/{len(files):,} files")
+    if jobs > 1:
+        import multiprocessing
+        chunksize = max(1, len(files) // (jobs * 8))
+        ctx = multiprocessing.get_context("spawn")
+        with ctx.Pool(processes=jobs) as pool:
+            for i, spread in enumerate(pool.imap(_rollout_spread_one, files, chunksize=chunksize)):
+                spreads[i] = spread
+                if (i + 1) % report_every == 0 or i + 1 == len(files):
+                    print(f"  loaded {i + 1:,}/{len(files):,} files")
+    else:
+        for i, fp in enumerate(files):
+            spreads[i] = _rollout_spread_one(fp)
+            if (i + 1) % report_every == 0 or i + 1 == len(files):
+                print(f"  loaded {i + 1:,}/{len(files):,} files")
     return spreads
 
 
@@ -171,6 +187,10 @@ def main() -> None:
              "stats AND histogram (e.g. 0.02 = drop <2%% and >98%%). Compares the "
              "central bulk, ignoring artifact/spurious tails. 0 = off (default).",
     )
+    parser.add_argument(
+        "--jobs", type=int, default=1,
+        help="Parallel worker count for generated rollout HDF5 loading (default 1).",
+    )
     args = parser.parse_args()
 
     out_path = args.output or os.path.join(args.rollout_dir, "histogram_compare.png")
@@ -183,7 +203,7 @@ def main() -> None:
         raise RuntimeError("Eval dataset has no samples in /data.")
 
     print(f"Loading generated rollouts from: {args.rollout_dir}")
-    gen = _rollout_spreads(args.rollout_dir)
+    gen = _rollout_spreads(args.rollout_dir, jobs=args.jobs)
     print(f"  generated spread values (1 per VAE sample): {gen.size:,}")
 
     if args.trim_quantile > 0:

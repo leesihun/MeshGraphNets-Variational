@@ -1,20 +1,20 @@
-"""Generate the 4-factor FM sweep (vae_latent_dim x mmd_bandwidth x
-prior_hidden_dim x lambda_mmd), 8 single-GPU cells.
+"""Generate the FM capacity/MMD sweep, 8 single-GPU cells.
 
 Strategy: prior_temperature (fixed 1.0 here) will calibrate the spread SCALE
 post-hoc at inference, so this training sweep is judged on SCALE-INVARIANT
 quality — centering (Gen_mu vs GT_mu), distribution shape (kurtosis + unit-scaled
 Wasserstein/KS), and prior health ([PriorDiag] spread_ratio) — NOT raw Wasserstein.
 
-Four 2-level factors in 8 runs = a resolution-IV half fraction (generator
-D = ABC, i.e. I = ABCD). Main effects A,B,C,D are clear of 2-factor
-interactions; 2fi's alias in pairs (AB=CD, AC=BD, AD=BC). Read the four main
-effects as 4-vs-4 averages; treat interactions cautiously.
+Three 2-level factors in 8 runs = a full factorial around the train6 regime.
 
-  A = vae_latent_dim    {64, 256}      latent capacity (centering + structure)
-  B = mmd_bandwidth      {fixed, median} aggregate-posterior SHAPE at high dim
-  C = prior_hidden_dim   {192, 384}     FM-prior fidelity (targets the main<->sec gap)
-  D = lambda_mmd         {0.05, 0.2}    MMD shaping strength (straddles the 0.1 default)
+  A = vae_latent_dim    {128, 256}      stochastic global z capacity
+  B = Latent_dim        {128, 256}      base MGN hidden/global capacity
+  C = lambda_mmd        {0.1, 1.0}      aggregate-posterior shaping strength
+
+prior_hidden_dim is tied to z capacity:
+  z128 -> ph256, z256 -> ph384
+
+mmd_bandwidth is fixed for this batch.
 
 FM prior only. alpha_recon = 1000 (fixed): pushes recon fidelity hard; safe
 because temperature restores spread downstream. Caveat: alpha_recon=1000 heavily
@@ -22,35 +22,36 @@ dominates the loss, so the MMD-related main effects (B, D) may read small simply
 because MMD is swamped — interpret a null B/D effect in that light.
 
 Base: L=2 Voronoi V-cycle, mp 4/8/12/8/4, voronoi 2000/500, mse, ew=0,
-beta_aux=1.0, posterior_min_std=0.05, Latent_dim=128, Training_epochs=2000.
+beta_aux=1.0, posterior_min_std=0.05, Training_epochs=1000.
 One GPU per cell (gpu_ids 0..7). config_train1..8 (+ main/sec infer per cell).
 """
 import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-EPOCHS = 2000
-LDM = 128        # model Latent_dim (fixed)
+EPOCHS = 1000
 ALPHA_RECON = 1000
 
-# Resolution-IV 2^(4-1), generator D = ABC.
-#   A vae_latent_dim (-=64,+=256)  B mmd_bandwidth (-=fixed,+=median)
-#   C prior_hidden_dim (-=192,+=384)  D lambda_mmd (-=0.05,+=0.2)
-# n, gpu, vae_latent_dim, mmd_bandwidth, prior_hidden_dim, lambda_mmd
+# Full factorial:
+#   A vae_latent_dim {128,256}
+#   B Latent_dim {128,256}
+#   C lambda_mmd {0.1,1.0}
+# prior_hidden_dim scales with vae_latent_dim; mmd_bandwidth is fixed.
+# n, gpu, vae_latent_dim, Latent_dim, prior_hidden_dim, lambda_mmd
 cells = [
-    dict(n=1, gpu=0, ld=64,  bw="fixed",  phd=192, lam=0.05),
-    dict(n=2, gpu=1, ld=256, bw="fixed",  phd=192, lam=0.2),
-    dict(n=3, gpu=2, ld=64,  bw="median", phd=192, lam=0.2),
-    dict(n=4, gpu=3, ld=256, bw="median", phd=192, lam=0.05),
-    dict(n=5, gpu=4, ld=64,  bw="fixed",  phd=384, lam=0.2),
-    dict(n=6, gpu=5, ld=256, bw="fixed",  phd=384, lam=0.05),
-    dict(n=7, gpu=6, ld=64,  bw="median", phd=384, lam=0.05),
-    dict(n=8, gpu=7, ld=256, bw="median", phd=384, lam=0.2),
+    dict(n=1, gpu=0, ld=128, ldm=128, bw="fixed", phd=256, lam=0.1),
+    dict(n=2, gpu=1, ld=128, ldm=128, bw="fixed", phd=256, lam=1.0),
+    dict(n=3, gpu=2, ld=128, ldm=256, bw="fixed", phd=256, lam=0.1),
+    dict(n=4, gpu=3, ld=128, ldm=256, bw="fixed", phd=256, lam=1.0),
+    dict(n=5, gpu=4, ld=256, ldm=128, bw="fixed", phd=384, lam=0.1),
+    dict(n=6, gpu=5, ld=256, ldm=128, bw="fixed", phd=384, lam=1.0),
+    dict(n=7, gpu=6, ld=256, ldm=256, bw="fixed", phd=384, lam=0.1),
+    dict(n=8, gpu=7, ld=256, ldm=256, bw="fixed", phd=384, lam=1.0),
 ]
 
 
 def make_tag(c):
-    return f"z{c['ld']}_{c['bw']}_ph{c['phd']}_l{str(c['lam']).replace('.', 'p')}"
+    return f"z{c['ld']}_h{c['ldm']}_{c['bw']}_ph{c['phd']}_l{str(c['lam']).replace('.', 'p')}"
 
 
 TRAIN_TMPL = """% ============================================================
@@ -220,7 +221,7 @@ written = []
 for c in cells:
     tag = make_tag(c)
     fields = dict(n=c["n"], gpu=c["gpu"], ld=c["ld"], bw=c["bw"], phd=c["phd"],
-                  lam=c["lam"], ldm=LDM, alpha=ALPHA_RECON, tag=tag, epochs=EPOCHS)
+                  lam=c["lam"], ldm=c["ldm"], alpha=ALPHA_RECON, tag=tag, epochs=EPOCHS)
     tpath = os.path.join(HERE, f"config_train{c['n']}.txt")
     write(tpath, TRAIN_TMPL.format(**fields))
     written.append(os.path.basename(tpath))

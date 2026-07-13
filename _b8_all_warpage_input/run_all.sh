@@ -28,6 +28,14 @@
 #                      (e.g. 0.02 -> central 96%; ignores artifact/spurious tails; default 0)
 #   BASELINES        = space-separated baseline indices (default: "1 2 3 4 5 6 7 8")
 #   DATASETS         = space-separated dataset tags (default: "main sec")
+#   VAE_BATCH_SIZE   = integer or "auto" (default: auto)
+#   VAE_BATCH_VRAM_FRACTION = free-VRAM fraction for auto batching (default: 0.70)
+#   VAE_BATCH_SIZE_MIN = lower bound after auto probe (default: 1)
+#   VAE_BATCH_SIZE_MAX = upper bound after auto probe; 0 = uncapped (default: 0)
+#   NUM_VAE_SAMPLES  = optional override for quick runs
+#   PLOT_JOBS        = workers for mesh PNG plotting (default: 8)
+#   PLOT_DPI         = mesh PNG DPI (default: 80)
+#   HIST_JOBS        = workers for histogram rollout loading (default: 8)
 #
 # diag_prior_spread.py reports, per checkpoint+type, the warpage-amplitude spread
 # under posterior / prior / full-cov z-sources + the mu_q eigen-spectrum — i.e.
@@ -52,13 +60,23 @@ DIAG="${DIAG:-0}"
 TRIM="${TRIM:-0}"   # e.g. 0.02 -> drop bottom/top 2% of each distribution in the histogram compare
 BASELINES="${BASELINES:-1 2 3 4 5 6 7 8}" 
 DATASETS="${DATASETS:-main sec}"
+VAE_BATCH_SIZE="${VAE_BATCH_SIZE:-auto}"
+VAE_BATCH_VRAM_FRACTION="${VAE_BATCH_VRAM_FRACTION:-0.70}"
+VAE_BATCH_SIZE_MIN="${VAE_BATCH_SIZE_MIN:-1}"
+VAE_BATCH_SIZE_MAX="${VAE_BATCH_SIZE_MAX:-0}"
+NUM_VAE_SAMPLES="${NUM_VAE_SAMPLES:-}"
+PLOT_JOBS="${PLOT_JOBS:-8}"
+PLOT_DPI="${PLOT_DPI:-80}"
+HIST_JOBS="${HIST_JOBS:-8}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
 LOG_ROOT="${LOG_ROOT:-outputs/b8_all/run_logs}"
-mkdir -p "$LOG_ROOT"
+RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)_$$}"
+RUNTIME_CONFIG_ROOT="$LOG_ROOT/runtime_configs/$RUN_ID"
+mkdir -p "$LOG_ROOT" "$RUNTIME_CONFIG_ROOT"
 
 eval_h5() {
     case "$1" in
@@ -76,6 +94,29 @@ gt_stats() {
         sec)  echo "749 360" ;;
         *)    echo "0 1" ;;
     esac
+}
+
+runtime_config() {
+    local source_cfg=$1
+    local tag=$2
+    local out_cfg="$RUNTIME_CONFIG_ROOT/config_infer${tag}.txt"
+
+    cp "$source_cfg" "$out_cfg"
+    {
+        echo ""
+        echo "% Runtime overrides from run_all.sh"
+        echo "% Source config: $source_cfg"
+        echo "% Run ID: $RUN_ID"
+        if [ -n "$NUM_VAE_SAMPLES" ]; then
+            echo "num_vae_samples $NUM_VAE_SAMPLES"
+        fi
+        echo "vae_batch_size $VAE_BATCH_SIZE"
+        echo "vae_batch_vram_fraction $VAE_BATCH_VRAM_FRACTION"
+        echo "vae_batch_size_min $VAE_BATCH_SIZE_MIN"
+        echo "vae_batch_size_max $VAE_BATCH_SIZE_MAX"
+    } >> "$out_cfg"
+
+    echo "$out_cfg"
 }
 
 diag_one() {
@@ -104,20 +145,22 @@ run_one() {
     local idx=$1
     local ds=$2
     local tag="${idx}_${ds}"
-    local cfg="_b8_all_warpage_input/config_infer${idx}_${ds}.txt"
+    local source_cfg="_b8_all_warpage_input/config_infer${idx}_${ds}.txt"
+    local cfg="$source_cfg"
     local rollout_dir="outputs/b8_all/infer_train${idx}_${ds}"
     local eval_ds
     eval_ds="$(eval_h5 "$ds")"
 
-    if [ ! -f "$cfg" ]; then
-        echo "[$tag] SKIP: config not found ($cfg)" >&2
+    if [ ! -f "$source_cfg" ]; then
+        echo "[$tag] SKIP: config not found ($source_cfg)" >&2
         return 0
     fi
 
     if [ "$ONLY" = "both" ] || [ "$ONLY" = "infer" ]; then
+        cfg="$(runtime_config "$source_cfg" "$tag")"
         echo ""
         echo "=========================================="
-        echo "[$tag] INFERENCE  cfg=$cfg"
+        echo "[$tag] INFERENCE  cfg=$cfg  source=$source_cfg"
         echo "=========================================="
         if ! "$PYTHON" MeshGraphNets_main.py --config "$cfg" 2>&1 \
                 | tee "$LOG_ROOT/infer_${tag}.log"; then
@@ -128,7 +171,9 @@ run_one() {
         echo ""
         echo "[$tag] MESH PLOTS  rollout_dir=$rollout_dir"
         if ! "$PYTHON" _b8_all_warpage_input/plot_rollout_meshes.py \
-                --rollout_dir "$rollout_dir" 2>&1 \
+                --rollout_dir "$rollout_dir" \
+                --jobs "$PLOT_JOBS" \
+                --dpi "$PLOT_DPI" 2>&1 \
                 | tee "$LOG_ROOT/plot_${tag}.log"; then
             echo "[$tag] mesh plotting FAILED (non-fatal) — see $LOG_ROOT/plot_${tag}.log" >&2
         fi
@@ -141,6 +186,7 @@ run_one() {
                 --eval_dataset "$eval_ds" \
                 --rollout_dir  "$rollout_dir" \
                 --trim_quantile "$TRIM" \
+                --jobs "$HIST_JOBS" \
                 --output       "$rollout_dir/histogram_compare.png" 2>&1 \
                 | tee "$LOG_ROOT/hist_${tag}.log"; then
             echo "[$tag] histogram comparison FAILED — see $LOG_ROOT/hist_${tag}.log" >&2
@@ -160,6 +206,15 @@ echo "  ONLY       = $ONLY     (infer | hist | both)"
 echo "  BASELINES  = $BASELINES"
 echo "  DATASETS   = $DATASETS"
 echo "  LOG_ROOT   = $LOG_ROOT"
+echo "  RUN_ID     = $RUN_ID"
+echo "  VAE_BATCH_SIZE = $VAE_BATCH_SIZE"
+echo "  VAE_BATCH_VRAM_FRACTION = $VAE_BATCH_VRAM_FRACTION"
+echo "  VAE_BATCH_SIZE_MIN/MAX = $VAE_BATCH_SIZE_MIN / $VAE_BATCH_SIZE_MAX"
+if [ -n "$NUM_VAE_SAMPLES" ]; then
+    echo "  NUM_VAE_SAMPLES = $NUM_VAE_SAMPLES"
+fi
+echo "  PLOT_JOBS  = $PLOT_JOBS"
+echo "  HIST_JOBS  = $HIST_JOBS"
 
 for i in $BASELINES; do
     for ds in $DATASETS; do
@@ -171,6 +226,7 @@ ended=$(date +%s)
 echo ""
 echo "All requested jobs complete in $((ended - started))s."
 echo "Tee logs:        $LOG_ROOT/"
+echo "Runtime configs: $RUNTIME_CONFIG_ROOT/"
 echo "Histogram PNGs:  outputs/b8_all/infer_train<i>_<ds>/histogram_compare.png"
 
 # ── mu / sigma summary ──────────────────────────────────────────────────────

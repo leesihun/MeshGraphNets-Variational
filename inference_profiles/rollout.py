@@ -37,6 +37,21 @@ except ImportError:
 Z_DISP_CHANNEL = 5
 
 
+def _format_bytes(num_bytes):
+    """Compact binary-size formatter for CUDA memory logs."""
+    num_bytes = float(num_bytes)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(num_bytes) < 1024.0 or unit == "TiB":
+            return f"{num_bytes:.1f} {unit}"
+        num_bytes /= 1024.0
+
+
+def _is_cuda_oom(exc):
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    return "out of memory" in str(exc).lower() and "cuda" in str(exc).lower()
+
+
 def _spread_max_minus_min(field_1d):
     """max - min of a 1-D node field (the spread of a single realization)."""
     v = np.asarray(field_1d, dtype=np.float64)
@@ -479,7 +494,20 @@ def run_rollout(config, config_filename='config.txt'):
     use_conditional_prior = bool(config.get('use_conditional_prior', True))
     prior_temperature = float(config.get('prior_temperature', 1.0))
     num_vae_samples = int(config.get('num_vae_samples', 1)) if use_vae else 1
-    vae_batch_size = max(1, int(config.get('vae_batch_size', 1))) if use_vae else 1
+    raw_vae_batch_size = config.get('vae_batch_size', 1)
+    auto_vae_batch_size = (
+        use_vae
+        and isinstance(raw_vae_batch_size, str)
+        and raw_vae_batch_size.strip().lower() == 'auto'
+    )
+    if use_vae and not auto_vae_batch_size:
+        vae_batch_size = max(1, int(raw_vae_batch_size))
+    else:
+        vae_batch_size = 1
+    vae_batch_vram_fraction = float(config.get('vae_batch_vram_fraction', 0.70))
+    vae_batch_vram_fraction = min(max(vae_batch_vram_fraction, 0.01), 1.0)
+    vae_batch_size_min = max(1, int(config.get('vae_batch_size_min', 1)))
+    vae_batch_size_max = max(0, int(config.get('vae_batch_size_max', 0)))
 
     conditional_prior = None
     if use_vae and use_conditional_prior:
@@ -495,8 +523,14 @@ def run_rollout(config, config_filename='config.txt'):
                                 f"({conditional_prior.num_components} components, temp={prior_temperature:g})")
         else:
             sampler_desc = "N(0, I)"
+        batch_desc = (
+            f"auto, target={vae_batch_vram_fraction:.0%} free VRAM"
+            if auto_vae_batch_size else str(vae_batch_size)
+        )
+        if auto_vae_batch_size and device.type != 'cuda':
+            batch_desc = "auto requested, using 1 on CPU"
         print(f"  VAE sampling: {num_vae_samples} sample(s) per scene "
-              f"(z_dim={vae_latent_dim}, batch_size={vae_batch_size}, prior={sampler_desc})")
+              f"(z_dim={vae_latent_dim}, batch_size={batch_desc}, prior={sampler_desc})")
 
     # ---- Rollout inputs --------------------------------------------------
     dataset_dir = config.get('infer_dataset')
@@ -556,20 +590,8 @@ def run_rollout(config, config_filename='config.txt'):
 
         ctx = _SampleContext(config, norm, ref_pos, edge_index, part_ids, device)
 
-        num_batches = (num_vae_samples + vae_batch_size - 1) // vae_batch_size
-        report_every = max(1, num_batches // 10)
-        if use_vae:
-            print(f"\nRollout: {num_vae_samples} z-sample(s) × {steps} step(s), "
-                  f"batch_size={vae_batch_size} → {num_batches} forward batch(es)")
-
-        for batch_start in range(0, num_vae_samples, vae_batch_size):
-            B = min(vae_batch_size, num_vae_samples - batch_start)
-            batch_idx = batch_start // vae_batch_size
-            if use_vae and (batch_idx % report_every == 0 or batch_idx == num_batches - 1):
-                print(f"  batch {batch_idx + 1}/{num_batches}  "
-                      f"(z-samples {batch_start}–{batch_start + B - 1})")
-
-            # B trajectories, all starting from the same initial state
+        def _run_batch(batch_start, requested_batch_size):
+            B = min(requested_batch_size, num_vae_samples - batch_start)
             states = [initial_state.copy() for _ in range(B)]
             all_states = np.zeros((B, steps + 1, num_nodes, output_dim), dtype=np.float32)
             for b in range(B):
@@ -580,8 +602,8 @@ def run_rollout(config, config_filename='config.txt'):
 
             with torch.no_grad():
                 for step in range(steps):
-                    # Step 0: all B states are identical → build one graph and
-                    # replicate. Step 1+: states have diverged → one graph each.
+                    # Step 0: all B states are identical; build one graph and
+                    # replicate. Step 1+: states have diverged, so build each graph.
                     if step == 0:
                         graphs = [ctx.build_step_graph(states[0])] * B
                         if use_vae:
@@ -604,8 +626,9 @@ def run_rollout(config, config_filename='config.txt'):
                         states[b][:, :output_dim] += delta
                         all_states[b, step + 1] = states[b][:, :output_dim]
 
-            rollout_time = time.time() - rollout_start
+            return B, all_states, time.time() - rollout_start
 
+        def _save_batch(batch_start, B, all_states, rollout_time):
             # Save one HDF5 per trajectory
             for b in range(B):
                 vae_idx = batch_start + b
@@ -630,8 +653,92 @@ def run_rollout(config, config_filename='config.txt'):
                     size_mb = os.path.getsize(output_path) / (1024 * 1024)
                     print(f"  Saved {filename}  ({size_mb:.1f} MB)")
 
+        active_vae_batch_size = vae_batch_size
+        batch_start = 0
+
+        if use_vae and auto_vae_batch_size and device.type == 'cuda' and num_vae_samples > 0:
+            print(f"\nRollout: {num_vae_samples} z-sample(s) x {steps} step(s), "
+                  f"batch_size=auto (target {vae_batch_vram_fraction:.0%} of free VRAM)")
+            print("  Auto batch probe: running z-sample 0 with batch_size=1")
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize(device)
+            free_before, total_bytes = torch.cuda.mem_get_info(device)
+            allocated_before = torch.cuda.memory_allocated(device)
+            reserved_before = torch.cuda.memory_reserved(device)
+            torch.cuda.reset_peak_memory_stats(device)
+
+            B, all_states, rollout_time = _run_batch(0, 1)
+
+            torch.cuda.synchronize(device)
+            peak_allocated = torch.cuda.max_memory_allocated(device)
+            peak_reserved = torch.cuda.max_memory_reserved(device)
+            probe_extra_allocated = max(0, peak_allocated - allocated_before)
+            probe_extra_reserved = max(0, peak_reserved - reserved_before)
+            probe_extra = max(1, probe_extra_allocated, probe_extra_reserved)
+            torch.cuda.empty_cache()
+            free_after, _ = torch.cuda.mem_get_info(device)
+
+            _save_batch(0, B, all_states, rollout_time)
+            batch_start = B
+
+            remaining = num_vae_samples - batch_start
+            target_extra = int(free_after * vae_batch_vram_fraction)
+            raw_choice = max(1, int(target_extra // probe_extra))
+            if vae_batch_size_max:
+                raw_choice = min(raw_choice, vae_batch_size_max)
+            if remaining > 0:
+                active_vae_batch_size = min(
+                    remaining,
+                    max(vae_batch_size_min, raw_choice),
+                )
+            else:
+                active_vae_batch_size = 1
+
+            print("  Auto batch memory:")
+            print(f"    free before probe: {_format_bytes(free_before)} / {_format_bytes(total_bytes)}")
+            print(f"    free after probe:  {_format_bytes(free_after)}")
+            print(f"    probe peak extra:  {_format_bytes(probe_extra)} "
+                  f"(allocated {_format_bytes(probe_extra_allocated)}, "
+                  f"reserved {_format_bytes(probe_extra_reserved)})")
+            print(f"    target extra:      {_format_bytes(target_extra)} "
+                  f"({vae_batch_vram_fraction:.0%} of free)")
+            print(f"    selected batch:    {active_vae_batch_size}")
+        else:
+            if use_vae:
+                if auto_vae_batch_size:
+                    print("\nRollout: auto VAE batch sizing requested, but CUDA is unavailable; "
+                          "using batch_size=1")
+                num_batches = (num_vae_samples + active_vae_batch_size - 1) // active_vae_batch_size
+                print(f"\nRollout: {num_vae_samples} z-sample(s) x {steps} step(s), "
+                      f"batch_size={active_vae_batch_size} -> {num_batches} forward batch(es)")
+
+        batch_counter = 0
+        while batch_start < num_vae_samples:
+            requested_batch_size = min(active_vae_batch_size, num_vae_samples - batch_start)
+            if use_vae:
+                batch_counter += 1
+                print(f"  batch {batch_counter}: z-samples "
+                      f"{batch_start}-{batch_start + requested_batch_size - 1} "
+                      f"(B={requested_batch_size})")
+            try:
+                B, all_states, rollout_time = _run_batch(batch_start, requested_batch_size)
+            except RuntimeError as exc:
+                if (auto_vae_batch_size and device.type == 'cuda'
+                        and requested_batch_size > 1 and _is_cuda_oom(exc)):
+                    new_batch_size = max(1, requested_batch_size // 2)
+                    print(f"  CUDA OOM at batch_size={requested_batch_size}; "
+                          f"retrying z-sample {batch_start} with batch_size={new_batch_size}")
+                    active_vae_batch_size = new_batch_size
+                    if use_vae:
+                        batch_counter -= 1
+                    torch.cuda.empty_cache()
+                    continue
+                raise
+            _save_batch(batch_start, B, all_states, rollout_time)
+            batch_start += B
+
     total_outputs = len(sample_ids) * num_vae_samples
-    print(f"\nRollout inference complete. Processed {len(sample_ids)} scene(s) × "
+    print(f"\nRollout inference complete. Processed {len(sample_ids)} scene(s) x "
           f"{num_vae_samples} VAE sample(s) = {total_outputs} output file(s).")
 
     # ---- z_disp spread histogram: generated vs ground-truth eval set ------

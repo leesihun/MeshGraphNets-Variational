@@ -1,10 +1,10 @@
-% Inference for cell 6: z256_fixed_ph384_l0p05 (main)
+% Inference for cell 6: z256_h128_fixed_ph384_l1p0 (main)
 % vae_latent_dim=256, prior_hidden_dim=384, Latent_dim=128
 model   MeshGraphNets-V
 mode    inference
 gpu_ids 5
 log_file_dir         b8_all/infer_train6_main.log
-modelpath            ./outputs/b8_all/warpage_train6_z256_fixed_ph384_l0p05.pth
+modelpath            ./outputs/b8_all/warpage_train6_z256_h128_fixed_ph384_l1p0.pth
 inference_output_dir outputs/b8_all/infer_train6_main
 
 % Datasets
