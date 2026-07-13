@@ -1,14 +1,18 @@
 % ============================================================
-% FM 4-factor sweep cell 4: z128_h256_fixed_ph256_l1p0
-% vae_latent_dim=128, mmd_bandwidth=fixed, prior_hidden_dim=256, lambda_mmd=1.0
-% alpha_recon=1000 (fixed), Latent_dim=256, Training_epochs=1000, single-GPU.
+% Aggressive-lambda + capacity sweep cell 4: z128_h128_median_ph256_l0p2
+% Why: see gen_sweep_configs.py docstring (lambda {0.2,1,10} maps the MMD
+% collapse threshold above the previous winner; Latent_dim 256 cells 7-8 are
+% pure width probes vs cells 1/4; everything else pinned to the winner).
+% vae_latent_dim=128, mmd_bandwidth=median, prior_hidden_dim=256, lambda_mmd=0.2
+% alpha_recon=1000 (fixed), Latent_dim=128, Training_epochs=2000, single-GPU.
+% Anchored on the previous sweep winner (z64_median_ph192_l0p2).
 % Base L=2, voronoi 2000/500, mse, ew=0, beta_aux=1.0, posterior_min_std=0.05.
 % ============================================================
 model   MeshGraphNets-V
 mode    train
 gpu_ids 3
-log_file_dir    b8_all/train4_z128_h256_fixed_ph256_l1p0.log
-modelpath       ./outputs/b8_all/warpage_train4_z128_h256_fixed_ph256_l1p0.pth
+log_file_dir    b8_all/train4_z128_h128_median_ph256_l0p2.log
+modelpath       ./outputs/b8_all/warpage_train4_z128_h128_median_ph256_l0p2.pth
 
 % Datasets
 dataset_dir     ./dataset/b8_main_sec_dataset_traincopy.h5
@@ -25,17 +29,17 @@ positional_features  4
 
 % Network parameters
 message_passing_num  15
-Training_epochs      1000
+Training_epochs      2000
 Batch_size           8
 LearningR            0.0001
-Latent_dim           256
+Latent_dim           128
 num_workers          4
 std_noise            0.01
 augment_geometry     True
 grad_accum_steps     1
 
 % Memory / performance
-use_checkpointing    False   # faster; set True if OOM (esp. z256 / prior_hidden_dim 384)
+use_checkpointing    False   # faster; set True if OOM
 use_amp              True
 use_ema              True
 ema_decay            0.99
@@ -64,18 +68,20 @@ use_vae          True
 vae_latent_dim   128
 recon_loss       mse
 alpha_recon      1000
-lambda_mmd       1.0
-mmd_bandwidth    fixed
+lambda_mmd       0.2
+mmd_bandwidth    median
 vae_graph_aware  True
 beta_aux         1.0
 posterior_min_std 0.05
 
 % Prior - gnn_e2e joint training; prior_family fm = conditional flow matching.
+% prior_fm_steps 40: sampling-only (validation CRPS + inference); halves Euler
+% overshoot in the z tails vs the old 20-step default (Gen_max spike fix).
 prior_type               gnn_e2e
 use_conditional_prior    True
 prior_family             fm
 prior_nll_weight         1.0
-prior_fm_steps           20
+prior_fm_steps           40
 prior_mp_layers          5
 prior_hidden_dim         256
 prior_temperature        1.0

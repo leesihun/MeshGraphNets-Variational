@@ -1,10 +1,10 @@
-% Inference for cell 7: z256_h256_fixed_ph384_l0p1 (main)
-% vae_latent_dim=256, prior_hidden_dim=384, Latent_dim=256
+% Inference for cell 7: z64_h256_median_ph192_l0p2 (main)
+% vae_latent_dim=64, prior_hidden_dim=192, Latent_dim=256
 model   MeshGraphNets-V
 mode    inference
 gpu_ids 6
 log_file_dir         b8_all/infer_train7_main.log
-modelpath            ./outputs/b8_all/warpage_train7_z256_h256_fixed_ph384_l0p1.pth
+modelpath            ./outputs/b8_all/warpage_train7_z64_h256_median_ph192_l0p2.pth
 inference_output_dir outputs/b8_all/infer_train7_main
 
 % Datasets
@@ -53,7 +53,7 @@ mp_per_level        4, 8, 12, 8, 4
 
 % VAE (MMD-InfoVAE)
 use_vae          True
-vae_latent_dim   256
+vae_latent_dim   64
 recon_loss       mse
 vae_graph_aware  True
 
@@ -61,7 +61,7 @@ vae_graph_aware  True
 prior_type               gnn_e2e
 use_conditional_prior    True
 prior_family             fm
-prior_fm_steps           20
+prior_fm_steps           40
 prior_mp_layers          5
-prior_hidden_dim         384
-prior_temperature        1.0   # Phase 2: sweep this at inference to calibrate spread scale
+prior_hidden_dim         192
+prior_temperature        1.0   # free post-hoc knob: calibrate spread scale at inference
