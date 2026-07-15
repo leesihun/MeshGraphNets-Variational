@@ -1,18 +1,19 @@
 % ============================================================
-% Aggressive-lambda + capacity sweep cell 2: z64_h128_median_ph192_l1
-% Why: see gen_sweep_configs.py docstring (lambda {0.2,1,10} maps the MMD
-% collapse threshold above the previous winner; Latent_dim 256 cells 7-8 are
-% pure width probes vs cells 1/4; everything else pinned to the winner).
-% vae_latent_dim=64, mmd_bandwidth=median, prior_hidden_dim=192, lambda_mmd=1.0
-% alpha_recon=1000 (fixed), Latent_dim=128, Training_epochs=2000, single-GPU.
-% Anchored on the previous sweep winner (z64_median_ph192_l0p2).
-% Base L=2, voronoi 2000/500, mse, ew=0, beta_aux=1.0, posterior_min_std=0.05.
+% Network-capacity (width x depth) sweep cell 2: z128_h512_pml5_ph256_vml5
+% Why: see gen_sweep_configs.py docstring. Anchored on the previous winner
+% (z128_h256_median_ph256_l0p2). Focus 2x2 = Latent_dim {256,512} x
+% prior_mp_layers {5,10} (cells 1-4); OFAT extras cells 5-8.
+% Latent_dim=512 (main width), prior_mp_layers=5 (prior depth),
+% prior_hidden_dim=256 (prior width), vae_mp_layers=5 (posterior depth).
+% Pinned: vae_latent_dim=128, lambda_mmd=0.2, mmd_bandwidth=median,
+% alpha_recon=1000, beta_aux=1.0, posterior_min_std=0.05, fm_steps=40,
+% Training_epochs=1000, L=2 voronoi 2000/500, mse, mp_per_level 4,8,12,8,4.
 % ============================================================
 model   MeshGraphNets-V
 mode    train
 gpu_ids 1
-log_file_dir    b8_all/train2_z64_h128_median_ph192_l1.log
-modelpath       ./outputs/b8_all/warpage_train2_z64_h128_median_ph192_l1.pth
+log_file_dir    b8_all/train2_z128_h512_pml5_ph256_vml5.log
+modelpath       ./outputs/b8_all/warpage_train2_z128_h512_pml5_ph256_vml5.pth
 
 % Datasets
 dataset_dir     ./dataset/b8_main_sec_dataset_traincopy.h5
@@ -29,10 +30,10 @@ positional_features  4
 
 % Network parameters
 message_passing_num  15
-Training_epochs      2000
+Training_epochs      1000
 Batch_size           8
 LearningR            0.0001
-Latent_dim           128
+Latent_dim           512
 num_workers          4
 std_noise            0.01
 augment_geometry     True
@@ -65,10 +66,11 @@ mp_per_level        4, 8, 12, 8, 4
 
 % VAE (MMD-InfoVAE)
 use_vae          True
-vae_latent_dim   64
+vae_latent_dim   128
+vae_mp_layers    5
 recon_loss       mse
 alpha_recon      1000
-lambda_mmd       1.0
+lambda_mmd       0.2
 mmd_bandwidth    median
 vae_graph_aware  True
 beta_aux         1.0
@@ -83,5 +85,5 @@ prior_family             fm
 prior_nll_weight         1.0
 prior_fm_steps           40
 prior_mp_layers          5
-prior_hidden_dim         192
+prior_hidden_dim         256
 prior_temperature        1.0

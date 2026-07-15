@@ -1,10 +1,11 @@
-% Inference for cell 8: z128_h256_median_ph256_l0p2 (sec)
-% vae_latent_dim=128, prior_hidden_dim=256, Latent_dim=256
+% Inference for cell 8: z128_h256_pml5_ph256_vml8 (sec)
+% Latent_dim=256, prior_mp_layers=5, prior_hidden_dim=256, vae_mp_layers=8
+% (all architecture keys MUST match training so the checkpoint loads).
 model   MeshGraphNets-V
 mode    inference
 gpu_ids 7
 log_file_dir         b8_all/infer_train8_sec.log
-modelpath            ./outputs/b8_all/warpage_train8_z128_h256_median_ph256_l0p2.pth
+modelpath            ./outputs/b8_all/warpage_train8_z128_h256_pml5_ph256_vml8.pth
 inference_output_dir outputs/b8_all/infer_train8_sec
 
 % Datasets
@@ -54,6 +55,7 @@ mp_per_level        4, 8, 12, 8, 4
 % VAE (MMD-InfoVAE)
 use_vae          True
 vae_latent_dim   128
+vae_mp_layers    8
 recon_loss       mse
 vae_graph_aware  True
 
