@@ -20,6 +20,7 @@ python MeshGraphNets_main.py --config path\to\config.txt
 | `mode` | launcher | `train` or `inference`. |
 | `gpu_ids` | launcher | `-1` for CPU, one GPU id for single process, or comma list for multi-GPU. |
 | `parallel_mode` | launcher | Optional. `ddp` by default; `model_split` enables the experimental pipeline split path. |
+| `pipeline_microbatches` | model_split | Optional. Batches pipelined per optimizer step under the 1F1B schedule (default `2 * num_stages`; `1` = legacy sequential). Effective batch = `batch_size * pipeline_microbatches`; VRAM does not grow with it. |
 | `modelpath` | training, inference, prior | Checkpoint path to save to or load from. |
 | `log_file_dir` | training | Relative path under `outputs/` for epoch logs. |
 

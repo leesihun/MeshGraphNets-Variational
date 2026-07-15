@@ -149,7 +149,14 @@ DDP training is in
 
 `parallel_mode model_split` activates the experimental pipeline split launcher in
 [parallelism/launcher.py](parallelism/launcher.py). It slices the processor across
-GPUs and saves a merged checkpoint for normal inference.
+GPUs and saves a merged checkpoint for normal inference. Stages run a 1F1B
+pipeline schedule: `pipeline_microbatches` (default `2 * num_stages`) batches are
+pipelined per optimizer step (gradient accumulation — effective batch =
+`batch_size * pipeline_microbatches`). Peak activation memory stays bounded at
+`num_stages` in-flight micro-batches per stage no matter how large
+`pipeline_microbatches` is, so raising it buys speed at no VRAM cost;
+`pipeline_microbatches 1` restores the sequential legacy behavior. Gradients are
+clipped by their global norm across all stages, matching single-GPU training.
 
 Training uses:
 

@@ -42,11 +42,15 @@ where W = 1 if use_world_edges, V = 1 if use_vae, Z = 1 if multiscale VAE with n
 
 NCCL note: send/recv pairs are matched strictly by ORDER (NCCL ignores tag).
 All sends/recvs are inside ONE autograd Function per boundary so order is
-deterministic on both ranks.
+deterministic on both ranks. Bundles travel as one header plus one flattened
+buffer per dtype; gradients travel headerless (shapes known from forward).
+Downstream data and upstream gradients use separate process groups so the
+1F1B schedule cannot deadlock on communicator ordering.
 """
 
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -73,27 +77,138 @@ _DTYPE_TO_CODE = {
 _CODE_TO_DTYPE = {v: k for k, v in _DTYPE_TO_CODE.items()}
 
 
-def _send_tensor(t: torch.Tensor, dst: int) -> None:
-    dtype_code = _DTYPE_TO_CODE[t.dtype]
-    shape = list(t.shape)
-    header = torch.tensor([len(shape), *shape, dtype_code], dtype=torch.long, device=t.device)
-    header_len = torch.tensor([header.numel()], dtype=torch.long, device=t.device)
-    dist.send(header_len, dst=dst)
-    dist.send(header, dst=dst)
-    dist.send(t.contiguous(), dst=dst)
+# The two pipeline traffic directions use separate process groups. NCCL runs
+# each communicator on its own stream, so a queued downstream data-send can
+# never serialize ahead of an upstream grad op and deadlock the 1F1B schedule.
+_PG_DATA = None
+_PG_GRAD = None
+
+# In-flight async sends: (work, buffer) pairs kept alive until the transfer
+# completes. Swept opportunistically; fully drained before each optimizer step.
+_PENDING_SENDS: List[tuple] = []
 
 
-def _recv_tensor(src: int, device: torch.device) -> torch.Tensor:
+def set_pipeline_process_groups(pg_data, pg_grad) -> None:
+    global _PG_DATA, _PG_GRAD
+    _PG_DATA = pg_data
+    _PG_GRAD = pg_grad
+
+
+def _isend_tracked(t: torch.Tensor, dst: int, group) -> None:
+    work = dist.isend(t, dst=dst, group=group)
+    _PENDING_SENDS.append((work, t))
+    if len(_PENDING_SENDS) > 16:
+        _PENDING_SENDS[:] = [(w, b) for w, b in _PENDING_SENDS if not w.is_completed()]
+
+
+def drain_pending_sends() -> None:
+    """Block until every outstanding isend finished; call before optimizer.step()."""
+    for work, _ in _PENDING_SENDS:
+        work.wait()
+    _PENDING_SENDS.clear()
+
+
+def _dtype_groups(dtypes: Sequence[torch.dtype]) -> List[Tuple[torch.dtype, List[int]]]:
+    """Indices grouped by dtype in first-appearance order.
+
+    Both peers derive the grouping from the same (shape, dtype) sequence, so the
+    per-dtype flat buffers pair up without any extra negotiation.
+    """
+    groups: Dict[torch.dtype, List[int]] = {}
+    for i, dt in enumerate(dtypes):
+        groups.setdefault(dt, []).append(i)
+    return list(groups.items())
+
+
+def _send_bundle(tensors: Sequence[torch.Tensor], dst: int, group) -> None:
+    """One header + one flat buffer per dtype instead of 3 messages per tensor."""
+    dev = tensors[0].device
+    meta: List[int] = [len(tensors)]
+    for t in tensors:
+        meta.append(t.dim())
+        meta.extend(t.shape)
+        meta.append(_DTYPE_TO_CODE[t.dtype])
+    header = torch.tensor(meta, dtype=torch.long, device=dev)
+    header_len = torch.tensor([header.numel()], dtype=torch.long, device=dev)
+    _isend_tracked(header_len, dst, group)
+    _isend_tracked(header, dst, group)
+    for _, idxs in _dtype_groups([t.dtype for t in tensors]):
+        parts = [tensors[i].reshape(-1) for i in idxs if tensors[i].numel() > 0]
+        if not parts:
+            continue
+        buf = parts[0].contiguous() if len(parts) == 1 else torch.cat(parts)
+        _isend_tracked(buf, dst, group)
+
+
+def _recv_bundle(src: int, device: torch.device, group) -> List[torch.Tensor]:
     header_len = torch.empty(1, dtype=torch.long, device=device)
-    dist.recv(header_len, src=src)
+    dist.recv(header_len, src=src, group=group)
     header = torch.empty(int(header_len.item()), dtype=torch.long, device=device)
-    dist.recv(header, src=src)
-    ndim = int(header[0].item())
-    shape = [int(header[1 + i].item()) for i in range(ndim)]
-    dtype = _CODE_TO_DTYPE[int(header[1 + ndim].item())]
-    t = torch.empty(*shape, dtype=dtype, device=device)
-    dist.recv(t, src=src)
-    return t
+    dist.recv(header, src=src, group=group)
+    meta = header.tolist()
+    n = meta[0]
+    shapes: List[List[int]] = []
+    dtypes: List[torch.dtype] = []
+    pos = 1
+    for _ in range(n):
+        ndim = meta[pos]; pos += 1
+        shapes.append(meta[pos:pos + ndim]); pos += ndim
+        dtypes.append(_CODE_TO_DTYPE[meta[pos]]); pos += 1
+    out: List[Optional[torch.Tensor]] = [None] * n
+    for dt, idxs in _dtype_groups(dtypes):
+        sizes = [math.prod(shapes[i]) for i in idxs]
+        nonzero = [(i, s) for i, s in zip(idxs, sizes) if s > 0]
+        total = sum(s for _, s in nonzero)
+        if total > 0:
+            buf = torch.empty(total, dtype=dt, device=device)
+            dist.recv(buf, src=src, group=group)
+            chunks = torch.split(buf, [s for _, s in nonzero])
+            for (i, _), chunk in zip(nonzero, chunks):
+                out[i] = chunk.view(shapes[i])
+        for i, s in zip(idxs, sizes):
+            if s == 0:
+                out[i] = torch.empty(shapes[i], dtype=dt, device=device)
+    return out
+
+
+def _send_flat_grads(grads: Sequence[Optional[torch.Tensor]],
+                     shapes: Sequence[Tuple[int, ...]],
+                     dtypes: Sequence[torch.dtype],
+                     dst: int, device: torch.device, group) -> None:
+    """Headerless grad send: the peer already knows every shape and dtype."""
+    flat: List[torch.Tensor] = []
+    for g, shape, dt in zip(grads, shapes, dtypes):
+        if g is None:
+            g = torch.zeros(shape, dtype=dt, device=device)
+        elif g.dtype != dt:
+            g = g.to(dt)
+        flat.append(g.reshape(-1))
+    for _, idxs in _dtype_groups(list(dtypes)):
+        parts = [flat[i] for i in idxs if flat[i].numel() > 0]
+        if not parts:
+            continue
+        buf = parts[0].contiguous() if len(parts) == 1 else torch.cat(parts)
+        _isend_tracked(buf, dst, group)
+
+
+def _recv_flat_grads(shapes: Sequence[Tuple[int, ...]],
+                     dtypes: Sequence[torch.dtype],
+                     src: int, device: torch.device, group) -> List[torch.Tensor]:
+    out: List[Optional[torch.Tensor]] = [None] * len(shapes)
+    for dt, idxs in _dtype_groups(list(dtypes)):
+        sizes = [math.prod(shapes[i]) for i in idxs]
+        nonzero = [(i, s) for i, s in zip(idxs, sizes) if s > 0]
+        total = sum(s for _, s in nonzero)
+        if total > 0:
+            buf = torch.empty(total, dtype=dt, device=device)
+            dist.recv(buf, src=src, group=group)
+            chunks = torch.split(buf, [s for _, s in nonzero])
+            for (i, _), chunk in zip(nonzero, chunks):
+                out[i] = chunk.view(shapes[i])
+        for i, s in zip(idxs, sizes):
+            if s == 0:
+                out[i] = torch.zeros(shapes[i], dtype=dt, device=device)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -115,17 +230,20 @@ class BundleSend(torch.autograd.Function):
         ctx.n_grad = n_grad
         ctx.n_nongd = len(all_tensors) - n_grad
         ctx.device = all_tensors[0].device
+        ctx.grad_shapes = [tuple(t.shape) for t in all_tensors[:n_grad]]
+        ctx.grad_dtypes = [t.dtype for t in all_tensors[:n_grad]]
         if ctx.n_nongd > 0:
             ctx.mark_non_differentiable(*all_tensors[n_grad:])
-        for t in all_tensors:
-            _send_tensor(t.contiguous(), dst=dst)
+        _send_bundle(all_tensors, dst, _PG_DATA)
         return torch.zeros((), device=ctx.device, dtype=all_tensors[0].dtype,
                            requires_grad=True)
 
     @staticmethod
     def backward(ctx, _grad_sentinel):
-        grads = [_recv_tensor(src=ctx.dst, device=ctx.device)
-                 for _ in range(ctx.n_grad)]
+        grads = _recv_flat_grads(
+            ctx.grad_shapes, ctx.grad_dtypes,
+            src=ctx.dst, device=ctx.device, group=_PG_GRAD,
+        )
         return (None, None) + tuple(grads) + (None,) * ctx.n_nongd
 
 
@@ -141,16 +259,25 @@ class BundleRecv(torch.autograd.Function):
                 device: torch.device, anchor: torch.Tensor):
         ctx.src = src
         ctx.n_grad = n_grad
-        tensors = [_recv_tensor(src=src, device=device)
-                   for _ in range(n_grad + n_nongd)]
+        ctx.device = device
+        tensors = _recv_bundle(src, device, _PG_DATA)
+        if len(tensors) != n_grad + n_nongd:
+            raise RuntimeError(
+                f"bundle size mismatch: received {len(tensors)}, "
+                f"expected {n_grad}+{n_nongd}"
+            )
+        ctx.out_shapes = [tuple(t.shape) for t in tensors[:n_grad]]
+        ctx.out_dtypes = [t.dtype for t in tensors[:n_grad]]
         if n_nongd > 0:
             ctx.mark_non_differentiable(*tensors[n_grad:])
         return tuple(tensors)
 
     @staticmethod
     def backward(ctx, *grads):
-        for g in grads[:ctx.n_grad]:
-            _send_tensor(g.contiguous(), dst=ctx.src)
+        _send_flat_grads(
+            grads[:ctx.n_grad], ctx.out_shapes, ctx.out_dtypes,
+            dst=ctx.src, device=ctx.device, group=_PG_GRAD,
+        )
         return (None, None, None, None, None)
 
 

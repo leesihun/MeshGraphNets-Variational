@@ -33,7 +33,7 @@
 #   VAE_BATCH_SIZE_MIN = lower bound after auto probe (default: 1)
 #   VAE_BATCH_SIZE_MAX = upper bound after auto probe; 0 = uncapped (default: 0)
 #   NUM_VAE_SAMPLES  = optional override for quick runs
-#   PLOT_JOBS        = workers for mesh PNG plotting (default: 8)
+#   PLOT_JOBS        = workers for mesh PNG plotting (default: nproc/2)
 #   PLOT_DPI         = mesh PNG DPI (default: 80)
 #   HIST_JOBS        = workers for histogram rollout loading (default: 8)
 #
@@ -65,7 +65,8 @@ VAE_BATCH_VRAM_FRACTION="${VAE_BATCH_VRAM_FRACTION:-0.70}"
 VAE_BATCH_SIZE_MIN="${VAE_BATCH_SIZE_MIN:-1}"
 VAE_BATCH_SIZE_MAX="${VAE_BATCH_SIZE_MAX:-0}"
 NUM_VAE_SAMPLES="${NUM_VAE_SAMPLES:-}"
-PLOT_JOBS="${PLOT_JOBS:-8}"
+NPROC="$(nproc 2>/dev/null || echo 8)"
+PLOT_JOBS="${PLOT_JOBS:-$(( NPROC / 2 > 0 ? NPROC / 2 : 1 ))}"
 PLOT_DPI="${PLOT_DPI:-80}"
 HIST_JOBS="${HIST_JOBS:-8}"
 
